@@ -11309,27 +11309,29 @@ static int smallclueTeeCommand(int argc, char **argv) {
         }
     }
     int file_count = argc - optind;
-    FILE **files = NULL;
+    int *files = NULL;
     if (file_count > 0) {
-        files = (FILE **)calloc((size_t)file_count, sizeof(FILE *));
+        files = (int *)calloc((size_t)file_count, sizeof(int));
         if (!files) {
             perror("tee");
             return 1;
         }
         for (int i = 0; i < file_count; ++i) {
-            const char *mode = append ? "ab" : "wb";
-            files[i] = fopen(argv[optind + i], mode);
-            if (!files[i]) {
+            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+            files[i] = open(argv[optind + i], flags, 0666);
+            if (files[i] < 0) {
                 fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
             }
         }
     }
     int status = 0;
-    char buffer[4096];
+    char buffer[65536];
+    bool stdout_failed = false;
+    fflush(stdout); /* flush before transitioning to direct fd writes */
     while (true) {
-        int read_err = 0;
-        ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
+        ssize_t nread = read(STDIN_FILENO, buffer, sizeof(buffer));
         if (nread < 0) {
+            if (errno == EINTR) continue;
             perror("tee");
             status = 1;
             break;
@@ -11337,32 +11339,41 @@ static int smallclueTeeCommand(int argc, char **argv) {
         if (nread == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
-            perror("tee");
-            status = 1;
-            break;
+        ssize_t total_written = 0;
+        while (!stdout_failed && total_written < nread) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)(nread - total_written));
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("tee: write error");
+                status = 1;
+                stdout_failed = true;
+                break;
+            }
+            total_written += nw;
         }
         for (int i = 0; i < file_count; ++i) {
-            if (!files[i]) {
+            if (files[i] < 0) {
                 continue;
             }
-            if (fwrite(buffer, 1, (size_t)nread, files[i]) != (size_t)nread) {
-                fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
-                fclose(files[i]);
-                files[i] = NULL;
-                status = 1;
+            ssize_t file_written = 0;
+            while (file_written < nread) {
+                ssize_t nw = write(files[i], buffer + file_written, (size_t)(nread - file_written));
+                if (nw < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
+                    close(files[i]);
+                    files[i] = -1;
+                    status = 1;
+                    break;
+                }
+                file_written += nw;
             }
-        }
-        if (read_err) {
-            perror("tee");
-            status = 1;
-            break;
         }
     }
     if (files) {
         for (int i = 0; i < file_count; ++i) {
-            if (files[i]) {
-                fclose(files[i]);
+            if (files[i] >= 0) {
+                close(files[i]);
             }
         }
         free(files);
