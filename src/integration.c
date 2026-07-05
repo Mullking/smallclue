@@ -68,15 +68,15 @@ static char *smallclueDuplicateArg(const Value *value) {
     if (!value) {
         return strdup("");
     }
-    if (value->type == TYPE_STRING && value->s_val) {
-        return strdup(value->s_val);
+    if (VALUE_TYPE(*value) == TYPE_STRING && AS_STRING(*value)) {
+        return strdup(AS_STRING(*value));
     }
     if (IS_INTLIKE(*value)) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%lld", (long long)AS_INTEGER(*value));
         return strdup(buf);
     }
-    if (isRealType(value->type)) {
+    if (isRealType(VALUE_TYPE(*value))) {
         char buf[64];
         long double real = AS_REAL(*value);
         snprintf(buf, sizeof(buf), "%.17Lg", real);
@@ -119,8 +119,8 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
     }
 
     int arg_start = 0;
-    if (arg_count > 0 && args[0].type == TYPE_STRING && args[0].s_val) {
-        if (strcasecmp(args[0].s_val, applet->name) == 0) {
+    if (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0])) {
+        if (strcasecmp(AS_STRING(args[0]), applet->name) == 0) {
             arg_start = 1;
         }
     }
