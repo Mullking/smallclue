@@ -439,7 +439,12 @@ static void registerSmallclueBuiltin(const char *name,
         /* Preserve any existing handler (e.g., shell builtins); only register when missing. */
         return;
     }
-    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name);
+    /* Busybox-style CLI tools (cat/ls/wget/watch/...): filesystem, process,
+     * and (wget) network side effects. Blanket-classify conservatively rather
+     * than auditing each of the ~30 wrapped tools (Docs/pscal_vm2_plan.md
+     * §6.3's default for ext_builtins categories). */
+    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name,
+                      FX_PROC | FX_IO | FX_NET);
     smallclueRecordRegisteredName(name);
 }
 
