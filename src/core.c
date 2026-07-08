@@ -2377,10 +2377,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"realpath", "realpath [-e|-m] PATH...\n"
                  "  Print the canonicalized absolute path\n"
                  "  -e require full existence  -m allow a missing final component (default)"},
-    {"rm", "rm [-r] [-f] [-i] FILE...\n"
-           "  -r recursive\n"
+    {"rm", "rm [-r|-R] [-f] [-i] [--no-preserve-root] FILE...\n"
+           "  -r/-R recursive\n"
            "  -f force\n"
-           "  -i interactive"},
+           "  -i interactive\n"
+           "  --preserve-root (default): refuse recursive removal of '/'\n"
+           "  --no-preserve-root: disable that failsafe"},
     {"rmdir", "rmdir [-p] [-v] DIR...\n"
               "  Remove empty directories\n"
               "  -p remove parents\n"
@@ -17643,8 +17645,13 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
             return -1;
         }
-        if ((interactive || !force) && !smallclueConfirmDelete(label, target)) {
-            return interactive ? 0 : 1;
+        /* When interactive, the "prompt for all files" check above already
+         * confirmed this exact same path -- asking again here would prompt
+         * the user twice for one directory. Only prompt here for the bare
+         * `rm -r DIR` case (neither -i nor -f given), which is intended as
+         * a lightweight safety net before recursing. */
+        if (!interactive && !force && !smallclueConfirmDelete(label, target)) {
+            return 1;
         }
         DIR *dir = opendir(target);
         if (!dir) {
@@ -17677,9 +17684,10 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
         }
         return 0;
     }
-    if (interactive && !smallclueConfirmDelete(label, target)) {
-        return 0;
-    }
+    /* No separate confirm here: the "prompt for all files" check at the
+     * top of this function already asked about this exact path and
+     * would have returned early if declined -- re-asking here was a
+     * second, redundant prompt for the same plain-file removal. */
     if (unlink(target) != 0) {
         if (!force) {
             fprintf(stderr, "%s: %s: %s\n", label, target, strerror(errno));
@@ -17897,15 +17905,49 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     return 0;
 }
 
+/* GNU rm's failsafe against `rm -rf /`-class disasters: recursive removal
+ * of a path that resolves to exactly "/" is refused unless the caller
+ * explicitly opts out via --no-preserve-root. On by default, matching GNU
+ * coreutils (not an opt-in flag). */
+static bool smallclueRmIsPreservedRoot(const char *path) {
+    if (!path) return false;
+    char resolved[PATH_MAX];
+    const char *target = realpath(path, resolved) ? resolved : path;
+    return strcmp(target, "/") == 0;
+}
+
 static int smallclueRmCommand(int argc, char **argv) {
     int recursive = 0;
     int force = 0;
     int interactive = 0;
+    bool preserve_root = true;
+
+    /* --preserve-root/--no-preserve-root are GNU long options with no
+     * short-flag equivalent -- getopt() doesn't understand "--"-prefixed
+     * long options and hard-errors on them, so strip them out first
+     * (same convention used by stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strcmp(argv[i], "--preserve-root") == 0) {
+            preserve_root = true;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-preserve-root") == 0) {
+            preserve_root = false;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "rfi")) != -1) {
+    while ((opt = getopt(argc, argv, "rRfi")) != -1) {
         switch (opt) {
             case 'r':
+            case 'R':
                 recursive = 1;
                 break;
             case 'f':
@@ -17938,6 +17980,12 @@ static int smallclueRmCommand(int argc, char **argv) {
             expanded = pathbuf;
         }
 #endif
+        if (recursive && preserve_root && smallclueRmIsPreservedRoot(expanded)) {
+            fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", expanded);
+            fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
+            status = 1;
+            continue;
+        }
         if (strpbrk(expanded, "*?[")) {
             glob_t matches;
             memset(&matches, 0, sizeof(matches));
@@ -17950,6 +17998,12 @@ static int smallclueRmCommand(int argc, char **argv) {
                 continue;
             }
             for (size_t m = 0; m < matches.gl_pathc; ++m) {
+                if (recursive && preserve_root && smallclueRmIsPreservedRoot(matches.gl_pathv[m])) {
+                    fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", matches.gl_pathv[m]);
+                    fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
+                    status = 1;
+                    continue;
+                }
                 if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive != 0) != 0) {
                     if (!force) {
                         status = 1;
