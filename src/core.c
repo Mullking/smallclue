@@ -15203,45 +15203,146 @@ static int smallclueDuCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
-static int smallclueFindVisit(const char *path, const char *pattern, int *status) {
+typedef struct SmallclueFindOptions {
+    const char *namePattern;
+    const char *inamePattern;
+    char typeFilter; /* 'f', 'd', 'l', or 0 for "any" */
+    int maxDepth;    /* -1 = unlimited */
+    int minDepth;    /* 0 = no minimum */
+    bool doDelete;
+    bool doExec;
+    char **execArgv;  /* NULL-terminated, {} not yet substituted */
+    int execArgc;
+    bool haveAction; /* -delete or -exec given: suppresses the implicit -print */
+} SmallclueFindOptions;
+
+static bool smallclueFindMatches(const char *path, const struct stat *st,
+                                 const SmallclueFindOptions *opts, int depth) {
+    if (depth < opts->minDepth) {
+        return false;
+    }
+    if (opts->namePattern || opts->inamePattern) {
+        const char *leaf = smallclueLeafName(path);
+        int flags = opts->inamePattern ? FNM_CASEFOLD : 0;
+        const char *pattern = opts->inamePattern ? opts->inamePattern : opts->namePattern;
+        if (fnmatch(pattern, leaf, flags) != 0) {
+            return false;
+        }
+    }
+    if (opts->typeFilter) {
+        bool ok = false;
+        switch (opts->typeFilter) {
+            case 'f': ok = S_ISREG(st->st_mode); break;
+            case 'd': ok = S_ISDIR(st->st_mode); break;
+            case 'l': ok = S_ISLNK(st->st_mode); break;
+            default: ok = true; break;
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc) {
+    char **argvCopy = calloc((size_t)execArgc + 1, sizeof(char *));
+    if (!argvCopy) {
+        fprintf(stderr, "find: out of memory\n");
+        return 1;
+    }
+    for (int i = 0; i < execArgc; ++i) {
+        if (strcmp(execArgv[i], "{}") == 0) {
+            argvCopy[i] = (char *)path;
+        } else {
+            argvCopy[i] = execArgv[i];
+        }
+    }
+    argvCopy[execArgc] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "find: fork: %s\n", strerror(errno));
+        free(argvCopy);
+        return 1;
+    }
+    if (pid == 0) {
+        execvp(argvCopy[0], argvCopy);
+        fprintf(stderr, "find: %s: %s\n", argvCopy[0], strerror(errno));
+        _exit(127);
+    }
+    free(argvCopy);
+    int childStatus = 0;
+    if (waitpid(pid, &childStatus, 0) < 0) {
+        fprintf(stderr, "find: waitpid: %s\n", strerror(errno));
+        return 1;
+    }
+    if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int smallclueFindVisit(const char *path, const SmallclueFindOptions *opts,
+                              int *status, int depth) {
     struct stat st;
     if (lstat(path, &st) != 0) {
         fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
         if (status) *status = 1;
         return 1;
     }
-    const char *leaf = smallclueLeafName(path);
-    if (!pattern || fnmatch(pattern, leaf, 0) == 0) {
-        printf("%s\n", path);
-    }
-    if (S_ISDIR(st.st_mode)) {
+
+    bool isDir = S_ISDIR(st.st_mode);
+    bool descendFirst = isDir && (opts->maxDepth < 0 || depth < opts->maxDepth);
+    /* -delete requires an empty directory, so recurse (and delete children)
+     * before acting on this entry -- matches GNU find's depth-first order
+     * for -delete. */
+    if (descendFirst) {
         DIR *dir = opendir(path);
         if (!dir) {
             fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
             if (status) *status = 1;
-            return 1;
-        }
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
+        } else {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                    continue;
+                }
+                char child[PATH_MAX];
+                if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+                    fprintf(stderr, "find: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+                    if (status) *status = 1;
+                    continue;
+                }
+                smallclueFindVisit(child, opts, status, depth + 1);
             }
-            char child[PATH_MAX];
-            if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
-                fprintf(stderr, "find: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+            closedir(dir);
+        }
+    }
+
+    if (smallclueFindMatches(path, &st, opts, depth)) {
+        if (opts->doExec) {
+            if (smallclueFindRunExec(path, opts->execArgv, opts->execArgc) != 0) {
                 if (status) *status = 1;
-                continue;
             }
-            smallclueFindVisit(child, pattern, status);
         }
-        closedir(dir);
+        if (opts->doDelete) {
+            int rc = isDir ? rmdir(path) : unlink(path);
+            if (rc != 0) {
+                fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
+                if (status) *status = 1;
+            }
+        }
+        if (!opts->haveAction) {
+            printf("%s\n", path);
+        }
     }
     return 0;
 }
 
 static int smallclueFindCommand(int argc, char **argv) {
     const char *start = ".";
-    const char *pattern = NULL;
+    SmallclueFindOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.maxDepth = -1;
+
     int index = 1;
     if (index < argc && argv[index] && argv[index][0] != '-') {
         start = argv[index++];
@@ -15253,14 +15354,66 @@ static int smallclueFindCommand(int argc, char **argv) {
                 fprintf(stderr, "find: missing argument to -name\n");
                 return 1;
             }
-            pattern = argv[index++];
+            opts.namePattern = argv[index++];
+        } else if (strcmp(arg, "-iname") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -iname\n");
+                return 1;
+            }
+            opts.inamePattern = argv[index++];
+        } else if (strcmp(arg, "-type") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -type\n");
+                return 1;
+            }
+            const char *typeArg = argv[index++];
+            if (strcmp(typeArg, "f") != 0 && strcmp(typeArg, "d") != 0 && strcmp(typeArg, "l") != 0) {
+                fprintf(stderr, "find: unsupported -type '%s' (only f/d/l)\n", typeArg);
+                return 1;
+            }
+            opts.typeFilter = typeArg[0];
+        } else if (strcmp(arg, "-maxdepth") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -maxdepth\n");
+                return 1;
+            }
+            opts.maxDepth = atoi(argv[index++]);
+        } else if (strcmp(arg, "-mindepth") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -mindepth\n");
+                return 1;
+            }
+            opts.minDepth = atoi(argv[index++]);
+        } else if (strcmp(arg, "-delete") == 0) {
+            opts.doDelete = true;
+            opts.haveAction = true;
+        } else if (strcmp(arg, "-print") == 0) {
+            opts.haveAction = false;
+        } else if (strcmp(arg, "-exec") == 0) {
+            opts.execArgv = &argv[index];
+            int execStart = index;
+            while (index < argc && strcmp(argv[index], ";") != 0) {
+                index++;
+            }
+            if (index >= argc) {
+                fprintf(stderr, "find: -exec requires a terminating ';'\n");
+                return 1;
+            }
+            opts.execArgc = index - execStart;
+            if (opts.execArgc == 0) {
+                fprintf(stderr, "find: -exec requires a command\n");
+                return 1;
+            }
+            index++; /* consume the ';' */
+            opts.doExec = true;
+            opts.haveAction = true;
         } else {
             fprintf(stderr, "find: unsupported predicate '%s'\n", arg);
             return 1;
         }
     }
     int status = 0;
-    smallclueFindVisit(start, pattern, &status);
+    smallclueFindVisit(start, &opts, &status, 0);
     return status ? 1 : 0;
 }
 
