@@ -1270,6 +1270,7 @@ static int smallclueClearCommand(int argc, char **argv);
 static int smallclueRmCommand(int argc, char **argv);
 static int smallclueCpCommand(int argc, char **argv);
 static int smallclueMvCommand(int argc, char **argv);
+static int smallclueInstallCommand(int argc, char **argv);
 static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
@@ -2043,6 +2044,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"umount", smallclueUmountCommand, "Unmount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
+    {"install", smallclueInstallCommand, "Copy files and set attributes (or create directories)"},
     {"md5sum", smallclueMd5sumCommand, "Compute or check MD5 digests"},
     {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
     {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
@@ -2277,6 +2279,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
            "  Move or rename files"},
+    {"install", "install [-m MODE] [-D] SRC... DEST\n"
+                "       install -d [-m MODE] DIRECTORY...\n"
+                "  Copy SRC to DEST (or each SRC into DEST/ if it's a\n"
+                "  directory) and chmod to MODE (default 0755)\n"
+                "  -D create DEST's parent directories first\n"
+                "  -d create directories instead of copying files\n"
+                "  -v verbose"},
     {"md5sum", "md5sum [-c] [FILE...]\n"
                "  -c verify against a checksums file (\"HEXDIGEST  path\" per line)"},
     {"sha1sum", "sha1sum [-c] [FILE...]\n"
@@ -18310,6 +18319,123 @@ static int smallclueMvCommand(int argc, char **argv) {
             }
         } else {
             fprintf(stderr, "mv: %s -> %s: %s\n", src, target, strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
+/* install(1): `make install` targets very commonly invoke this directly
+ * rather than cp+chmod+mkdir -p, so its absence is a real gap for a
+ * self-hosted build environment. Supports the common subset: copying
+ * (optionally into a directory, or with -D creating the destination's
+ * parent directories first) with a settable mode, and -d for creating
+ * directories outright instead of copying files. -o/-g (owner/group) are
+ * not implemented -- they require root in the common case and add scope
+ * without being load-bearing for a single-user guest. */
+static int smallclueInstallCommand(int argc, char **argv) {
+    mode_t mode = 0755;
+    bool makeDirs = false;      /* -d: create directories, don't copy files */
+    bool makeParentDirs = false; /* -D: create DEST's parent dirs first */
+    bool verbose = false;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-m") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "install: -m requires a mode argument\n");
+                return 1;
+            }
+            mode_t parsed;
+            if (!smallclueChmodParseOctal(argv[++argi], &parsed)) {
+                fprintf(stderr, "install: invalid mode '%s'\n", argv[argi]);
+                return 1;
+            }
+            mode = parsed;
+        } else if (strcmp(arg, "-d") == 0) {
+            makeDirs = true;
+        } else if (strcmp(arg, "-D") == 0) {
+            makeParentDirs = true;
+        } else if (strcmp(arg, "-v") == 0) {
+            verbose = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "install: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+
+    if (makeDirs) {
+        if (argi >= argc) {
+            fprintf(stderr, "install: -d requires at least one directory\n");
+            return 1;
+        }
+        int status = 0;
+        for (int i = argi; i < argc; ++i) {
+            if (verbose) {
+                printf("install: creating directory %s\n", argv[i]);
+            }
+            if (smallclueMkdirParents(argv[i], mode, verbose) != 0) {
+                fprintf(stderr, "install: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    if (argc - argi < 2) {
+        fprintf(stderr, "install: missing file operand\n");
+        return 1;
+    }
+    const char *dest = argv[argc - 1];
+    int sourceCount = (argc - 1) - argi;
+    struct stat destStat;
+    bool destIsDir = stat(dest, &destStat) == 0 && S_ISDIR(destStat.st_mode);
+    if (sourceCount > 1 && !destIsDir) {
+        fprintf(stderr, "install: target '%s' is not a directory\n", dest);
+        return 1;
+    }
+
+    int status = 0;
+    for (int i = argi; i < argi + sourceCount; ++i) {
+        const char *src = argv[i];
+        char targetPath[PATH_MAX];
+        const char *target = dest;
+        if (destIsDir) {
+            if (smallclueBuildPath(targetPath, sizeof(targetPath), dest, smallclueLeafName(src)) != 0) {
+                fprintf(stderr, "install: %s/%s: %s\n", dest, smallclueLeafName(src), strerror(errno));
+                status = 1;
+                continue;
+            }
+            target = targetPath;
+        } else if (makeParentDirs) {
+            char parentBuf[PATH_MAX];
+            snprintf(parentBuf, sizeof(parentBuf), "%s", dest);
+            char *slash = strrchr(parentBuf, '/');
+            if (slash && slash != parentBuf) {
+                *slash = '\0';
+                if (smallclueMkdirParents(parentBuf, 0777, verbose) != 0) {
+                    fprintf(stderr, "install: %s: %s\n", parentBuf, strerror(errno));
+                    status = 1;
+                    continue;
+                }
+            }
+        }
+        if (verbose) {
+            printf("install: %s -> %s\n", src, target);
+        }
+        if (smallclueCopyFile("install", src, target) != 0) {
+            status = 1;
+            continue;
+        }
+        if (chmod(target, mode) != 0) {
+            fprintf(stderr, "install: %s: %s\n", target, strerror(errno));
             status = 1;
         }
     }
