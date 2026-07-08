@@ -2191,8 +2191,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"dvtm", "dvtm\n"
              "  Launch dvtm terminal multiplexer"},
 #endif
-    {"echo", "echo [args...]\n"
-             "  Print arguments"},
+    {"echo", "echo [-neE] [args...]\n"
+             "  Print arguments\n"
+             "  -n: suppress the trailing newline\n"
+             "  -e: interpret backslash escapes (\\n \\t \\\\ \\0NNN \\xHH etc; \\c\n"
+             "      stops all further output immediately)\n"
+             "  -E: don't interpret backslash escapes (the default)"},
     {"env", "env [-i] [NAME=VALUE ...] [command]\n"
             "  -i start with empty environment"},
     {"expr", "expr EXPRESSION\n"
@@ -10923,20 +10927,101 @@ static void print_usage(void) {
     fprintf(stderr, "\nYou can symlink applets to 'smallclue' or invoke them directly.\n");
 }
 
+/* Expands bash-echo-style backslash escapes (\a \b \e \f \n \r \t \v \\,
+ * plus \0NNN octal and \xHH hex) while printing directly to stdout.
+ * Returns true if \c was encountered, meaning the caller should stop all
+ * further output immediately (no trailing space/newline, no more args). */
+static bool smallclueEchoPrintExpanded(const char *s) {
+    for (const char *p = s; *p; ++p) {
+        if (*p == '\\' && p[1]) {
+            switch (p[1]) {
+                case 'a': putchar('\a'); p++; continue;
+                case 'b': putchar('\b'); p++; continue;
+                case 'c': return true;
+                case 'e': putchar('\033'); p++; continue;
+                case 'f': putchar('\f'); p++; continue;
+                case 'n': putchar('\n'); p++; continue;
+                case 'r': putchar('\r'); p++; continue;
+                case 't': putchar('\t'); p++; continue;
+                case 'v': putchar('\v'); p++; continue;
+                case '\\': putchar('\\'); p++; continue;
+                case '0': {
+                    int val = 0, digits = 0;
+                    const char *q = p + 2;
+                    while (digits < 3 && *q >= '0' && *q <= '7') {
+                        val = val * 8 + (*q - '0');
+                        q++;
+                        digits++;
+                    }
+                    putchar(val);
+                    p = q - 1;
+                    continue;
+                }
+                case 'x': {
+                    int val = 0, digits = 0;
+                    const char *q = p + 2;
+                    while (digits < 2 && isxdigit((unsigned char)*q)) {
+                        char hc = *q;
+                        int hv = (hc >= '0' && hc <= '9') ? hc - '0' : (tolower((unsigned char)hc) - 'a' + 10);
+                        val = val * 16 + hv;
+                        q++;
+                        digits++;
+                    }
+                    if (digits > 0) {
+                        putchar(val);
+                        p = q - 1;
+                        continue;
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        putchar(*p);
+    }
+    return false;
+}
+
 static int smallclueEchoCommand(int argc, char **argv) {
     int print_newline = 1;
+    bool interpret_escapes = false;
     int start_index = 1;
-    if (argc > 1 && strcmp(argv[1], "-n") == 0) {
-        print_newline = 0;
-        start_index = 2;
+
+    /* Matches bash's builtin echo option scanning: a leading arg is only
+     * an option cluster if EVERY character after the '-' is one of
+     * n/e/E; anything else (including a bare "-") stops option scanning
+     * and is treated as the first operand. */
+    for (; start_index < argc; ++start_index) {
+        const char *arg = argv[start_index];
+        if (!arg || arg[0] != '-' || arg[1] == '\0') break;
+        bool all_flags = true;
+        for (const char *c = arg + 1; *c; ++c) {
+            if (*c != 'n' && *c != 'e' && *c != 'E') {
+                all_flags = false;
+                break;
+            }
+        }
+        if (!all_flags) break;
+        for (const char *c = arg + 1; *c; ++c) {
+            if (*c == 'n') print_newline = 0;
+            else if (*c == 'e') interpret_escapes = true;
+            else if (*c == 'E') interpret_escapes = false;
+        }
     }
-    for (int i = start_index; i < argc; i++) {
-        printf("%s", argv[i]);
-        if (i < argc - 1) {
+
+    bool stop = false;
+    for (int i = start_index; i < argc && !stop; i++) {
+        if (interpret_escapes) {
+            stop = smallclueEchoPrintExpanded(argv[i]);
+        } else {
+            fputs(argv[i], stdout);
+        }
+        if (!stop && i < argc - 1) {
             putchar(' ');
         }
     }
-    if (print_newline) {
+    if (print_newline && !stop) {
         putchar('\n');
     }
     return 0;
