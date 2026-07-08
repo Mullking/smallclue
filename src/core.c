@@ -2410,12 +2410,18 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Simple substitution support"},
     {"sleep", "sleep SECONDS\n"
               "  Pause execution"},
-    {"sort", "sort [-r] [-n] [-u] [-k N] [-t SEP] [FILE...]\n"
+    {"sort", "sort [-r] [-n] [-u] [-k N] [-t SEP] [-c|-C] [-m] [FILE...]\n"
              "  -r reverse\n"
              "  -n numeric\n"
              "  -u unique (after sorting)\n"
              "  -k N sort by field N through end of line (1-based)\n"
-             "  -t SEP field separator for -k (default: runs of whitespace)"},
+             "  -t SEP field separator for -k (default: runs of whitespace)\n"
+             "  -c/--check: verify input is already sorted; no output, exits 1\n"
+             "     and reports the first out-of-order line if not\n"
+             "  -C/--check=quiet: like -c but no diagnostic message\n"
+             "  -m/--merge: accepted for compatibility (sorts fully rather\n"
+             "     than doing a true presorted-runs merge; same output)\n"
+             "  Stable: equal-key lines keep their original relative order"},
     {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
              "  -L follow symlinks\n"
              "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
@@ -4775,6 +4781,67 @@ static int smallclueSortCompare(const void *a, const void *b) {
         return 0;
     }
     return strcmp(lkey, rkey);
+}
+
+/* qsort() isn't guaranteed stable, but GNU sort documents itself as
+ * stable (equal-key lines keep their original relative order). A simple
+ * bottom-up-recursive merge sort gives that for free (merge always
+ * takes the left/earlier run on a tie) without needing to smuggle an
+ * original-index tiebreaker through qsort's context-free comparator. */
+static void smallclueSortStableMerge(char **arr, char **temp, size_t lo, size_t mid, size_t hi) {
+    size_t i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        if (smallclueSortCompare(&arr[i], &arr[j]) <= 0) {
+            temp[k++] = arr[i++];
+        } else {
+            temp[k++] = arr[j++];
+        }
+    }
+    while (i < mid) temp[k++] = arr[i++];
+    while (j < hi) temp[k++] = arr[j++];
+    for (size_t x = lo; x < hi; ++x) arr[x] = temp[x];
+}
+
+static void smallclueSortStableRec(char **arr, char **temp, size_t lo, size_t hi) {
+    if (hi - lo <= 1) return;
+    size_t mid = lo + (hi - lo) / 2;
+    smallclueSortStableRec(arr, temp, lo, mid);
+    smallclueSortStableRec(arr, temp, mid, hi);
+    smallclueSortStableMerge(arr, temp, lo, mid, hi);
+}
+
+static void smallclueSortStable(char **arr, size_t count) {
+    if (count < 2) return;
+    char **temp = (char **)malloc(count * sizeof(char *));
+    if (!temp) {
+        qsort(arr, count, sizeof(char *), smallclueSortCompare);
+        return;
+    }
+    smallclueSortStableRec(arr, temp, 0, count);
+    free(temp);
+}
+
+/* -c/--check: verifies the input is already ordered per the current
+ * comparator/reverse settings, printing GNU sort's "disorder" diagnostic
+ * (unless quiet) and returning 1 on the first out-of-order pair. */
+static int smallclueSortCheckOrder(const SmallclueLineVector *vec, bool reverse, bool quiet, const char *label) {
+    for (size_t i = 1; i < vec->count; ++i) {
+        int cmp = smallclueSortCompare(&vec->items[i - 1], &vec->items[i]);
+        bool outOfOrder = reverse ? (cmp < 0) : (cmp > 0);
+        if (outOfOrder) {
+            if (!quiet) {
+                char *lineCopy = strdup(vec->items[i]);
+                if (lineCopy) {
+                    size_t len = strlen(lineCopy);
+                    if (len > 0 && lineCopy[len - 1] == '\n') lineCopy[len - 1] = '\0';
+                    fprintf(stderr, "sort: %s:%zu: disorder: %s\n", label ? label : "-", i + 1, lineCopy);
+                    free(lineCopy);
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static FILE *smallclueOpenTempFile(const char *tag) {
@@ -15957,6 +16024,8 @@ static int smallclueResizeCommand(int argc, char **argv) {
 static int smallclueSortCommand(int argc, char **argv) {
     int reverse = 0;
     bool uniqueOnly = false;
+    bool checkOnly = false;
+    bool checkQuiet = false;
     memset(&gSmallclueSortOpts, 0, sizeof(gSmallclueSortOpts));
     int index = 1;
     while (index < argc) {
@@ -15980,6 +16049,29 @@ static int smallclueSortCommand(int argc, char **argv) {
         }
         if (strcmp(arg, "-u") == 0) {
             uniqueOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--check") == 0 || strcmp(arg, "--check=diagnose-first") == 0) {
+            checkOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-C") == 0 || strcmp(arg, "--check=quiet") == 0 || strcmp(arg, "--check=silent") == 0) {
+            checkOnly = true;
+            checkQuiet = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--merge") == 0) {
+            /* Accepted for compatibility: treated as a full re-sort of
+             * the (assumed-sorted) inputs rather than a true multiway
+             * merge. Output is identical either way -- this just skips
+             * the presorted-runs optimization, matching this codebase's
+             * established scope trade-offs (e.g. diff's O(n*m) DP
+             * instead of full Myers). Nothing else to do here: the
+             * existing full-sort path below already produces the
+             * correct result. */
             index++;
             continue;
         }
@@ -16039,8 +16131,18 @@ static int smallclueSortCommand(int argc, char **argv) {
             fclose(fp);
         }
     }
+    if (status == 0 && checkOnly) {
+        /* GNU sort's -c reports FILE:LINE; with a single input source
+         * that's unambiguous, so use the real name. With stdin or
+         * multiple concatenated files there's no one file the global
+         * line number maps to, so fall back to "-". */
+        const char *label = (index < argc && index == argc - 1) ? argv[index] : "-";
+        int rc = smallclueSortCheckOrder(&vec, reverse != 0, checkQuiet, label);
+        smallclueLineVectorFree(&vec);
+        return rc;
+    }
     if (status == 0 && vec.count > 1) {
-        qsort(vec.items, vec.count, sizeof(char *), smallclueSortCompare);
+        smallclueSortStable(vec.items, vec.count);
     }
     if (status == 0) {
         char *lastPrinted = NULL;
