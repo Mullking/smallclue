@@ -7491,8 +7491,41 @@ static int smallclueGitFormatPrettyCommit(const git_commit *commit,
     return 0;
 }
 
+/* Formats a git_signature's timestamp the way real `git log`'s default
+ * format does: "Ddd Mon D HH:MM:SS YYYY +ZZZZ", using the signature's
+ * OWN recorded UTC offset (not the local system's), since that's the
+ * timezone the commit was actually made in. */
+static void smallclueGitFormatDefaultDate(const git_signature *sig, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!sig) return;
+    time_t t = (time_t)sig->when.time;
+    int offset_minutes = sig->when.offset;
+    time_t local_t = t + (time_t)offset_minutes * 60;
+    struct tm tm_buf;
+    gmtime_r(&local_t, &tm_buf);
+    /* Real git's default date format uses a plain (non-zero/space-padded)
+     * day-of-month, unlike %e (which space-pads to 2 columns) or %d
+     * (which zero-pads) -- format the weekday/month and time/year
+     * separately and splice in tm_mday as a bare integer. */
+    char wday_mon[16];
+    char rest[32];
+    if (strftime(wday_mon, sizeof(wday_mon), "%a %b", &tm_buf) == 0 ||
+        strftime(rest, sizeof(rest), "%H:%M:%S %Y", &tm_buf) == 0) {
+        return;
+    }
+    int sign = (offset_minutes < 0) ? -1 : 1;
+    int abs_offset = (offset_minutes < 0) ? -offset_minutes : offset_minutes;
+    int oh = abs_offset / 60;
+    int om = abs_offset % 60;
+    snprintf(out, out_sz, "%s %d %s %c%02d%02d", wday_mon, tm_buf.tm_mday, rest,
+             sign < 0 ? '-' : '+', oh, om);
+}
+
 static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
     bool oneline = false;
+    bool patch_mode = false;
+    bool graph_mode = false;
     bool decorate = false;
     bool reverse = false;
     bool log_all = false;
@@ -7525,6 +7558,18 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         }
         if (strcmp(arg, "--oneline") == 0) {
             oneline = true;
+            continue;
+        }
+        if (strcmp(arg, "-p") == 0 || strcmp(arg, "--patch") == 0 || strcmp(arg, "-u") == 0) {
+            patch_mode = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-patch") == 0 || strcmp(arg, "-s") == 0) {
+            patch_mode = false;
+            continue;
+        }
+        if (strcmp(arg, "--graph") == 0) {
+            graph_mode = true;
             continue;
         }
         if (strcmp(arg, "--abbrev-commit") == 0) {
@@ -7649,6 +7694,13 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         }
     }
 
+    /* -p prints each commit's diff immediately as it's visited; buffering
+     * headers for --reverse while printing diffs in forward order would
+     * badly interleave the two, so -p takes priority and disables the
+     * reverse-buffering path (a scope trade-off -- `log --reverse -p` is
+     * a rare combination next to plain `log -p`). */
+    bool effective_reverse = reverse && !patch_mode;
+
     git_revwalk *walk = NULL;
     if (git_revwalk_new(&walk, repo) != 0) {
         smallclueGitPrintLibgitError("log walk failed");
@@ -7772,7 +7824,7 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         char subject[512];
         smallclueGitCopySubjectLine(smallclueGitCommitSubject(commit), subject, sizeof(subject));
 
-        char line[2048];
+        char line[8192];
         line[0] = '\0';
         if (format_spec && *format_spec) {
             if (smallclueGitFormatPrettyCommit(commit, &oid, abbrev_width, format_spec, line, sizeof(line)) != 0) {
@@ -7788,44 +7840,99 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
                 smallclueGitPrintError("log format output too long");
                 return 1;
             }
-        } else {
-            if (oneline) {
-                if (decorate) {
-                    char deco[512];
-                    smallclueGitDecorateCommit(repo,
-                                               &oid,
-                                               head_name,
-                                               have_head_target ? &head_target : NULL,
-                                               deco,
-                                               sizeof(deco));
-                    if (deco[0]) {
-                        (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
-                    } else {
-                        (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
-                    }
+        } else if (oneline) {
+            if (decorate) {
+                char deco[512];
+                smallclueGitDecorateCommit(repo,
+                                           &oid,
+                                           head_name,
+                                           have_head_target ? &head_target : NULL,
+                                           deco,
+                                           sizeof(deco));
+                if (deco[0]) {
+                    (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
                 } else {
                     (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
                 }
             } else {
-                if (decorate) {
-                    char deco[512];
-                    smallclueGitDecorateCommit(repo,
-                                               &oid,
-                                               head_name,
-                                               have_head_target ? &head_target : NULL,
-                                               deco,
-                                               sizeof(deco));
-                    if (deco[0]) {
-                        (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
-                    } else {
-                        (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
-                    }
-                } else {
-                    (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
-                }
+                (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
+            }
+        } else {
+            /* Real git log's actual default format (not the same as
+             * --oneline, which the previous implementation incorrectly
+             * fell back to regardless of --oneline being given):
+             * "commit <full-hash>\nAuthor: ...\nDate:   ...\n\n    msg\n\n" */
+            char full_oid[GIT_OID_HEXSZ + 1];
+            (void)git_oid_tostr(full_oid, sizeof(full_oid), &oid);
+            const git_signature *author = git_commit_author(commit);
+            char date_buf[64];
+            smallclueGitFormatDefaultDate(author, date_buf, sizeof(date_buf));
+            char deco[512];
+            deco[0] = '\0';
+            if (decorate) {
+                smallclueGitDecorateCommit(repo, &oid, head_name,
+                                           have_head_target ? &head_target : NULL,
+                                           deco, sizeof(deco));
+            }
+            size_t used = 0;
+            int n = snprintf(line + used, sizeof(line) - used, "commit %s%s%s%s\n",
+                             full_oid, deco[0] ? " (" : "", deco, deco[0] ? ")" : "");
+            if (n > 0) used += (size_t)n;
+            n = snprintf(line + used, sizeof(line) - used, "Author: %s <%s>\n",
+                        author && author->name ? author->name : "",
+                        author && author->email ? author->email : "");
+            if (n > 0) used += (size_t)n;
+            n = snprintf(line + used, sizeof(line) - used, "Date:   %s\n\n", date_buf);
+            if (n > 0) used += (size_t)n;
+            const char *full_msg = git_commit_message(commit);
+            if (!full_msg) full_msg = "";
+            /* Indent every line of the message body by 4 spaces, matching
+             * git's default format, stopping early if the buffer fills. */
+            const char *mp = full_msg;
+            while (*mp && used + 8 < sizeof(line)) {
+                const char *nl = strchr(mp, '\n');
+                size_t seglen = nl ? (size_t)(nl - mp) : strlen(mp);
+                if (used + 4 + seglen + 1 >= sizeof(line)) break;
+                memcpy(line + used, "    ", 4);
+                used += 4;
+                memcpy(line + used, mp, seglen);
+                used += seglen;
+                line[used++] = '\n';
+                mp = nl ? nl + 1 : mp + seglen;
+                if (!nl) break;
+            }
+            /* No trailing blank line here -- that separator belongs
+             * between entries (or between the message and a following
+             * patch), not baked into every commit's own text, otherwise
+             * the very last entry would leave a stray blank line at the
+             * end of the whole `log` output. Handled at print time. */
+            line[used < sizeof(line) ? used : sizeof(line) - 1] = '\0';
+        }
+
+        if (graph_mode && !(format_spec && *format_spec)) {
+            /* Prefix only the first line ("commit <hash>" or the
+             * one-line summary) with "* ". Real git also continues the
+             * graph marker down through every subsequent line of a
+             * multi-line commit block (Author/Date/message/diff), using
+             * "| " for ongoing history but plain spaces once a commit
+             * has no further ancestor in view -- correctly reproducing
+             * that (including the diff content itself also being
+             * prefixed) needs real per-commit graph-column state that's
+             * out of scope here. --oneline (by far --graph's most common
+             * pairing) is a single line per commit, so this is already a
+             * complete, exact match for that case; multi-line formats
+             * combined with --graph get a graph marker on just the
+             * first line, with continuation lines left unprefixed. */
+            char graphed[sizeof(line) + 8];
+            const char *nl = strchr(line, '\n');
+            size_t firstLen = nl ? (size_t)(nl - line) : strlen(line);
+            int n = snprintf(graphed, sizeof(graphed), "* %.*s%s", (int)firstLen, line, nl ? nl : "");
+            if (n > 0 && (size_t)n < sizeof(graphed)) {
+                snprintf(line, sizeof(line), "%s", graphed);
             }
         }
-        if (reverse) {
+
+        if (effective_reverse) {
             if (reverse_count == reverse_capacity) {
                 size_t new_capacity = reverse_capacity ? reverse_capacity * 2 : 16;
                 char **grown = (char **)realloc(reverse_lines, new_capacity * sizeof(char *));
@@ -7867,7 +7974,38 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
                     fputc('\n', stdout);
                 }
             } else {
+                /* Full (non-oneline) format: one blank line separates
+                 * consecutive entries, but there's no separator before
+                 * the first entry and no trailing one after the last --
+                 * printing it here (before this entry, when it isn't
+                 * the first) achieves exactly that without needing to
+                 * know in advance which commit the stream will end on. */
+                if (!oneline && printed > 0) {
+                    putchar('\n');
+                }
                 fputs(line, stdout);
+            }
+            if (patch_mode) {
+                git_tree *new_tree = NULL;
+                git_tree *old_tree = NULL;
+                if (git_commit_tree(&new_tree, commit) == 0) {
+                    if (git_commit_parentcount(commit) > 0) {
+                        git_commit *parent = NULL;
+                        if (git_commit_parent(&parent, commit, 0) == 0) {
+                            (void)git_commit_tree(&old_tree, parent);
+                            git_commit_free(parent);
+                        }
+                    }
+                    git_diff_options diff_opts = GIT_DIFF_OPTIONS_INIT;
+                    git_diff *diff = NULL;
+                    if (git_diff_tree_to_tree(&diff, repo, old_tree, new_tree, &diff_opts) == 0 && diff) {
+                        putchar('\n');
+                        (void)smallclueGitPrintDiff(diff, SMALLCLUE_GIT_DIFF_PATCH);
+                        git_diff_free(diff);
+                    }
+                }
+                git_tree_free(old_tree);
+                git_tree_free(new_tree);
             }
         }
 
@@ -7878,10 +8016,14 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         }
     }
 
-    if (reverse && reverse_lines) {
+    if (effective_reverse && reverse_lines) {
         bool first_output = true;
         for (size_t i = reverse_count; i > 0; --i) {
-            if (format_spec && *format_spec && !format_with_terminator && !first_output) {
+            if (format_spec && *format_spec) {
+                if (!format_with_terminator && !first_output) {
+                    fputc('\n', stdout);
+                }
+            } else if (!oneline && !first_output) {
                 fputc('\n', stdout);
             }
             fputs(reverse_lines[i - 1], stdout);
