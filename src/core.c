@@ -71,6 +71,8 @@
 #include <shadow.h>
 #include <crypt.h>
 #include <sys/klog.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #endif
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -2440,8 +2442,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  System initialization (PID 1 by default)\n"
              "  --service-mode allows compatibility startup when PID != 1"},
 #if SMALLCLUE_HAS_IFADDRS
-    {"ipaddr", "ipaddr\n"
-               "  Show interface IP addresses"},
+    {"ipaddr", "ipaddr [-4|-6] [-a]\n"
+               "  Show interface IP addresses\n"
+               "  ipaddr add|del ADDR/PREFIXLEN dev IFACE (Linux only,\n"
+               "  needs CAP_NET_ADMIN; IPv4 only)"},
 #endif
     {"kill", "kill [-SIGNAL] PID...\n"
              "  Signals: HUP INT TERM KILL etc."},
@@ -13515,8 +13519,115 @@ static int smallclueAddTabCommand(int argc, char **argv) {
 #endif
 #if SMALLCLUE_HAS_IFADDRS
 static void smallclueIpAddrUsage(void) {
-    fputs("usage: ipaddr [-4|-6] [-a]\n", stderr);
+    fputs("usage: ipaddr [-4|-6] [-a]\n"
+          "       ipaddr add|del ADDR/PREFIXLEN dev IFACE\n", stderr);
 }
+
+#if defined(__linux__) || defined(linux) || defined(__linux)
+/* IPv4-only netlink RTM_NEWADDR/RTM_DELADDR sender for `ipaddr add/del`.
+ * Uses a real NETLINK_ROUTE socket (not ioctl SIOCSIFADDR) specifically
+ * because ioctl's single-primary-address model can't add a SECOND
+ * address to an interface that already has one without clobbering it --
+ * netlink supports proper multi-address semantics matching real `ip addr
+ * add/del`. IPv6 and CIDR-notation validation beyond a plain prefix
+ * length are out of scope. Requires CAP_NET_ADMIN. */
+struct smallclueNlAddAddrReq {
+    struct nlmsghdr nh;
+    struct ifaddrmsg ifa;
+    struct rtattr rta_local;
+    uint32_t addr_local;
+    struct rtattr rta_address;
+    uint32_t addr_address;
+};
+
+static int smallclueIpAddrModify(const char *ifaceName, const char *addrSpec, bool isAdd) {
+    char addrPart[64];
+    const char *slash = strchr(addrSpec, '/');
+    if (!slash) {
+        fprintf(stderr, "ipaddr: %s: expected ADDR/PREFIXLEN\n", addrSpec);
+        return 1;
+    }
+    size_t addrLen = (size_t)(slash - addrSpec);
+    if (addrLen == 0 || addrLen >= sizeof(addrPart)) {
+        fprintf(stderr, "ipaddr: %s: invalid address\n", addrSpec);
+        return 1;
+    }
+    memcpy(addrPart, addrSpec, addrLen);
+    addrPart[addrLen] = '\0';
+    int prefixLen = atoi(slash + 1);
+    if (prefixLen < 0 || prefixLen > 32) {
+        fprintf(stderr, "ipaddr: %s: invalid prefix length\n", addrSpec);
+        return 1;
+    }
+    struct in_addr addr4;
+    if (inet_pton(AF_INET, addrPart, &addr4) != 1) {
+        fprintf(stderr, "ipaddr: %s: not a valid IPv4 address\n", addrPart);
+        return 1;
+    }
+    unsigned int ifindex = if_nametoindex(ifaceName);
+    if (ifindex == 0) {
+        fprintf(stderr, "ipaddr: %s: %s\n", ifaceName, strerror(errno));
+        return 1;
+    }
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct smallclueNlAddAddrReq req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = sizeof(req);
+    req.nh.nlmsg_type = isAdd ? RTM_NEWADDR : RTM_DELADDR;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (isAdd) {
+        req.nh.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    }
+    req.nh.nlmsg_seq = 1;
+    req.ifa.ifa_family = AF_INET;
+    req.ifa.ifa_prefixlen = (unsigned char)prefixLen;
+    req.ifa.ifa_scope = 0;
+    req.ifa.ifa_index = ifindex;
+    req.rta_local.rta_len = RTA_LENGTH(sizeof(req.addr_local));
+    req.rta_local.rta_type = IFA_LOCAL;
+    req.addr_local = addr4.s_addr;
+    req.rta_address.rta_len = RTA_LENGTH(sizeof(req.addr_address));
+    req.rta_address.rta_type = IFA_ADDRESS;
+    req.addr_address = addr4.s_addr;
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+
+    if (sendto(sock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+
+    char replyBuf[4096];
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
+    close(sock);
+    if (n < 0) {
+        fprintf(stderr, "ipaddr: netlink recv: %s\n", strerror(errno));
+        return 1;
+    }
+    for (struct nlmsghdr *nh = (struct nlmsghdr *)replyBuf; NLMSG_OK(nh, (size_t)n); nh = NLMSG_NEXT(nh, n)) {
+        if (nh->nlmsg_type == NLMSG_ERROR) {
+            const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
+            if (err->error != 0) {
+                fprintf(stderr, "ipaddr: %s %s/%d on %s: %s\n",
+                        isAdd ? "add" : "del", addrPart, prefixLen, ifaceName, strerror(-err->error));
+                return 1;
+            }
+            return 0;
+        }
+    }
+    fprintf(stderr, "ipaddr: no netlink ACK received\n");
+    return 1;
+}
+#endif
 
 static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, bool show_all) {
     if (show_all || !ifa) {
@@ -13537,6 +13648,20 @@ static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, 
 }
 
 static int smallclueIpAddrCommand(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "add") == 0 || strcmp(argv[1], "del") == 0)) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        bool isAdd = strcmp(argv[1], "add") == 0;
+        /* ADDR/PREFIXLEN dev IFACE */
+        if (argc != 5 || strcmp(argv[3], "dev") != 0) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpAddrModify(argv[4], argv[2], isAdd);
+#else
+        fprintf(stderr, "ipaddr: add/del is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
     bool request_v4 = false;
     bool request_v6 = false;
     bool show_all = false;
