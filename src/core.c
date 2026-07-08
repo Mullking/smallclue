@@ -2594,7 +2594,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"tee", "tee [-a] FILE...\n"
             "  -a append"},
     {"telnet", "telnet [-p PORT] HOST\n"
-               "  Connect to HOST over TCP (default port 23) and relay stdin/stdout"},
+               "  Connect to HOST over TCP (default port 23) and relay stdin/stdout;\n"
+               "  handles IAC option negotiation (declines every DO/WILL request)\n"
+               "  and subnegotiation blocks -- no actual options are supported"},
     {"traceroute", "traceroute HOST [PORT]\n"
                    "  Trace network path using the system traceroute command"},
     {"test", "test EXPRESSION\n"
@@ -14134,7 +14136,98 @@ static int smallcluePingCommand(int argc, char **argv) {
 #define TELNET_DEFAULT_PORT 23
 #define TELNET_BUF_SIZE 4096
 
+/* Telnet protocol constants (RFC 854) -- defined locally rather than
+ * pulled from <arpa/telnet.h> since that header isn't guaranteed to
+ * exist on every target libc (e.g. musl, used on the actual deployment
+ * target). Only the handful this minimal client actually needs. */
+#define TELNET_IAC  255
+#define TELNET_DONT 254
+#define TELNET_DO   253
+#define TELNET_WONT 252
+#define TELNET_WILL 251
+#define TELNET_SB   250
+#define TELNET_SE   240
+
+typedef enum {
+    TELNET_PARSE_DATA,
+    TELNET_PARSE_IAC,
+    TELNET_PARSE_CMD,   /* saw IAC DO/DONT/WILL/WONT, waiting for the option byte */
+    TELNET_PARSE_SB,     /* inside IAC SB ... waiting for IAC SE to close it */
+    TELNET_PARSE_SB_IAC, /* inside SB, saw an IAC, check if next is SE */
+} SmallclueTelnetParseState;
+
+typedef struct {
+    SmallclueTelnetParseState state;
+    unsigned char pendingCmd; /* the DO/DONT/WILL/WONT byte, valid in TELNET_PARSE_CMD */
+} SmallclueTelnetParser;
+
+/* Feeds one byte of server output through the telnet negotiation state
+ * machine. Plain data bytes are appended to `out`; IAC-prefixed option
+ * negotiation (DO/DONT/WILL/WONT <option>) is intercepted and answered
+ * immediately on `sock` (this client declines every option: WONT in
+ * reply to DO, DONT in reply to WILL -- the standard minimal-client
+ * response when there's nothing to actually negotiate), and IAC SB ...
+ * IAC SE subnegotiation blocks are consumed without being echoed. A
+ * doubled IAC IAC in the data stream is the escape for a literal 0xFF
+ * byte and is unescaped back to a single 0xFF. */
+static void smallclueTelnetFeedByte(SmallclueTelnetParser *p, unsigned char c, int sock,
+                                    unsigned char *out, size_t *outLen) {
+    switch (p->state) {
+        case TELNET_PARSE_DATA:
+            if (c == TELNET_IAC) {
+                p->state = TELNET_PARSE_IAC;
+            } else {
+                out[(*outLen)++] = c;
+            }
+            break;
+        case TELNET_PARSE_IAC:
+            if (c == TELNET_IAC) {
+                out[(*outLen)++] = TELNET_IAC;
+                p->state = TELNET_PARSE_DATA;
+            } else if (c == TELNET_DO || c == TELNET_DONT || c == TELNET_WILL || c == TELNET_WONT) {
+                p->pendingCmd = c;
+                p->state = TELNET_PARSE_CMD;
+            } else if (c == TELNET_SB) {
+                p->state = TELNET_PARSE_SB;
+            } else {
+                /* Single-byte commands (NOP, AYT, etc.) and anything else
+                 * unrecognized: consume and return to plain data. */
+                p->state = TELNET_PARSE_DATA;
+            }
+            break;
+        case TELNET_PARSE_CMD: {
+            unsigned char reply[3] = { TELNET_IAC, 0, c };
+            if (p->pendingCmd == TELNET_DO) {
+                reply[1] = TELNET_WONT;
+                (void)write(sock, reply, sizeof(reply));
+            } else if (p->pendingCmd == TELNET_WILL) {
+                reply[1] = TELNET_DONT;
+                (void)write(sock, reply, sizeof(reply));
+            }
+            /* DONT/WONT from the server need no reply -- we already
+             * aren't doing whatever it is. */
+            p->state = TELNET_PARSE_DATA;
+            break;
+        }
+        case TELNET_PARSE_SB:
+            if (c == TELNET_IAC) {
+                p->state = TELNET_PARSE_SB_IAC;
+            }
+            break;
+        case TELNET_PARSE_SB_IAC:
+            if (c == TELNET_SE) {
+                p->state = TELNET_PARSE_DATA;
+            } else {
+                /* Not actually the closing IAC SE -- back into the
+                 * subnegotiation body. */
+                p->state = TELNET_PARSE_SB;
+            }
+            break;
+    }
+}
+
 static int smallclueTelnetCommand(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
     smallclueResetGetopt();
     int port = TELNET_DEFAULT_PORT;
     int opt;
@@ -14192,6 +14285,9 @@ static int smallclueTelnetCommand(int argc, char **argv) {
 
     int status = 0;
     bool running = true;
+    SmallclueTelnetParser parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.state = TELNET_PARSE_DATA;
     while (running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -14205,14 +14301,19 @@ static int smallclueTelnetCommand(int argc, char **argv) {
             break;
         }
         if (FD_ISSET(sock, &rfds)) {
-            char buf[TELNET_BUF_SIZE];
+            unsigned char buf[TELNET_BUF_SIZE];
             ssize_t n = read(sock, buf, sizeof(buf));
             if (n <= 0) {
                 running = false;
             } else {
+                unsigned char plain[TELNET_BUF_SIZE];
+                size_t plainLen = 0;
+                for (ssize_t i = 0; i < n; ++i) {
+                    smallclueTelnetFeedByte(&parser, buf[i], sock, plain, &plainLen);
+                }
                 ssize_t off = 0;
-                while (off < n) {
-                    ssize_t w = write(STDOUT_FILENO, buf + off, (size_t)(n - off));
+                while (off < (ssize_t)plainLen) {
+                    ssize_t w = write(STDOUT_FILENO, plain + off, plainLen - (size_t)off);
                     if (w < 0) {
                         if (errno == EINTR) continue;
                         running = false;
