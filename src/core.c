@@ -2318,8 +2318,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Create special files (b=block, c/u=char, p=fifo)"},
     {"mount", "mount [-p] [-t type] [-o options] [source] dir\n"
               "  Mount filesystems (iOS: omit source to open folder picker; -p persists to /etc/fstab)"},
-    {"umount", "umount [-p] dir\n"
-               "  Unmount filesystems (iOS: -p also removes matching /etc/fstab entry)"},
+    {"umount", "umount [-p] [-l] [-f] dir\n"
+               "  Unmount filesystems (iOS: -p also removes matching /etc/fstab entry)\n"
+               "  Linux: -l lazy unmount (MNT_DETACH), -f force (MNT_FORCE)"},
     {"micro", "micro [FILE]\n"
               "  Micro editor"},
     {"more", "more [FILE...]\n"
@@ -19672,20 +19673,34 @@ static int smallclueMountCommand(int argc, char **argv) {
 
 static int smallclueUmountCommand(int argc, char **argv) {
 #if defined(__linux__) || defined(linux) || defined(__linux)
-    const char *usage = "usage: umount dir\n";
+    const char *usage = "usage: umount [-l] [-f] dir\n";
+    bool lazy = false;
+    bool force = false;
     smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "")) != -1) {
-        (void)opt;
-        fputs(usage, stderr);
-        return 1;
+    while ((opt = getopt(argc, argv, "lf")) != -1) {
+        switch (opt) {
+            case 'l':
+                lazy = true;
+                break;
+            case 'f':
+                force = true;
+                break;
+            default:
+                fputs(usage, stderr);
+                return 1;
+        }
     }
     if (optind + 1 != argc) {
         fputs(usage, stderr);
         return 1;
     }
     const char *target = argv[optind];
-    if (umount(target) != 0) {
+    int flags = 0;
+    if (lazy) flags |= MNT_DETACH;
+    if (force) flags |= MNT_FORCE;
+    int rc = flags ? umount2(target, flags) : umount(target);
+    if (rc != 0) {
         perror("umount");
         return 1;
     }
