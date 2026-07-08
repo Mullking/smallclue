@@ -1318,6 +1318,7 @@ static int smallclueBracketCommand(int argc, char **argv);
 static int smallclueXargsCommand(int argc, char **argv);
 static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
+static int smallclueTimeoutCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
@@ -2097,6 +2098,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"time", smallclueTimeCommand, "Measure command runtime"},
     {"tset", smallclueTsetCommand, "Initialize terminal settings"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
+    {"timeout", smallclueTimeoutCommand, "Run a command with a time limit"},
     {"tty", smallclueTtyCommand, "Print terminal name"},
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
@@ -2457,6 +2459,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -r REFFILE: copy REFFILE's timestamps\n"
               "  -t [[CC]YY]MMDDhhmm[.ss]\n"
               "  -d STRING: ISO-ish date (\"YYYY-MM-DD[ HH:MM[:SS]]\")"},
+    {"timeout", "timeout [-s SIGNAL] [-k DURATION] [--preserve-status] DURATION COMMAND [ARG...]\n"
+                "  Run COMMAND, terminating it if it's still running after DURATION\n"
+                "  DURATION accepts an optional s/m/h/d suffix (default seconds)\n"
+                "  -s SIGNAL: signal to send on timeout (default TERM)\n"
+                "  -k DURATION: send KILL after this additional time if still alive\n"
+                "  --preserve-status: exit with COMMAND's own status instead of 124\n"
+                "  Exit 124 on timeout (unless --preserve-status), 125 on usage/setup\n"
+                "  error, 126/127 if COMMAND can't be invoked, else COMMAND's status"},
     {"sum", "sum [-r|-s] [FILE...]\n"
             "  BSD (-r, default): rotate-right checksum, 1K blocks.\n"
             "  SysV (-s, --sysv): simple sum, 512-byte blocks.\n"
@@ -3733,6 +3743,158 @@ static int smallclueKillCommandOriginal(int argc, char **argv) {
 
 static int smallclueKillCommand(int argc, char **argv) {
     return smallclueKillCommandOriginal(argc, argv);
+}
+
+/* Parses a duration like "5", "2.5", "3s", "1m", "2h", "1d" into seconds. */
+static bool smallclueTimeoutParseDuration(const char *s, double *out) {
+    if (!s || !*s) return false;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || v < 0) return false;
+    double mult = 1.0;
+    if (*end != '\0') {
+        if (end[1] != '\0') return false;
+        switch (*end) {
+            case 's': mult = 1.0; break;
+            case 'm': mult = 60.0; break;
+            case 'h': mult = 3600.0; break;
+            case 'd': mult = 86400.0; break;
+            default: return false;
+        }
+    }
+    *out = v * mult;
+    return true;
+}
+
+/* Runs COMMAND in its own process group with a wall-clock time limit,
+ * sending it a signal (default TERM) if it hasn't exited by then, and
+ * escalating to KILL after --kill-after if it's still alive. Polls with
+ * waitpid(WNOHANG) rather than relying on SIGALRM/itimers, matching the
+ * simple portable style used elsewhere in this file (e.g. init's reap
+ * loop) instead of adding signal-handler state. */
+static int smallclueTimeoutCommand(int argc, char **argv) {
+    int signalToSend = SIGTERM;
+    double killAfter = 0.0;
+    bool preserveStatus = false;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--signal") == 0) {
+            if (argi + 1 >= argc || !smallclueParseSignal(argv[argi + 1], &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal\n");
+                return 125;
+            }
+            argi++;
+        } else if (strncmp(arg, "--signal=", 9) == 0) {
+            if (!smallclueParseSignal(arg + 9, &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal '%s'\n", arg + 9);
+                return 125;
+            }
+        } else if (strncmp(arg, "-s", 2) == 0 && arg[2] != '\0') {
+            if (!smallclueParseSignal(arg + 2, &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal '%s'\n", arg + 2);
+                return 125;
+            }
+        } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--kill-after") == 0) {
+            if (argi + 1 >= argc || !smallclueTimeoutParseDuration(argv[argi + 1], &killAfter)) {
+                fprintf(stderr, "timeout: invalid duration\n");
+                return 125;
+            }
+            argi++;
+        } else if (strncmp(arg, "--kill-after=", 13) == 0) {
+            if (!smallclueTimeoutParseDuration(arg + 13, &killAfter)) {
+                fprintf(stderr, "timeout: invalid duration '%s'\n", arg + 13);
+                return 125;
+            }
+        } else if (strcmp(arg, "--preserve-status") == 0) {
+            preserveStatus = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "timeout: unknown option '%s'\n", arg);
+            return 125;
+        } else {
+            break;
+        }
+    }
+
+    if (argi >= argc) {
+        fprintf(stderr, "timeout: missing duration\n");
+        return 125;
+    }
+    double duration;
+    if (!smallclueTimeoutParseDuration(argv[argi], &duration)) {
+        fprintf(stderr, "timeout: invalid duration '%s'\n", argv[argi]);
+        return 125;
+    }
+    argi++;
+    if (argi >= argc) {
+        fprintf(stderr, "timeout: missing command\n");
+        return 125;
+    }
+    char **cmdArgv = &argv[argi];
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "timeout: fork: %s\n", strerror(errno));
+        return 125;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        execvp(cmdArgv[0], cmdArgv);
+        fprintf(stderr, "timeout: %s: %s\n", cmdArgv[0], strerror(errno));
+        _exit(127);
+    }
+    setpgid(pid, pid);
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bool timedOut = false;
+    bool killSent = false;
+    struct timespec signalSentAt = {0, 0};
+    int status = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) {
+            fprintf(stderr, "timeout: waitpid: %s\n", strerror(errno));
+            return 125;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec - start.tv_sec) +
+                          (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+        if (!timedOut && elapsed >= duration) {
+            kill(-pid, signalToSend);
+            timedOut = true;
+            signalSentAt = now;
+        } else if (timedOut && killAfter > 0.0 && !killSent) {
+            double sinceSignal = (double)(now.tv_sec - signalSentAt.tv_sec) +
+                                   (double)(now.tv_nsec - signalSentAt.tv_nsec) / 1e9;
+            if (sinceSignal >= killAfter) {
+                kill(-pid, SIGKILL);
+                killSent = true;
+            }
+        }
+        struct timespec pollInterval = {0, 20 * 1000 * 1000};
+        nanosleep(&pollInterval, NULL);
+    }
+
+    if (timedOut) {
+        if (preserveStatus) {
+            if (WIFEXITED(status)) return WEXITSTATUS(status);
+            if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+            return 1;
+        }
+        return 124;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
 }
 
 /* xargs -I REPLACE mode: builds one invocation's argv by substituting
