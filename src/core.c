@@ -22,6 +22,7 @@
 #include "chown_app.h"
 #include "base64_app.h"
 #include "nohup_app.h"
+#include "cmp_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2016,6 +2017,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
     {"diff", smallclueDiffCommand, "Compare files line by line"},
+    {"cmp", smallclueCmpCommand, "Compare two files byte by byte"},
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
 #if defined(SMALLCLUE_WITH_DVTM)
@@ -2197,6 +2199,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"diff", "diff [-u] [-q] FILE1 FILE2\n"
              "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
              "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
+    {"cmp", "cmp [-s] [-l] FILE1 FILE2\n"
+            "  Byte-for-byte comparison; default prints the first differing\n"
+            "  byte/line offset (or an EOF message if one file is a prefix\n"
+            "  of the other). FILE may be '-' for stdin (only one side).\n"
+            "  -s: silent, exit status only\n"
+            "  -l: list every differing byte offset with both octal values\n"
+            "  Exit status: 0 same, 1 differ, 2 error"},
     {"dirname", "dirname PATH...\n"
                 "  Strip last path component from each PATH, one per line\n"
                 "  -z/--zero: NUL-terminate output instead of newline"},
