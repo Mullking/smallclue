@@ -18,7 +18,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 ### File Management
 * **ls**: List directory contents (supports colors, `-l`, `-h`, `-a`, `-t`, `-R` recursive, `-i` inode, `-S`/`-X`/`-v`/`-r` sort order).
 * **cp**: Copy files and directories (`-r`/`-R` recursive, `-a` archive, `-p` preserve timestamps).
-* **rsync**: By default, dispatches to the vendored upstream **openrsync** (`third-party/openrsync/`), a real rsync-protocol client -- not the hand-rolled local-sync-plus-scp engine described below. openrsync gaps vs GNU rsync: no `-u`/`--update` or `-c`/`--checksum`, `--link-dest`/`--copy-dest` compiled out, `-z`/`--compress` only requests SSH transport compression (not real rsync-protocol payload compression), no `--progress`, and daemon-push (uploading to a remote `rsync://`/`::` target) is not supported. Set `PSCALI_RSYNC_LEGACY=1` to use the legacy hand-rolled engine instead, which synchronizes files/directories locally or over SSH (`-a`, `-r`, `-p`, `-t`, `-u`, `-c`, `-v`, `-z`, `-n`, `--delete`, `--include`, `--exclude`) and routes remote `host:path` transfers through the OpenSSH `scp` backend (supports `-a/-r/-p/-t/-v/-z`, plus `-n` preview; remote `-u/-c/--include/--exclude/--delete` are not yet implemented in that legacy path).
+* **rsync**: By default, dispatches to the vendored upstream **openrsync** (`third-party/openrsync/`), a real rsync-protocol client -- not the hand-rolled local-sync-plus-scp engine described below. Now supports `-u`/`--update` (skip files whose destination copy is newer than the source). Remaining openrsync gaps vs GNU rsync: no `-c`/`--checksum`, `--link-dest`/`--copy-dest` compiled out, `-z`/`--compress` only requests SSH transport compression (not real rsync-protocol payload compression), no `--progress`, and daemon-push (uploading to a remote `rsync://`/`::` target) is not supported. Set `PSCALI_RSYNC_LEGACY=1` to use the legacy hand-rolled engine instead, which synchronizes files/directories locally or over SSH (`-a`, `-r`, `-p`, `-t`, `-u`, `-c`, `-v`, `-z`, `-n`, `--delete`, `--include`, `--exclude`) and routes remote `host:path` transfers through the OpenSSH `scp` backend (supports `-a/-r/-p/-t/-v/-z`, plus `-n` preview; remote `-u/-c/--include/--exclude/--delete` are not yet implemented in that legacy path).
 * **mv**: Move or rename files.
 * **rm**: Remove files and directories (`-r`/`-R`, `-f`, `-i`, `--preserve-root`).
 * **mkdir** / **rmdir**: Create or remove directories.
@@ -67,6 +67,8 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **fold**: Wrap each line to a given width (`-w`, `-s` break at whitespace).
 * **paste**: Merge corresponding lines of files side by side (`-d`, `-s`).
 * **split**: Split a file into pieces by line count or byte count (`-l`, `-b`).
+* **fmt**: Reflow text into filled paragraphs (`-w` width, default 75).
+* **comm**: Compare two sorted files line by line (`-1`/`-2`/`-3` to suppress columns).
 * **md5sum** / **sha1sum** / **sha256sum**: Compute or check cryptographic digests (`-c`).
 * **base64**: Base64 encode or decode (`-d`, `-i`, `-w`).
 * **expr**: Evaluate expressions (shell arithmetic/string idiom).
