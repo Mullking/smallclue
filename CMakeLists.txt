@@ -75,7 +75,7 @@ list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth2-gss\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/gss-genr\\.c$")
 # Drop server/auth-only sources; keep client pieces like authfd/authfile.
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth2-.*\\.c$")
-list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth-(passwd|rhosts).*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth-(passwd|rhosts|shadow).*\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/monitor.*\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sshd.*\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/servconf\\.c$")
@@ -373,15 +373,29 @@ endif()
 # Darwin both ship it in libc itself, so this is a no-op there. On musl,
 # install musl-fts-dev (ships both the header at the normal system include
 # path and libfts.a/.so) -- same package Alpine's own openssh/rsync use.
+# find_library() defaults to preferring .so on Linux; this build links fully
+# static (-static), so ask for the .a explicitly or the linker fails with
+# "attempted static link of dynamic object".
+set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
 find_library(FTS_LIBRARY fts)
+set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
 if(FTS_LIBRARY)
     target_link_libraries(smallclue PRIVATE ${FTS_LIBRARY})
 endif()
 
 # Link OpenSSH dependencies
+# Same static-vs-shared story as the FTS_LIBRARY lookup above: FindZLIB/
+# FindOpenSSL also default to preferring .so on Linux, which this fully
+# static (-static) build can't link against ("attempted static link of a
+# dynamic object"). zlib-static/openssl-libs-static (Alpine package names)
+# ship the matching .a files; just need CMake to prefer them.
+set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
 find_package(ZLIB REQUIRED)
-target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
 find_package(OpenSSL REQUIRED)
+set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
 target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 if(SMALLCLUE_WITH_LIBGIT2)
@@ -390,6 +404,13 @@ if(SMALLCLUE_WITH_LIBGIT2)
     if(SMALLCLUE_LIBGIT2_USE_SSH)
         target_link_libraries(smallclue PRIVATE PkgConfig::LIBSSH2)
     endif()
+    # libgit2.a's openssl.c needs SSL_*/OPENSSL_* symbols, but static linking
+    # on Linux is a single left-to-right pass -- since OpenSSL::SSL/Crypto
+    # were already listed earlier (line ~399, before libgit2.a lands in the
+    # link line), the linker never looks back at them once it hits libgit2's
+    # unresolved references. Re-list them after libgit2.a so they're
+    # available on this later pass too.
+    target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 if(APPLE)

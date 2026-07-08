@@ -1,6 +1,9 @@
 #include <sys/socket.h>
 #include <stdint.h>
 #include <stdio.h>
+#if !defined(__APPLE__)
+#include <shadow.h>
+#endif
 #include "third-party/openssh/sshkey.h"
 
 /* Stub DNS host key verification: DNS SSHFP lookups disabled in this build. */
@@ -29,3 +32,18 @@ int export_dns_rr(const char *hostname, struct sshkey *key, FILE *f,
     fprintf(stderr, "ssh-keygen: DNS SSHFP record export is unavailable in this build\n");
     return -1;
 }
+
+/* Stub shadow-password account-expiry check: auth-shadow.c is excluded from
+ * this build (it's sshd/server-side authentication code -- references the
+ * server-only `loginmsg` global -- never reachable from the ssh/scp/sftp
+ * client). platform.c's platform_locked_account() still calls this under
+ * #ifdef HAS_SHADOW_EXPIRE (musl's real <shadow.h> makes that true), so the
+ * symbol needs to exist; a client binary never actually hits this path.
+ * <shadow.h>/struct spwd don't exist on Darwin, so this stub -- along with
+ * the HAS_SHADOW_EXPIRE path that calls it -- is Linux/musl-only. */
+#if !defined(__APPLE__)
+int auth_shadow_acctexpired(struct spwd *spw) {
+    (void)spw;
+    return 0;
+}
+#endif

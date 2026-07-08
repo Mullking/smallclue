@@ -41,6 +41,7 @@
 #include <dlfcn.h>
 #include <poll.h>
 #include <fnmatch.h>
+#include <regex.h>
 #include <grp.h>
 #include <limits.h>
 #include <libgen.h>
@@ -14246,7 +14247,24 @@ static int smallclueUniqCommand(int argc, char **argv) {
     return status;
 }
 
-static bool smallclueSedParseExpr(const char *expr, char **pattern, char **replacement, bool *global) {
+typedef struct SmallclueSedExpr {
+    regex_t re;
+    bool reValid;
+    char *replacement;
+    bool global;
+    bool caseInsensitive;
+} SmallclueSedExpr;
+
+/* s<delim>PATTERN<delim>REPLACEMENT<delim>[flags] -- delim is whatever
+ * character immediately follows 's'. Flags after the closing delimiter are
+ * scanned one character at a time (fixing a real bug in the previous
+ * literal-substring implementation, which treated ANY 'g' appearing
+ * anywhere in the flags tail as enabling global mode): 'g' = global, 'i'/
+ * 'I' = case-insensitive. Compiles PATTERN as a POSIX regex (basic by
+ * default, extended when extendedRegex is set, i.e. -E/-r) instead of the
+ * previous literal-substring-only match. */
+static bool smallclueSedParseExpr(const char *expr, bool extendedRegex, SmallclueSedExpr *out) {
+    memset(out, 0, sizeof(*out));
     if (!expr || expr[0] != 's' || expr[1] == '\0') {
         return false;
     }
@@ -14263,143 +14281,301 @@ static bool smallclueSedParseExpr(const char *expr, char **pattern, char **repla
     }
     size_t pat_len = (size_t)(pat_end - pat_start);
     size_t rep_len = (size_t)(rep_end - rep_start);
-    *pattern = (char *)malloc(pat_len + 1);
-    *replacement = (char *)malloc(rep_len + 1);
-    if (!*pattern || !*replacement) {
-        free(*pattern);
-        free(*replacement);
+
+    for (const char *f = rep_end + 1; *f; ++f) {
+        if (*f == 'g') {
+            out->global = true;
+        } else if (*f == 'i' || *f == 'I') {
+            out->caseInsensitive = true;
+        } else {
+            fprintf(stderr, "sed: unsupported flag '%c'\n", *f);
+            return false;
+        }
+    }
+
+    char *pattern = (char *)malloc(pat_len + 1);
+    out->replacement = (char *)malloc(rep_len + 1);
+    if (!pattern || !out->replacement) {
+        free(pattern);
+        free(out->replacement);
+        out->replacement = NULL;
         return false;
     }
-    memcpy(*pattern, pat_start, pat_len);
-    (*pattern)[pat_len] = '\0';
-    memcpy(*replacement, rep_start, rep_len);
-    (*replacement)[rep_len] = '\0';
-    *global = (strchr(rep_end + 1, 'g') != NULL);
+    memcpy(pattern, pat_start, pat_len);
+    pattern[pat_len] = '\0';
+    memcpy(out->replacement, rep_start, rep_len);
+    out->replacement[rep_len] = '\0';
+
+    int flags = (extendedRegex ? REG_EXTENDED : 0) | (out->caseInsensitive ? REG_ICASE : 0);
+    int rc = regcomp(&out->re, pattern, flags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, &out->re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "sed: invalid pattern '%s': %s\n", pattern, errbuf);
+        free(pattern);
+        free(out->replacement);
+        out->replacement = NULL;
+        return false;
+    }
+    free(pattern);
+    out->reValid = true;
     return true;
 }
 
-static char *smallclueSedApply(const char *line, const char *pattern, const char *replacement, bool global) {
-    size_t pat_len = strlen(pattern);
-    size_t rep_len = strlen(replacement);
-    size_t line_len = strlen(line);
-    size_t cap = line_len + 1 + ((rep_len > pat_len) ? (rep_len - pat_len) * 4 : 0);
-    char *out = (char *)malloc(cap);
-    if (!out) {
-        return NULL;
+static void smallclueSedExprFree(SmallclueSedExpr *e) {
+    if (e->reValid) {
+        regfree(&e->re);
+        e->reValid = false;
     }
-    size_t out_len = 0;
-    const char *cursor = line;
-    bool replaced = false;
-    while (*cursor) {
-        if (pat_len > 0 && strncmp(cursor, pattern, pat_len) == 0) {
-            size_t needed = out_len + rep_len + (line_len - (cursor - line)) + 1;
-            if (needed > cap) {
-                cap = needed + 32;
-                char *resized = (char *)realloc(out, cap);
-                if (!resized) {
-                    free(out);
-                    return NULL;
+    free(e->replacement);
+    e->replacement = NULL;
+}
+
+static bool smallclueSedAppend(char **out, size_t *outLen, size_t *cap, const char *data, size_t len) {
+    if (*outLen + len + 1 > *cap) {
+        size_t newCap = (*outLen + len + 1) * 2;
+        char *resized = (char *)realloc(*out, newCap);
+        if (!resized) return false;
+        *out = resized;
+        *cap = newCap;
+    }
+    memcpy(*out + *outLen, data, len);
+    *outLen += len;
+    return true;
+}
+
+/* Expands & (whole match) and \1-\9 (submatch) backreferences in the
+ * replacement text against the current regexec match. */
+static bool smallclueSedAppendReplacement(char **out, size_t *outLen, size_t *cap,
+                                          const char *line, const char *replacement,
+                                          const regmatch_t *pmatch, size_t nmatch) {
+    for (const char *r = replacement; *r; ++r) {
+        if (*r == '\\' && r[1] >= '1' && r[1] <= '9') {
+            size_t idx = (size_t)(r[1] - '0');
+            r++;
+            if (idx < nmatch && pmatch[idx].rm_so >= 0) {
+                if (!smallclueSedAppend(out, outLen, cap, line + pmatch[idx].rm_so,
+                                       (size_t)(pmatch[idx].rm_eo - pmatch[idx].rm_so))) {
+                    return false;
                 }
-                out = resized;
             }
-            memcpy(out + out_len, replacement, rep_len);
-            out_len += rep_len;
-            cursor += pat_len;
-            replaced = true;
-            if (!global) {
-                memcpy(out + out_len, cursor, strlen(cursor) + 1);
-                return out;
+        } else if (*r == '\\' && r[1] == '&') {
+            if (!smallclueSedAppend(out, outLen, cap, "&", 1)) return false;
+            r++;
+        } else if (*r == '&') {
+            if (!smallclueSedAppend(out, outLen, cap, line + pmatch[0].rm_so,
+                                   (size_t)(pmatch[0].rm_eo - pmatch[0].rm_so))) {
+                return false;
             }
-            continue;
+        } else {
+            if (!smallclueSedAppend(out, outLen, cap, r, 1)) return false;
         }
-        if (out_len + 2 > cap) {
-            cap *= 2;
-            char *resized = (char *)realloc(out, cap);
-            if (!resized) {
+    }
+    return true;
+}
+
+static char *smallclueSedApply(const char *line, const SmallclueSedExpr *expr) {
+    size_t lineLen = strlen(line);
+    size_t cap = lineLen + 32;
+    size_t outLen = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    out[0] = '\0';
+
+    const char *cursor = line;
+    bool replacedAny = false;
+    bool firstMatch = true;
+    while (*cursor || firstMatch) {
+        regmatch_t pmatch[10];
+        int eflags = (cursor == line) ? 0 : REG_NOTBOL;
+        int rc = regexec(&expr->re, cursor, 10, pmatch, eflags);
+        if (rc != 0) {
+            break;
+        }
+        firstMatch = false;
+        if (!smallclueSedAppend(&out, &outLen, &cap, cursor, (size_t)pmatch[0].rm_so)) {
+            free(out);
+            return NULL;
+        }
+        if (!smallclueSedAppendReplacement(&out, &outLen, &cap, cursor, expr->replacement, pmatch, 10)) {
+            free(out);
+            return NULL;
+        }
+        replacedAny = true;
+        if (pmatch[0].rm_eo == pmatch[0].rm_so) {
+            /* Zero-length match (e.g. pattern "x*" on non-x text): copy one
+             * char forward to guarantee progress, matching sed's own
+             * empty-match handling. */
+            if (cursor[pmatch[0].rm_eo] == '\0') {
+                cursor += pmatch[0].rm_eo;
+                break;
+            }
+            if (!smallclueSedAppend(&out, &outLen, &cap, cursor + pmatch[0].rm_eo, 1)) {
                 free(out);
                 return NULL;
             }
-            out = resized;
+            cursor += pmatch[0].rm_eo + 1;
+        } else {
+            cursor += pmatch[0].rm_eo;
         }
-        out[out_len++] = *cursor++;
+        if (!expr->global) {
+            break;
+        }
     }
-    out[out_len] = '\0';
-    if (!replaced) {
+    if (!smallclueSedAppend(&out, &outLen, &cap, cursor, strlen(cursor))) {
+        free(out);
+        return NULL;
+    }
+    out[outLen] = '\0';
+    if (!replacedAny) {
         free(out);
         return strdup(line);
     }
     return out;
 }
 
+static int smallclueSedProcessStream(FILE *in, FILE *out, const SmallclueSedExpr *expr, const char *label, int *status) {
+    char *line = NULL;
+    size_t cap = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, in, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "sed: %s: %s\n", label, strerror(read_err));
+                *status = 1;
+            }
+            break;
+        }
+        /* smallclueGetlineStream keeps the trailing '\n' in the buffer.
+         * Matching against that embedded newline is wrong for both `$`
+         * (which should anchor to the logical end of line, not after an
+         * embedded newline) and `.` (a POSIX regex `.` matches '\n' too
+         * without REG_NEWLINE, so a greedy `.*` would swallow it) -- strip
+         * it before applying the substitution and re-add it after,
+         * preserving a final line with no trailing newline as-is. */
+        bool hadNewline = (len > 0 && line[len - 1] == '\n');
+        if (hadNewline) {
+            line[len - 1] = '\0';
+        }
+        char *transformed = smallclueSedApply(line, expr);
+        if (!transformed) {
+            fprintf(stderr, "sed: out of memory\n");
+            *status = 1;
+            break;
+        }
+        fputs(transformed, out);
+        if (hadNewline) {
+            fputc('\n', out);
+        }
+        free(transformed);
+    }
+    free(line);
+    return *status;
+}
+
 static int smallclueSedCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool extendedRegex = false;
+    bool inPlace = false;
+    const char *inPlaceSuffix = NULL;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-E") == 0 || strcmp(arg, "-r") == 0) {
+            extendedRegex = true;
+        } else if (strcmp(arg, "-i") == 0) {
+            inPlace = true;
+        } else if (strncmp(arg, "-i", 2) == 0 && arg[2] != '\0') {
+            inPlace = true;
+            inPlaceSuffix = arg + 2;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "sed: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+
+    if (argi >= argc) {
         fprintf(stderr, "sed: missing expression\n");
         return 1;
     }
-    char *pattern = NULL;
-    char *replacement = NULL;
-    bool global = false;
-    if (!smallclueSedParseExpr(argv[1], &pattern, &replacement, &global)) {
-        fprintf(stderr, "sed: invalid expression '%s'\n", argv[1]);
+
+    SmallclueSedExpr expr;
+    if (!smallclueSedParseExpr(argv[argi], extendedRegex, &expr)) {
+        fprintf(stderr, "sed: invalid expression '%s'\n", argv[argi]);
         return 1;
     }
+    argi++;
+
     int status = 0;
-    char *line = NULL;
-    size_t cap = 0;
-    int index = 2;
-    if (index >= argc) {
-        while (!status) {
-            int read_err = 0;
-            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
-            if (len < 0) {
-                if (read_err) {
-                    fprintf(stderr, "sed: %s\n", strerror(read_err));
-                    status = 1;
-                }
-                break;
-            }
-            char *out = smallclueSedApply(line, pattern, replacement, global);
-            if (!out) {
-                fprintf(stderr, "sed: out of memory\n");
-                status = 1;
-                break;
-            }
-            fputs(out, stdout);
-            free(out);
+    if (argi >= argc) {
+        if (inPlace) {
+            fprintf(stderr, "sed: -i requires a file argument (cannot edit stdin in place)\n");
+            smallclueSedExprFree(&expr);
+            return 1;
         }
+        smallclueSedProcessStream(stdin, stdout, &expr, "(stdin)", &status);
     } else {
-        for (int i = index; i < argc && status == 0; ++i) {
+        for (int i = argi; i < argc && status == 0; ++i) {
             FILE *fp = fopen(argv[i], "r");
             if (!fp) {
                 fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
                 status = 1;
                 break;
             }
-            while (true) {
-                int read_err = 0;
-                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(read_err));
-                        status = 1;
-                    }
-                    break;
-                }
-                char *out = smallclueSedApply(line, pattern, replacement, global);
-                if (!out) {
-                    fprintf(stderr, "sed: out of memory\n");
-                    status = 1;
-                    break;
-                }
-                fputs(out, stdout);
-                free(out);
+            if (!inPlace) {
+                smallclueSedProcessStream(fp, stdout, &expr, argv[i], &status);
+                fclose(fp);
+                continue;
             }
+            char tmpPath[PATH_MAX];
+            snprintf(tmpPath, sizeof(tmpPath), "%s.sedtmp.XXXXXX", argv[i]);
+            int tmpFd = mkstemp(tmpPath);
+            if (tmpFd < 0) {
+                fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                fclose(fp);
+                continue;
+            }
+            FILE *tmpFp = fdopen(tmpFd, "w");
+            if (!tmpFp) {
+                fprintf(stderr, "sed: %s: %s\n", tmpPath, strerror(errno));
+                close(tmpFd);
+                unlink(tmpPath);
+                status = 1;
+                fclose(fp);
+                continue;
+            }
+            smallclueSedProcessStream(fp, tmpFp, &expr, argv[i], &status);
             fclose(fp);
+            fclose(tmpFp);
+            if (status != 0) {
+                unlink(tmpPath);
+                continue;
+            }
+            if (inPlaceSuffix && *inPlaceSuffix) {
+                char backupPath[PATH_MAX];
+                snprintf(backupPath, sizeof(backupPath), "%s%s", argv[i], inPlaceSuffix);
+                if (rename(argv[i], backupPath) != 0) {
+                    fprintf(stderr, "sed: %s: %s\n", backupPath, strerror(errno));
+                    status = 1;
+                    unlink(tmpPath);
+                    continue;
+                }
+            }
+            if (rename(tmpPath, argv[i]) != 0) {
+                fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                unlink(tmpPath);
+            }
         }
     }
-    free(pattern);
-    free(replacement);
-    free(line);
+    smallclueSedExprFree(&expr);
     return status;
 }
 
