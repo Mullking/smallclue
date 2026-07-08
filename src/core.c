@@ -2624,7 +2624,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -I REPLACE: one invocation per input line, substituting\n"
               "    REPLACE wherever it appears in COMMAND's arguments\n"
               "  -t print each command line before running it"},
-    {"df", "df [-h]\n"
+    {"df", "df [-h] [path ...]\n"
+           "  With no path, lists every mounted filesystem (like real df)\n"
            "  -h human-readable sizes"},
     {"dmesg", "dmesg [-T]\n"
               "  Print or control the kernel ring buffer\n"
@@ -13438,6 +13439,81 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
     return true;
 }
 
+/* Enumerates every mounted filesystem so bare `df` (no path arguments)
+ * lists all mounts like the real tool, instead of only reporting the
+ * current directory's filesystem. Returns a malloc'd array of malloc'd
+ * mount-point strings; caller frees each element and the array. */
+#if defined(__linux__) || defined(linux) || defined(__linux)
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) fp = fopen("/etc/mtab", "r");
+    if (!fp) {
+        *outCount = 0;
+        return NULL;
+    }
+    char **list = NULL;
+    size_t count = 0, capacity = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char device[256], mountpoint[512], fstype[64];
+        if (sscanf(line, "%255s %511s %63s", device, mountpoint, fstype) != 3) continue;
+        /* Skip pseudo/virtual filesystems with no meaningful disk usage,
+         * matching real df's own dummy-filesystem exclusion. */
+        static const char *skipTypes[] = {
+            "proc", "sysfs", "devtmpfs", "cgroup", "cgroup2", "devpts",
+            "securityfs", "debugfs", "tracefs", "pstore", "mqueue",
+            "hugetlbfs", "configfs", "bpf", "autofs", "fusectl", "tmpfs",
+            "overlay", "squashfs", "binfmt_misc", "efivarfs", "rpc_pipefs",
+        };
+        bool skip = false;
+        for (size_t s = 0; s < sizeof(skipTypes) / sizeof(skipTypes[0]); ++s) {
+            if (strcmp(fstype, skipTypes[s]) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        if (count == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            char **resized = (char **)realloc(list, capacity * sizeof(char *));
+            if (!resized) break;
+            list = resized;
+        }
+        list[count] = strdup(mountpoint);
+        if (list[count]) count++;
+    }
+    fclose(fp);
+    *outCount = count;
+    return list;
+}
+#elif defined(SMALLCLUE_HAVE_STATFS)
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    struct statfs *mounts = NULL;
+    int n = getmntinfo(&mounts, MNT_NOWAIT);
+    if (n <= 0) {
+        *outCount = 0;
+        return NULL;
+    }
+    char **list = (char **)calloc((size_t)n, sizeof(char *));
+    if (!list) {
+        *outCount = 0;
+        return NULL;
+    }
+    size_t count = 0;
+    for (int i = 0; i < n; ++i) {
+        list[count] = strdup(mounts[i].f_mntonname);
+        if (list[count]) count++;
+    }
+    *outCount = count;
+    return list;
+}
+#else
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    *outCount = 0;
+    return NULL;
+}
+#endif
+
 static void smallclueDfFormatSize(char *buf, size_t bufsize,
                                   unsigned long long bytes, bool human) {
     if (!buf || bufsize == 0) {
@@ -13506,8 +13582,25 @@ static int smallclueDfCommand(int argc, char **argv) {
     int path_count = (optind < argc) ? (argc - optind) : 0;
     smallclueDfPrintHeader(human);
     int status = 0;
-    for (int i = 0; i < (path_count > 0 ? path_count : 1); ++i) {
-        const char *path = (path_count > 0) ? argv[path_start + i] : ".";
+
+    char **allMounts = NULL;
+    size_t allMountsCount = 0;
+    if (path_count == 0) {
+        allMounts = smallclueDfEnumerateMounts(&allMountsCount);
+    }
+    size_t iterCount = (path_count > 0) ? (size_t)path_count
+                        : (allMountsCount > 0) ? allMountsCount
+                        : 1;
+
+    for (size_t i = 0; i < iterCount; ++i) {
+        const char *path;
+        if (path_count > 0) {
+            path = argv[path_start + i];
+        } else if (allMountsCount > 0) {
+            path = allMounts[i];
+        } else {
+            path = ".";
+        }
         SmallclueDfStats stats;
         if (!smallclueDfQuery(path, &stats)) {
             fprintf(stderr, "df: %s: %s\n", path ? path : "(null)", strerror(errno));
@@ -13533,6 +13626,11 @@ static int smallclueDfCommand(int argc, char **argv) {
                avail_buf,
                percent,
                path ? path : stats.mount_point);
+    }
+
+    if (allMounts) {
+        for (size_t i = 0; i < allMountsCount; ++i) free(allMounts[i]);
+        free(allMounts);
     }
     return status;
 }
