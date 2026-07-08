@@ -2261,12 +2261,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  -c stdout  -k keep original  -f force overwrite"},
     {"zcat", "zcat FILE...\n"
              "  Decompress to standard output"},
-    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] PATTERN [FILE...]\n"
+    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] [-c] [-o] [-w] [-x] PATTERN [FILE...]\n"
              "  -i ignore case\n"
              "  -n line numbers\n"
              "  -v invert match\n"
              "  -r/-R recursive directory search\n"
-             "  -E extended regex (default: POSIX basic regex)"},
+             "  -E extended regex (default: POSIX basic regex)\n"
+             "  -c print only a count of matching lines per file\n"
+             "  -o print only the matched portion, one match per line\n"
+             "  -w match whole words only\n"
+             "  -x match whole lines only"},
     {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
             "  Supported in this build:\n"
             "  init,\n"
@@ -17705,12 +17709,90 @@ static void smallclueGrepPrintMatch(const char *line, size_t len, const regex_t 
     smallclueGrepHighlightMatches(line, len, re);
 }
 
+static bool smallclueGrepIsWordChar(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Finds the first match satisfying -w's word-boundary constraint: the
+ * match must not be immediately preceded or followed by a word
+ * character. Retries at subsequent positions if the first regexec hit
+ * isn't word-bounded, since the "real" word match may occur later in
+ * the line. Portable (checks boundaries manually rather than relying on
+ * \< \> regex extensions, which aren't guaranteed across regex(3)
+ * implementations). */
+static bool smallclueGrepFindWordMatch(const char *line, size_t lineLen, const regex_t *re, regmatch_t *outMatch) {
+    size_t offset = 0;
+    while (offset <= lineLen) {
+        regmatch_t m;
+        int eflags = (offset > 0) ? REG_NOTBOL : 0;
+        if (regexec(re, line + offset, 1, &m, eflags) != 0) return false;
+        size_t start = offset + (size_t)m.rm_so;
+        size_t end = offset + (size_t)m.rm_eo;
+        bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
+        bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
+        if (leftOk && rightOk) {
+            outMatch->rm_so = (regoff_t)start;
+            outMatch->rm_eo = (regoff_t)end;
+            return true;
+        }
+        size_t advance = (end > offset) ? (end - offset) : 1;
+        offset += advance;
+    }
+    return false;
+}
+
 /* Matches `line` (length lineLen, WITHOUT any trailing '\n' -- callers
- * must strip it first) against the compiled pattern. */
+ * must strip it first) against the compiled pattern, honoring -w
+ * (whole word) / -x (whole line) if requested. Returns the match bounds
+ * (relative to `line`) via outMatch when non-NULL. */
+static bool smallclueGrepMatchesEx(const char *line, size_t lineLen, const regex_t *re,
+                                   bool wordMode, bool lineMode, regmatch_t *outMatch) {
+    regmatch_t m;
+    if (lineMode) {
+        if (regexec(re, line, 1, &m, 0) != 0) return false;
+        if ((size_t)m.rm_so != 0 || (size_t)m.rm_eo != lineLen) return false;
+    } else if (wordMode) {
+        if (!smallclueGrepFindWordMatch(line, lineLen, re, &m)) return false;
+    } else {
+        if (regexec(re, line, 1, &m, 0) != 0) return false;
+    }
+    if (outMatch) *outMatch = m;
+    return true;
+}
+
 static bool smallclueGrepMatches(const char *line, size_t lineLen, const regex_t *re) {
-    (void)lineLen;
-    regmatch_t pmatch[1];
-    return regexec(re, line, 1, pmatch, 0) == 0;
+    return smallclueGrepMatchesEx(line, lineLen, re, false, false, NULL);
+}
+
+/* -o: prints every non-overlapping match on the line (honoring -w/-x),
+ * one per output line, instead of the whole line. */
+static void smallclueGrepPrintAllMatches(const char *line, size_t lineLen, const regex_t *re,
+                                         bool wordMode, bool lineMode,
+                                         const char *prefixPath, long lineNo, bool numberLines) {
+    size_t offset = 0;
+    while (offset <= lineLen) {
+        regmatch_t m;
+        int eflags = (offset > 0) ? REG_NOTBOL : 0;
+        if (regexec(re, line + offset, 1, &m, eflags) != 0) break;
+        size_t start = offset + (size_t)m.rm_so;
+        size_t end = offset + (size_t)m.rm_eo;
+        bool ok = true;
+        if (lineMode) {
+            ok = (start == 0 && end == lineLen);
+        } else if (wordMode) {
+            bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
+            bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
+            ok = leftOk && rightOk;
+        }
+        if (ok && end > start) {
+            if (prefixPath) printf("%s:", prefixPath);
+            if (numberLines) printf("%ld:", lineNo);
+            fwrite(line + start, 1, end - start, stdout);
+            putchar('\n');
+        }
+        size_t advance = (end > offset) ? (end - offset) : 1;
+        offset += advance;
+    }
 }
 
 typedef struct SmallclueGrepOptions {
@@ -17719,6 +17801,10 @@ typedef struct SmallclueGrepOptions {
     bool useColor;
     bool recursive;
     bool multiplePaths; /* prefix matched lines with the file path */
+    bool countOnly;      /* -c */
+    bool matchOnly;      /* -o */
+    bool wordMatch;      /* -w */
+    bool lineMatch;      /* -x */
 } SmallclueGrepOptions;
 
 static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
@@ -17727,6 +17813,7 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
     char *line = NULL;
     size_t cap = 0;
     long lineNo = 0;
+    long matchCount = 0;
     for (;;) {
         int read_err = 0;
         ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
@@ -17746,20 +17833,32 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
             line[matchLen - 1] = '\0';
             matchLen--;
         }
-        bool found = smallclueGrepMatches(line, matchLen, re);
+        bool found = smallclueGrepMatchesEx(line, matchLen, re, opts->wordMatch, opts->lineMatch, NULL);
         if (opts->invertMatch ? !found : found) {
-            /* Print only up to matchLen (line[] now has a NUL where the
-             * original '\n' was), then re-add the newline explicitly --
-             * printing the original `len` bytes here would emit that
-             * stray NUL byte in place of the newline. */
-            smallclueGrepPrintMatch(line, matchLen, re, opts->useColor && !opts->invertMatch,
-                                    opts->multiplePaths ? label : NULL,
-                                    opts->numberLines ? lineNo : 0);
-            if (matchLen < (size_t)len) {
-                fputc('\n', stdout);
-            }
             status = 0;
+            if (opts->countOnly) {
+                matchCount++;
+            } else if (opts->matchOnly && !opts->invertMatch) {
+                smallclueGrepPrintAllMatches(line, matchLen, re, opts->wordMatch, opts->lineMatch,
+                                             opts->multiplePaths ? label : NULL,
+                                             opts->numberLines ? lineNo : 0, opts->numberLines);
+            } else {
+                /* Print only up to matchLen (line[] now has a NUL where the
+                 * original '\n' was), then re-add the newline explicitly --
+                 * printing the original `len` bytes here would emit that
+                 * stray NUL byte in place of the newline. */
+                smallclueGrepPrintMatch(line, matchLen, re, opts->useColor && !opts->invertMatch,
+                                        opts->multiplePaths ? label : NULL,
+                                        opts->numberLines ? lineNo : 0);
+                if (matchLen < (size_t)len) {
+                    fputc('\n', stdout);
+                }
+            }
         }
+    }
+    if (opts->countOnly) {
+        if (opts->multiplePaths) printf("%s:", label);
+        printf("%ld\n", matchCount);
     }
     free(line);
     return status;
@@ -17859,6 +17958,26 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 index++;
                 continue;
             }
+            if (strcmp(arg, "--count") == 0) {
+                opts.countOnly = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--only-matching") == 0) {
+                opts.matchOnly = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--word-regexp") == 0) {
+                opts.wordMatch = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--line-regexp") == 0) {
+                opts.lineMatch = true;
+                index++;
+                continue;
+            }
             if (strncmp(arg, "--color", 7) == 0 || strncmp(arg, "--colour", 8) == 0) {
                 const char *val = NULL;
                 if (strncmp(arg, "--color=", 8) == 0) val = arg + 8;
@@ -17886,6 +18005,14 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 opts.recursive = true;
             } else if (*opt == 'E') {
                 extendedRegex = true;
+            } else if (*opt == 'c') {
+                opts.countOnly = true;
+            } else if (*opt == 'o') {
+                opts.matchOnly = true;
+            } else if (*opt == 'w') {
+                opts.wordMatch = true;
+            } else if (*opt == 'x') {
+                opts.lineMatch = true;
             } else {
                 fprintf(stderr, "grep: unsupported option -%c\n", *opt);
                 return 1;
