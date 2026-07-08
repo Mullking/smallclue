@@ -2234,8 +2234,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Signals: HUP INT TERM KILL etc."},
     {"less", "less [FILE...]\n"
              "  Pager; navigation: j/k, /, n, g/G, q"},
-    {"ln", "ln [-s] TARGET LINK\n"
-           "  -s symbolic link"},
+    {"ln", "ln [-s] [-f] TARGET LINK\n"
+           "       ln [-s] [-f] TARGET... DIRECTORY\n"
+           "  -s symbolic link  -f force overwrite\n"
+           "  When the last operand is a directory, each target's basename\n"
+           "  is created inside it"},
     {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
@@ -17504,35 +17507,74 @@ static int smallclueStatCommand(int argc, char **argv) {
     return status;
 }
 
+static int smallclueLnCreateOne(const char *target, const char *linkname, bool symbolic, bool force) {
+    if (force) {
+        unlink(linkname);
+    }
+    if (symbolic) {
+        if (symlink(target, linkname) != 0) {
+            fprintf(stderr, "ln: cannot create symbolic link '%s': %s\n", linkname, strerror(errno));
+            return 1;
+        }
+    } else {
+        if (link(target, linkname) != 0) {
+            fprintf(stderr, "ln: cannot create link '%s': %s\n", linkname, strerror(errno));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int smallclueLnCommand(int argc, char **argv) {
     int symbolic = 0;
+    int force = 0;
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "s")) != -1) {
+    while ((opt = getopt(argc, argv, "sf")) != -1) {
         switch (opt) {
             case 's':
                 symbolic = 1;
+                break;
+            case 'f':
+                force = 1;
                 break;
             default:
                 fprintf(stderr, "ln: invalid option -- %c\n", optopt);
                 return 1;
         }
     }
-    if (argc - optind < 2) {
+    int nOperands = argc - optind;
+    if (nOperands < 2) {
         fprintf(stderr, "ln: missing file operand\n");
         return 1;
     }
-    const char *target = argv[optind];
-    const char *linkname = argv[optind + 1];
+
+    const char *lastArg = argv[argc - 1];
+    struct stat destStat;
+    bool destIsDir = (nOperands > 2) || (stat(lastArg, &destStat) == 0 && S_ISDIR(destStat.st_mode));
+
+    if (!destIsDir) {
+        /* Classic two-operand form: `ln [-s] TARGET LINKNAME`. */
+        return smallclueLnCreateOne(argv[optind], argv[optind + 1], symbolic, force);
+    }
+
+    /* `ln [-s] TARGET... DIRECTORY` -- matches GNU ln's auto-append of each
+     * target's basename inside the destination directory instead of
+     * requiring the caller to spell out the link path (e.g.
+     * `ln -s /usr/bin/foo /usr/local/bin/` now creates
+     * /usr/local/bin/foo, rather than failing with EEXIST against the
+     * directory itself). */
     int status = 0;
-    if (symbolic) {
-        if (symlink(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create symbolic link '%s': %s\n", linkname, strerror(errno));
+    for (int i = optind; i < argc - 1; ++i) {
+        const char *target = argv[i];
+        const char *base = smallclueLeafName(target);
+        char linkname[PATH_MAX];
+        if (smallclueBuildPath(linkname, sizeof(linkname), lastArg, base) != 0) {
+            fprintf(stderr, "ln: %s/%s: %s\n", lastArg, base, strerror(errno));
             status = 1;
+            continue;
         }
-    } else {
-        if (link(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create link '%s': %s\n", linkname, strerror(errno));
+        if (smallclueLnCreateOne(target, linkname, symbolic, force) != 0) {
             status = 1;
         }
     }
