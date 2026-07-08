@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fnmatch.h>
 #include <limits.h>
+#include <pwd.h>
 #include <regex.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -18,6 +19,101 @@
 
 #if defined(PSCAL_HAS_LIBGIT2)
 #include <git2.h>
+
+/*
+ * Credentials callback shared by every clone/fetch/push call site.
+ *
+ * Before this, no clone/fetch/pull/push call site anywhere in this file
+ * populated .callbacks.credentials on its options struct -- every remote
+ * operation silently only worked against fully anonymous transports (public
+ * git://, unauthenticated http(s)). Any HTTPS remote needing a token, or
+ * any SSH remote needing key auth (the overwhelming majority of real,
+ * hosted repos today), failed outright with no way to supply credentials.
+ *
+ * Priority order per libgit2 convention -- try the cheapest/most automatic
+ * option first, and only offer a credential type if the transport actually
+ * asked for it (allowed_types):
+ *   1. SSH: ssh-agent (git_credential_ssh_key_from_agent), then the default
+ *      unencrypted key files under ~/.ssh (id_ed25519, id_ecdsa, id_rsa).
+ *      Passphrase-protected keys without an agent are not attempted --
+ *      there's no interactive prompt wired up here, and silently failing
+ *      auth is no worse than the total block this replaces.
+ *   2. HTTPS/plain userpass: GIT_USERNAME/GIT_PASSWORD env vars if both are
+ *      set; otherwise GIT_TOKEN alone (GitHub/GitLab/Bitbucket all accept a
+ *      personal access token as the password with an arbitrary username).
+ *   3. GIT_CREDENTIAL_DEFAULT (NTLM/Negotiate) as a last resort.
+ * Returns GIT_PASSTHROUGH (positive) when nothing applicable is configured,
+ * which per the git_credential_acquire_cb contract makes libgit2 behave as
+ * if no callback were set (the transport reports its own auth failure).
+ */
+static bool smallclueGitTryAgentKey(git_credential **out, const char *username) {
+    return git_credential_ssh_key_from_agent(out, username ? username : "git") == 0;
+}
+
+static bool smallclueGitTryDefaultKeyFile(git_credential **out, const char *username) {
+    const char *home = getenv("HOME");
+    char homeBuf[PATH_MAX];
+    if (!home || !*home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw && pw->pw_dir) {
+            snprintf(homeBuf, sizeof(homeBuf), "%s", pw->pw_dir);
+            home = homeBuf;
+        }
+    }
+    if (!home || !*home) {
+        return false;
+    }
+
+    static const char *kKeyNames[] = {"id_ed25519", "id_ecdsa", "id_rsa"};
+    for (size_t i = 0; i < sizeof(kKeyNames) / sizeof(kKeyNames[0]); ++i) {
+        char privatePath[PATH_MAX];
+        char publicPath[PATH_MAX];
+        snprintf(privatePath, sizeof(privatePath), "%s/.ssh/%s", home, kKeyNames[i]);
+        snprintf(publicPath, sizeof(publicPath), "%s/.ssh/%s.pub", home, kKeyNames[i]);
+        struct stat st;
+        if (stat(privatePath, &st) != 0 || stat(publicPath, &st) != 0) {
+            continue;
+        }
+        if (git_credential_ssh_key_new(out, username ? username : "git",
+                                       publicPath, privatePath, NULL) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int smallclueGitCredentialsCallback(git_credential **out, const char *url,
+                                           const char *usernameFromUrl,
+                                           unsigned int allowedTypes, void *payload) {
+    (void)url;
+    (void)payload;
+
+    if (allowedTypes & GIT_CREDENTIAL_SSH_KEY) {
+        if (smallclueGitTryAgentKey(out, usernameFromUrl)) return 0;
+        if (smallclueGitTryDefaultKeyFile(out, usernameFromUrl)) return 0;
+    }
+    if (allowedTypes & GIT_CREDENTIAL_USERPASS_PLAINTEXT) {
+        const char *envUser = getenv("GIT_USERNAME");
+        const char *envPass = getenv("GIT_PASSWORD");
+        const char *envToken = getenv("GIT_TOKEN");
+        if (envUser && envPass) {
+            if (git_credential_userpass_plaintext_new(out, envUser, envPass) == 0) return 0;
+        } else if (envToken && *envToken) {
+            const char *tokenUser = usernameFromUrl ? usernameFromUrl : "x-access-token";
+            if (git_credential_userpass_plaintext_new(out, tokenUser, envToken) == 0) return 0;
+        }
+    }
+    if (allowedTypes & GIT_CREDENTIAL_DEFAULT) {
+        if (git_credential_default_new(out) == 0) return 0;
+    }
+    return GIT_PASSTHROUGH;
+}
+
+/* Wire the shared callback into a git_remote_callbacks struct -- call this
+ * on every clone/fetch/push options' .callbacks before use. */
+static void smallclueGitApplyCredentials(git_remote_callbacks *callbacks) {
+    callbacks->credentials = smallclueGitCredentialsCallback;
+}
 #endif
 
 typedef enum SmallclueGitDiffMode {
@@ -8779,6 +8875,7 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
     }
 
     git_clone_options clone_opts = GIT_CLONE_OPTIONS_INIT;
+    smallclueGitApplyCredentials(&clone_opts.fetch_opts.callbacks);
     clone_opts.bare = bare ? 1 : 0;
     if (branch && *branch) {
         clone_opts.checkout_branch = branch;
@@ -9154,6 +9251,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         }
         if (fetch) {
             git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+            smallclueGitApplyCredentials(&fetch_opts.callbacks);
             if (git_remote_fetch(remote, NULL, &fetch_opts, NULL) != 0) {
                 git_remote_free(remote);
                 smallclueGitPrintLibgitError("remote add --fetch failed");
@@ -9666,6 +9764,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             return 0;
         }
         git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+        smallclueGitApplyCredentials(&fetch_opts.callbacks);
         fetch_opts.prune = GIT_FETCH_PRUNE;
         int rc = git_remote_fetch(remote, NULL, &fetch_opts, NULL);
         git_remote_free(remote);
@@ -9705,6 +9804,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         }
 
         git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+        smallclueGitApplyCredentials(&fetch_opts.callbacks);
         fetch_opts.prune = prune ? GIT_FETCH_PRUNE : GIT_FETCH_NO_PRUNE;
 
         int rc = 0;
@@ -10432,6 +10532,7 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
     }
 
     git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
+    smallclueGitApplyCredentials(&opts.callbacks);
     opts.prune = prune ? GIT_FETCH_PRUNE : GIT_FETCH_NO_PRUNE;
     opts.download_tags = download_tags;
 
@@ -10640,6 +10741,7 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
         return 1;
     }
     git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+    smallclueGitApplyCredentials(&fetch_opts.callbacks);
     if (git_remote_fetch(remote, &arr, &fetch_opts, NULL) != 0) {
         git_remote_free(remote);
         smallclueGitPrintLibgitError("pull fetch failed");
@@ -12577,6 +12679,7 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
         return 1;
     }
     git_push_options push_opts = GIT_PUSH_OPTIONS_INIT;
+    smallclueGitApplyCredentials(&push_opts.callbacks);
     git_strarray arr = { pushed_refspecs, pushed_count };
     if (git_remote_push(remote, &arr, &push_opts) != 0) {
         git_remote_free(remote);
