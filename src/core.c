@@ -11,6 +11,7 @@
 #include "nextvi_app.h"
 #include "openssh_app.h"
 #include "openrsync_app.h"
+#include "tar_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2067,6 +2068,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"su", smallclueSuCommand, "Change user ID or become superuser"},
     {"sudo", smallclueSudoCommand, "Execute a command as another user"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
+    {"tar", smallclueTarCommand, "Create, extract, or list tar archives"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
@@ -2331,6 +2333,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Execute a command as another user"},
     {"tail", "tail [-n N] [FILE...]\n"
              "  Default N=10"},
+    {"tar", "tar -c|-x|-t -f archive [-v] [-z] [-C dir] [file...]\n"
+            "  -c create  -x extract  -t list\n"
+            "  -f archive path (or - for stdin/stdout)\n"
+            "  -v verbose  -z gzip (also auto-detected on read)\n"
+            "  -C dir  chdir before create, or extract-destination dir\n"
+            "  Bundled form also accepted: tar xzf archive.tar.gz"},
     {"tee", "tee [-a] FILE...\n"
             "  -a append"},
     {"telnet", "telnet [-p PORT] HOST\n"

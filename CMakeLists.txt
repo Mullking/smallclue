@@ -173,6 +173,7 @@ set(SOURCES
     src/runtime_stubs_extra.c
     src/openssh_stubs.c
     src/openssh_shim.c
+    src/tar_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
