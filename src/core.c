@@ -1996,7 +1996,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"chmod", smallclueChmodCommand, "Change file permissions"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
-    {"cp", smallclueCpCommand, "Copy files"},
+    {"cp", smallclueCpCommand, "Copy files and directories"},
     {"rsync", smallclueRsyncCommand, "Synchronize files and directories"},
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
@@ -2126,8 +2126,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Clear the terminal"},
     {"cls", "cls\n"
             "  Clear the terminal (alias)"},
-    {"cp", "cp [-r] SRC... DEST\n"
-           "  -r  recursive copy"},
+    {"cp", "cp [-r|-R] [-a] [-p] SRC... DEST\n"
+           "  -r/-R  recursive copy (directories)\n"
+           "  -a     archive: recursive + preserve timestamps\n"
+           "  -p     preserve timestamps"},
     {"curl", "curl [options] URL...\n"
              "  Common: -o FILE,\n"
              "  -O (remote name)\n"
@@ -15642,6 +15644,91 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
     return status;
 }
 
+static void smallclueCopyPreserveTimes(const char *src, const char *dst, const struct stat *srcStat) {
+    struct timeval times[2];
+    times[0].tv_sec = srcStat->st_atime;
+    times[0].tv_usec = 0;
+    times[1].tv_sec = srcStat->st_mtime;
+    times[1].tv_usec = 0;
+    if (utimes(dst, times) != 0) {
+        fprintf(stderr, "cp: %s: failed to preserve timestamps from %s: %s\n", dst, src, strerror(errno));
+    }
+}
+
+/* Recursive copy for `cp -r`/`-a`/`-R`: files copy via smallclueCopyFile,
+ * symlinks are recreated pointing at the same target (not followed and
+ * copied as file content), directories are made then walked. preserveTimes
+ * corresponds to -p/-a (mode is always preserved by smallclueCopyFile). */
+static int smallclueCopyRecursive(const char *label, const char *src, const char *dst, bool preserveTimes) {
+    struct stat srcStat;
+    if (lstat(src, &srcStat) != 0) {
+        fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISLNK(srcStat.st_mode)) {
+        char linkTarget[PATH_MAX];
+        ssize_t n = readlink(src, linkTarget, sizeof(linkTarget) - 1);
+        if (n < 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+            return -1;
+        }
+        linkTarget[n] = '\0';
+        unlink(dst);
+        if (symlink(linkTarget, dst) != 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+
+    if (S_ISDIR(srcStat.st_mode)) {
+        if (mkdir(dst, srcStat.st_mode & 07777) != 0 && errno != EEXIST) {
+            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
+            return -1;
+        }
+        DIR *dir = opendir(src);
+        if (!dir) {
+            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+            return -1;
+        }
+        struct dirent *entry;
+        int status = 0;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            char childSrc[PATH_MAX];
+            char childDst[PATH_MAX];
+            if (smallclueBuildPath(childSrc, sizeof(childSrc), src, entry->d_name) != 0 ||
+                smallclueBuildPath(childDst, sizeof(childDst), dst, entry->d_name) != 0) {
+                fprintf(stderr, "%s: %s/%s: %s\n", label, src, entry->d_name, strerror(errno));
+                status = -1;
+                continue;
+            }
+            if (smallclueCopyRecursive(label, childSrc, childDst, preserveTimes) != 0) {
+                status = -1;
+            }
+        }
+        closedir(dir);
+        if (preserveTimes) {
+            smallclueCopyPreserveTimes(src, dst, &srcStat);
+        }
+        return status;
+    }
+
+    if (S_ISREG(srcStat.st_mode)) {
+        int rc = smallclueCopyFile(label, src, dst);
+        if (rc == 0 && preserveTimes) {
+            smallclueCopyPreserveTimes(src, dst, &srcStat);
+        }
+        return rc;
+    }
+
+    fprintf(stderr, "%s: %s: unsupported file type, skipping\n", label, src);
+    return 0;
+}
+
 static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     if (!path || !*path) {
         errno = EINVAL;
@@ -17129,7 +17216,39 @@ static int smallclueTypeCommand(int argc, char **argv) {
 }
 
 static int smallclueCpCommand(int argc, char **argv) {
-    if (argc < 3) {
+    bool recursive = false;
+    bool preserveTimes = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (arg[0] != '-' || strcmp(arg, "-") == 0) {
+            break;
+        }
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'r':
+                case 'R':
+                    recursive = true;
+                    break;
+                case 'a':
+                    recursive = true;
+                    preserveTimes = true;
+                    break;
+                case 'p':
+                    preserveTimes = true;
+                    break;
+                default:
+                    fprintf(stderr, "cp: unsupported option '%c'\n", *p);
+                    return 1;
+            }
+        }
+    }
+
+    if (argc - argi < 2) {
         fprintf(stderr, "cp: missing file operand\n");
         return 1;
     }
@@ -17139,23 +17258,23 @@ static int smallclueCpCommand(int argc, char **argv) {
     struct stat dest_stat;
     int dest_exists = (stat(dest_real, &dest_stat) == 0);
     bool dest_is_dir = dest_exists && S_ISDIR(dest_stat.st_mode);
-    int source_count = argc - 2;
+    int source_count = (argc - 1) - argi;
     if (source_count > 1 && !dest_is_dir) {
         fprintf(stderr, "cp: target '%s' is not a directory\n", dest);
         return 1;
     }
     int status = 0;
-    for (int i = 1; i <= source_count; ++i) {
+    for (int i = argi; i < argi + source_count; ++i) {
         char resolved_src[PATH_MAX];
         const char *src = smallclueResolvePath(argv[i], resolved_src, sizeof(resolved_src));
         struct stat src_stat;
-        if (stat(src, &src_stat) != 0) {
+        if (lstat(src, &src_stat) != 0) {
             fprintf(stderr, "cp: %s: %s\n", src, strerror(errno));
             status = 1;
             continue;
         }
-        if (S_ISDIR(src_stat.st_mode)) {
-            fprintf(stderr, "cp: %s: is a directory\n", src);
+        if (S_ISDIR(src_stat.st_mode) && !recursive) {
+            fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);
             status = 1;
             continue;
         }
@@ -17178,8 +17297,14 @@ static int smallclueCpCommand(int argc, char **argv) {
                 continue;
             }
         }
-        if (smallclueCopyFile("cp", src, target) != 0) {
+        if (S_ISDIR(src_stat.st_mode)) {
+            if (smallclueCopyRecursive("cp", src, target, preserveTimes) != 0) {
+                status = 1;
+            }
+        } else if (smallclueCopyFile("cp", src, target) != 0) {
             status = 1;
+        } else if (preserveTimes) {
+            smallclueCopyPreserveTimes(src, target, &src_stat);
         }
     }
     return status;
