@@ -21,6 +21,7 @@
 #include "expr_app.h"
 #include "chown_app.h"
 #include "base64_app.h"
+#include "nohup_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2062,6 +2063,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
+    {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
     {"passwd", smallcluePasswdCommand, "Change user password"},
     {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
     {"printf", smallcluePrintfCommand, "Format and print data"},
@@ -2357,6 +2359,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  -c verify against a checksums file"},
     {"sha256sum", "sha256sum [-c] [FILE...]\n"
                   "  -c verify against a checksums file"},
+    {"nohup", "nohup COMMAND [ARG...]\n"
+              "  Run COMMAND immune to SIGHUP, so it survives the controlling\n"
+              "  terminal hanging up. If stdout is a terminal, output is appended\n"
+              "  to nohup.out (or $HOME/nohup.out); if stderr is also a terminal,\n"
+              "  it goes to the same place."},
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53).\n"
                  "  -v prints hosts lookup debugging."},
