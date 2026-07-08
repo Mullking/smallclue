@@ -182,6 +182,7 @@ set(SOURCES
     src/printf_app.c
     src/expr_app.c
     src/chown_app.c
+    src/base64_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c

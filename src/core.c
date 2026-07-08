@@ -20,6 +20,7 @@
 #include "printf_app.h"
 #include "expr_app.h"
 #include "chown_app.h"
+#include "base64_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2055,6 +2056,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"install", smallclueInstallCommand, "Copy files and set attributes (or create directories)"},
+    {"base64", smallclueBase64Command, "Base64 encode or decode"},
     {"md5sum", smallclueMd5sumCommand, "Compute or check MD5 digests"},
     {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
     {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
@@ -2345,6 +2347,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  -D create DEST's parent directories first\n"
                 "  -d create directories instead of copying files\n"
                 "  -v verbose"},
+    {"base64", "base64 [-d] [-i] [-w COLS] [FILE]\n"
+               "  Encode FILE/stdin to base64 (default), or decode with -d\n"
+               "  -i/--ignore-garbage: skip invalid characters when decoding\n"
+               "  -w COLS: wrap encoded output at COLS columns (default 76, 0 disables)"},
     {"md5sum", "md5sum [-c] [FILE...]\n"
                "  -c verify against a checksums file (\"HEXDIGEST  path\" per line)"},
     {"sha1sum", "sha1sum [-c] [FILE...]\n"
