@@ -19110,10 +19110,41 @@ static int smallclueInitCommand(int argc, char **argv) {
             fprintf(stderr, "init: failed to exec '%s': %s\n", rcPath, strerror(execErr));
             _exit(127);
         } else if (pid > 0) {
+            /* A single waitpid(pid, ...) here only ever reaps rc itself --
+             * for the entire time rc is running (which for an interactive
+             * session can be the whole guest lifetime), any orphaned or
+             * double-forked background process reparented to us as PID 1
+             * would accumulate as an unreaped zombie, since nothing else
+             * in this init calls wait() until final shutdown.
+             *
+             * waitpid(-1, ...) blocks until ANY child changes state and
+             * reaps it, whichever child that is -- looping on that instead
+             * of targeting `pid` directly means every orphan that exits
+             * while rc runs gets reaped as it happens, with no signal
+             * handler needed. We keep looping past any non-rc child until
+             * we see rc's own pid, at which point we've both reaped rc and
+             * captured its exit status for the log message below. */
             int rcStatus = 0;
-            if (waitpid(pid, &rcStatus, 0) < 0) {
-                fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
-            } else if (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0) {
+            bool haveRcStatus = false;
+            for (;;) {
+                int status = 0;
+                pid_t reaped = waitpid(-1, &status, 0);
+                if (reaped < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
+                    break;
+                }
+                if (reaped == pid) {
+                    rcStatus = status;
+                    haveRcStatus = true;
+                    break;
+                }
+                /* Some other reparented child exited -- reaped and
+                 * discarded; keep waiting for rc specifically. */
+            }
+            if (haveRcStatus && (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0)) {
                 if (WIFEXITED(rcStatus)) {
                     fprintf(stderr, "init: %s exited with status %d\n",
                             rcPath, WEXITSTATUS(rcStatus));
