@@ -2166,10 +2166,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  -c stdout  -k keep original  -f force overwrite"},
     {"zcat", "zcat FILE...\n"
              "  Decompress to standard output"},
-    {"grep", "grep [-i] [-n] [-v] PATTERN [FILE...]\n"
+    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] PATTERN [FILE...]\n"
              "  -i ignore case\n"
              "  -n line numbers\n"
-             "  -v invert match"},
+             "  -v invert match\n"
+             "  -r/-R recursive directory search\n"
+             "  -E extended regex (default: POSIX basic regex)"},
     {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
             "  Supported in this build:\n"
             "  init,\n"
@@ -14937,7 +14939,49 @@ static int smallclueEnvCommand(int argc, char **argv) {
     return 126;
 }
 
-static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pattern, int ignore_case, int color_enabled, const char *prefix_path, long line_number) {
+/* Highlights every non-overlapping regex match in [line, line+len) using
+ * the already-compiled pattern. `len` is the byte length actually being
+ * searched (the caller has already excluded any trailing '\n' so `$`/`.`
+ * behave as end-of-line, not end-of-buffer -- see smallclueGrepMatches). */
+static void smallclueGrepHighlightMatches(const char *line, size_t len, const regex_t *re) {
+    const char *cursor = line;
+    const char *end = line + len;
+    while (cursor <= end) {
+        regmatch_t pmatch[1];
+        /* regexec needs a NUL-terminated string; searching from `cursor`
+         * within the original NUL-terminated line buffer is safe as long
+         * as we never search past `end`. */
+        int eflags = (cursor == line) ? 0 : REG_NOTBOL;
+        int rc = regexec(re, cursor, 1, pmatch, eflags);
+        if (rc != 0 || cursor + pmatch[0].rm_so >= end) {
+            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
+            return;
+        }
+        if (pmatch[0].rm_so > 0) {
+            fwrite(cursor, 1, (size_t)pmatch[0].rm_so, stdout);
+        }
+        const char *matchStart = cursor + pmatch[0].rm_so;
+        size_t matchLen = (size_t)(pmatch[0].rm_eo - pmatch[0].rm_so);
+        if (matchStart + matchLen > end) {
+            matchLen = (size_t)(end - matchStart);
+        }
+        fputs("\033[1;31m", stdout);
+        fwrite(matchStart, 1, matchLen, stdout);
+        fputs("\033[0m", stdout);
+        if (matchLen == 0) {
+            /* Zero-length match: emit one char verbatim to guarantee
+             * forward progress. */
+            if (matchStart >= end) return;
+            fwrite(matchStart, 1, 1, stdout);
+            cursor = matchStart + 1;
+        } else {
+            cursor = matchStart + matchLen;
+        }
+    }
+}
+
+static void smallclueGrepPrintMatch(const char *line, size_t len, const regex_t *re, int color_enabled,
+                                    const char *prefix_path, long line_number) {
     if (prefix_path) {
         if (color_enabled) fputs("\033[35m", stdout);
         printf("%s", prefix_path);
@@ -14951,45 +14995,129 @@ static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pa
         else putchar(':');
     }
 
-    if (!color_enabled || !pattern || !*pattern) {
+    if (!color_enabled) {
         fwrite(line, 1, len, stdout);
         return;
     }
+    smallclueGrepHighlightMatches(line, len, re);
+}
 
-    const char *cursor = line;
-    const char *end = line + len;
-    while (cursor < end) {
-        /* Note: smallclueStrCaseStr stops at null terminator, so matches after embedded nulls in binary files are ignored (matching existing behavior). */
-        const char *match = smallclueStrCaseStr(cursor, pattern, ignore_case);
-        if (!match || match >= end) {
-            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
+/* Matches `line` (length lineLen, WITHOUT any trailing '\n' -- callers
+ * must strip it first) against the compiled pattern. */
+static bool smallclueGrepMatches(const char *line, size_t lineLen, const regex_t *re) {
+    (void)lineLen;
+    regmatch_t pmatch[1];
+    return regexec(re, line, 1, pmatch, 0) == 0;
+}
+
+typedef struct SmallclueGrepOptions {
+    bool numberLines;
+    bool invertMatch;
+    bool useColor;
+    bool recursive;
+    bool multiplePaths; /* prefix matched lines with the file path */
+} SmallclueGrepOptions;
+
+static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
+                                   const SmallclueGrepOptions *opts) {
+    int status = 1;
+    char *line = NULL;
+    size_t cap = 0;
+    long lineNo = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "grep: %s: %s\n", label, strerror(read_err));
+            }
             break;
         }
-
-        /* Print prefix */
-        if (match > cursor) {
-            fwrite(cursor, 1, (size_t)(match - cursor), stdout);
+        lineNo++;
+        /* Strip any trailing '\n' before matching so `$`/`.` behave against
+         * the logical end of line, not an embedded newline (the same bug
+         * class fixed in sed) -- but still print with the original length
+         * so output formatting is unaffected. */
+        size_t matchLen = (size_t)len;
+        if (matchLen > 0 && line[matchLen - 1] == '\n') {
+            line[matchLen - 1] = '\0';
+            matchLen--;
         }
-
-        /* Print match in color */
-        size_t pat_len = strlen(pattern);
-        if (match + pat_len > end) {
-            pat_len = (size_t)(end - match);
+        bool found = smallclueGrepMatches(line, matchLen, re);
+        if (opts->invertMatch ? !found : found) {
+            /* Print only up to matchLen (line[] now has a NUL where the
+             * original '\n' was), then re-add the newline explicitly --
+             * printing the original `len` bytes here would emit that
+             * stray NUL byte in place of the newline. */
+            smallclueGrepPrintMatch(line, matchLen, re, opts->useColor && !opts->invertMatch,
+                                    opts->multiplePaths ? label : NULL,
+                                    opts->numberLines ? lineNo : 0);
+            if (matchLen < (size_t)len) {
+                fputc('\n', stdout);
+            }
+            status = 0;
         }
+    }
+    free(line);
+    return status;
+}
 
-        fputs("\033[1;31m", stdout); /* Bold Red */
-        fwrite(match, 1, pat_len, stdout);
-        fputs("\033[0m", stdout); /* Reset */
-
-        cursor = match + pat_len;
+static void smallclueGrepWalkPath(const char *path, const regex_t *re, const SmallclueGrepOptions *opts, int *status) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        *status = *status == 0 ? 0 : 2;
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (!opts->recursive) {
+            fprintf(stderr, "grep: %s: is a directory\n", path);
+            *status = *status == 0 ? 0 : 2;
+            return;
+        }
+        DIR *dir = opendir(path);
+        if (!dir) {
+            fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+            *status = *status == 0 ? 0 : 2;
+            return;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            char child[PATH_MAX];
+            if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+                fprintf(stderr, "grep: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+                *status = *status == 0 ? 0 : 2;
+                continue;
+            }
+            smallclueGrepWalkPath(child, re, opts, status);
+        }
+        closedir(dir);
+        return;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        *status = *status == 0 ? 0 : 2;
+        return;
+    }
+    int rc = smallclueGrepScanStream(fp, path, re, opts);
+    fclose(fp);
+    if (rc == 0) {
+        *status = 0;
+    } else if (*status != 0) {
+        *status = 1;
     }
 }
 
 static int smallclueGrepCommand(int argc, char **argv) {
     int index = 1;
-    int number_lines = 0;
-    int ignore_case = 0;
-    int invert_match = 0;
+    SmallclueGrepOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    bool extendedRegex = false;
+    bool ignoreCase = false;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
 
     while (index < argc) {
@@ -15004,17 +15132,27 @@ static int smallclueGrepCommand(int argc, char **argv) {
         if (strncmp(arg, "--", 2) == 0) {
             /* Support common long forms and treat unknown long opts as end of options. */
             if (strcmp(arg, "--ignore-case") == 0 || strcmp(arg, "--ignore") == 0) {
-                ignore_case = 1;
+                ignoreCase = true;
                 index++;
                 continue;
             }
             if (strcmp(arg, "--invert-match") == 0 || strcmp(arg, "--invert") == 0) {
-                invert_match = 1;
+                opts.invertMatch = true;
                 index++;
                 continue;
             }
             if (strcmp(arg, "--line-number") == 0 || strcmp(arg, "--number") == 0) {
-                number_lines = 1;
+                opts.numberLines = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--recursive") == 0) {
+                opts.recursive = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--extended-regexp") == 0) {
+                extendedRegex = true;
                 index++;
                 continue;
             }
@@ -15036,11 +15174,15 @@ static int smallclueGrepCommand(int argc, char **argv) {
         }
         for (const char *opt = arg + 1; *opt; ++opt) {
             if (*opt == 'n') {
-                number_lines = 1;
+                opts.numberLines = true;
             } else if (*opt == 'i') {
-                ignore_case = 1;
+                ignoreCase = true;
             } else if (*opt == 'v') {
-                invert_match = 1;
+                opts.invertMatch = true;
+            } else if (*opt == 'r' || *opt == 'R') {
+                opts.recursive = true;
+            } else if (*opt == 'E') {
+                extendedRegex = true;
             } else {
                 fprintf(stderr, "grep: unsupported option -%c\n", *opt);
                 return 1;
@@ -15054,64 +15196,33 @@ static int smallclueGrepCommand(int argc, char **argv) {
     }
     const char *pattern = argv[index++];
 
+    regex_t re;
+    int reFlags = (extendedRegex ? REG_EXTENDED : 0) | (ignoreCase ? REG_ICASE : 0);
+    int rc = regcomp(&re, pattern, reFlags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, &re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "grep: invalid pattern '%s': %s\n", pattern, errbuf);
+        return 2;
+    }
+
     if (color_mode == 0) {
         color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
     }
-    int use_color = (color_mode == 1) && !invert_match;
+    opts.useColor = (color_mode == 1);
 
     int paths = argc - index;
-    int status = 1;
-    char *line = NULL;
-    size_t cap = 0;
+    int status;
     if (paths <= 0) {
-        ssize_t len;
-        long line_no = 0;
-        while (true) {
-            int read_err = 0;
-            len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
-            if (len < 0) {
-                if (read_err) {
-                    fprintf(stderr, "grep: %s\n", strerror(read_err));
-                }
-                break;
-            }
-            line_no++;
-            int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
-            if (invert_match ? !found : found) {
-                smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, NULL, number_lines ? line_no : 0);
-                status = 0;
-            }
-        }
+        status = smallclueGrepScanStream(stdin, "(standard input)", &re, &opts);
     } else {
+        opts.multiplePaths = (paths > 1) || opts.recursive;
+        status = 1;
         for (int i = index; i < argc; ++i) {
-            const char *path = argv[i];
-            FILE *fp = fopen(path, "r");
-            if (!fp) {
-                fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-                continue;
-            }
-            ssize_t len;
-            long line_no = 0;
-            while (true) {
-                int read_err = 0;
-                len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "grep: %s: %s\n", path, strerror(read_err));
-                    }
-                    break;
-                }
-                line_no++;
-                int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
-                if (invert_match ? !found : found) {
-                    smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, (paths > 1) ? path : NULL, number_lines ? line_no : 0);
-                    status = 0;
-                }
-            }
-            fclose(fp);
+            smallclueGrepWalkPath(argv[i], &re, &opts, &status);
         }
     }
-    free(line);
+    regfree(&re);
     return status;
 }
 
