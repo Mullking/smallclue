@@ -2263,14 +2263,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -s symbolic link  -f force overwrite\n"
            "  When the last operand is a directory, each target's basename\n"
            "  is created inside it"},
-    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-S] [-X] [-r] [-R] [-h] [-d]\n"
+           "     [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
            "  -n numeric uid/gid (implies -l)\n"
            "  -1 list one file per line\n"
            "  -C list entries by columns\n"
-           "  -t sort by modification time\n"
+           "  -t sort by modification time  -S sort by size  -X sort by extension\n"
+           "  -r reverse sort order  -R recurse into subdirectories\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
     {"md", "md [-i] [-c] [FILE|URL]\n"
@@ -9867,6 +9869,27 @@ static int compare_ls_entries_group_dirs_mtime(const void *lhs, const void *rhs)
     return strcmp(a->name, b->name);
 }
 
+static int compare_ls_entries_by_size(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    if (a->stat_buf.st_size > b->stat_buf.st_size) return -1;
+    if (a->stat_buf.st_size < b->stat_buf.st_size) return 1;
+    return strcmp(a->name, b->name);
+}
+
+static const char *smallclueLsExtensionOf(const char *name) {
+    const char *dot = strrchr(name, '.');
+    return (dot && dot != name) ? dot + 1 : "";
+}
+
+static int compare_ls_entries_by_extension(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    int cmp = strcmp(smallclueLsExtensionOf(a->name), smallclueLsExtensionOf(b->name));
+    if (cmp != 0) return cmp;
+    return strcmp(a->name, b->name);
+}
+
 #define LS_FORMAT_AUTO 0
 #define LS_FORMAT_LONG 1
 #define LS_FORMAT_COLUMNS 2
@@ -9948,7 +9971,11 @@ static int list_directory(const char *path,
                           bool human,
                           bool numeric_ids,
                           int color_mode,
-                          int classify) {
+                          int classify,
+                          bool sort_by_size,
+                          bool sort_by_extension,
+                          bool reverse_sort,
+                          bool recursive) {
     DIR *d = opendir(path);
     if (!d) {
         fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
@@ -10029,8 +10056,19 @@ static int list_directory(const char *path,
             }
         } else if (sort_by_time) {
             comparator = compare_ls_entries_by_mtime;
+        } else if (sort_by_size) {
+            comparator = compare_ls_entries_by_size;
+        } else if (sort_by_extension) {
+            comparator = compare_ls_entries_by_extension;
         }
         qsort(entries, count, sizeof(entries[0]), comparator);
+        if (reverse_sort) {
+            for (size_t i = 0; i < count / 2; ++i) {
+                SmallclueLsEntry tmp = entries[i];
+                entries[i] = entries[count - 1 - i];
+                entries[count - 1 - i] = tmp;
+            }
+        }
     }
 
     if (format_mode == LS_FORMAT_LONG) {
@@ -10057,6 +10095,18 @@ static int list_directory(const char *path,
         }
     } else {
         print_ls_columns(entries, count, color_mode, classify);
+    }
+
+    if (recursive) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!S_ISDIR(entries[i].stat_buf.st_mode)) continue;
+            if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0) continue;
+            printf("\n%s:\n", entries[i].full_path);
+            status |= list_directory(entries[i].full_path, show_all, show_almost_all, format_mode,
+                                     sort_by_time, group_directories_first, human, numeric_ids,
+                                     color_mode, classify, sort_by_size, sort_by_extension,
+                                     reverse_sort, recursive);
+        }
     }
 
     free_ls_entries(entries, count);
@@ -10120,7 +10170,11 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *list_dirs_only,
                                             int *human_sizes,
                                             int *classify,
-                                            int *numeric_ids) {
+                                            int *numeric_ids,
+                                            int *sort_by_size,
+                                            int *sort_by_extension,
+                                            int *reverse_sort,
+                                            int *recursive) {
     if (!arg) {
         return true;
     }
@@ -10159,6 +10213,18 @@ static bool smallclueLsValidateShortOptions(const char *arg,
             case 'n':
                 *numeric_ids = 1;
                 *format = LS_FORMAT_LONG;
+                break;
+            case 'S':
+                *sort_by_size = 1;
+                break;
+            case 'X':
+                *sort_by_extension = 1;
+                break;
+            case 'r':
+                *reverse_sort = 1;
+                break;
+            case 'R':
+                *recursive = 1;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -10220,6 +10286,10 @@ static int smallclueLsCommand(int argc, char **argv) {
     int classify = 0;
     int numeric_ids = 0;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
+    int sort_by_size = 0;
+    int sort_by_extension = 0;
+    int reverse_sort = 0;
+    int recursive = 0;
     smallclueResetGetopt();
 
     int idx = 1;
@@ -10262,7 +10332,11 @@ static int smallclueLsCommand(int argc, char **argv) {
                                              &list_dirs_only,
                                              &human_sizes,
                                              &classify,
-                                             &numeric_ids)) {
+                                             &numeric_ids,
+                                             &sort_by_size,
+                                             &sort_by_extension,
+                                             &reverse_sort,
+                                             &recursive)) {
             return 1;
         }
         idx++;
@@ -10287,7 +10361,8 @@ static int smallclueLsCommand(int argc, char **argv) {
             return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
         }
         return list_directory(".", show_all, show_almost_all, format,
-                              sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
+                              sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
+                              sort_by_size, sort_by_extension, reverse_sort, recursive);
     }
 
     int remaining = argc - paths_start;
@@ -10308,7 +10383,8 @@ static int smallclueLsCommand(int argc, char **argv) {
                 printf("%s:\n", path);
             }
             status |= list_directory(path, show_all, show_almost_all, format,
-                                     sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
+                                     sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
+                                     sort_by_size, sort_by_extension, reverse_sort, recursive);
         } else {
             status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
         }
