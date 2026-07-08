@@ -2136,8 +2136,11 @@ static const SmallclueApplet kSmallclueApplets[] = {
 static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"[", "[ expression ]\n"
           "  Alias for test; see 'test' for operators"},
-    {"basename", "basename PATH [SUFFIX]\n"
-                 "  Strip directory prefix and optional suffix"},
+    {"basename", "basename PATH [SUFFIX] | basename -a|-s SUFFIX PATH...\n"
+                 "  Strip directory prefix and optional suffix\n"
+                 "  -a/--multiple: treat every operand as a PATH (no positional SUFFIX)\n"
+                 "  -s/--suffix=SUFFIX: strip SUFFIX from every PATH (implies -a)\n"
+                 "  -z/--zero: NUL-terminate output instead of newline"},
     {"cal", "cal [month] [year]\n"
             "  Show a simple calendar"},
     {"cat", "cat [-n|-b] [-E] [-T] [-A] [-s] [FILE ...]\n"
@@ -2179,8 +2182,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"diff", "diff [-u] [-q] FILE1 FILE2\n"
              "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
              "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
-    {"dirname", "dirname PATH\n"
-                "  Strip last path component"},
+    {"dirname", "dirname PATH...\n"
+                "  Strip last path component from each PATH, one per line\n"
+                "  -z/--zero: NUL-terminate output instead of newline"},
     {"du", "du [-h] [PATH...]\n"
            "  -h human-readable sizes"},
 #if defined(SMALLCLUE_WITH_DVTM)
@@ -12662,40 +12666,131 @@ static int smallclueSleepCommand(int argc, char **argv) {
     return 0;
 }
 
+static char *smallclueBasenameOne(const char *input, const char *suffix) {
+    char *path = strdup(input);
+    if (!path) return NULL;
+    char *base = basename(path);
+    char *result = strdup(base ? base : "");
+    free(path);
+    if (!result) return NULL;
+    if (suffix && *suffix) {
+        size_t blen = strlen(result);
+        size_t slen = strlen(suffix);
+        /* GNU basename: only strip if it wouldn't leave an empty result. */
+        if (blen > slen && strcmp(result + blen - slen, suffix) == 0) {
+            result[blen - slen] = '\0';
+        }
+    }
+    return result;
+}
+
 static int smallclueBasenameCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool multiple = false;
+    const char *suffix = NULL;
+    bool nul_terminate = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--multiple") == 0) {
+            multiple = true;
+        } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--suffix") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "basename: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            suffix = argv[++argi];
+            multiple = true;
+        } else if (strncmp(arg, "--suffix=", 9) == 0) {
+            suffix = arg + 9;
+            multiple = true;
+        } else if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            nul_terminate = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "basename: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "basename: missing operand\n");
         return 1;
     }
-    char *path = strdup(argv[1]);
-    if (!path) {
-        perror("basename");
-        return 1;
+
+    if (!multiple) {
+        const char *name = argv[argi++];
+        const char *singleSuffix = suffix;
+        if (argi < argc) {
+            singleSuffix = argv[argi++];
+        }
+        if (argi < argc) {
+            fprintf(stderr, "basename: extra operand '%s'\n", argv[argi]);
+            return 1;
+        }
+        char *result = smallclueBasenameOne(name, singleSuffix);
+        if (!result) {
+            perror("basename");
+            return 1;
+        }
+        fputs(result, stdout);
+        putchar(nul_terminate ? '\0' : '\n');
+        free(result);
+        return 0;
     }
-    char *base = basename(path);
-    if (base) {
-        puts(base);
+
+    for (; argi < argc; ++argi) {
+        char *result = smallclueBasenameOne(argv[argi], suffix);
+        if (!result) {
+            perror("basename");
+            return 1;
+        }
+        fputs(result, stdout);
+        putchar(nul_terminate ? '\0' : '\n');
+        free(result);
     }
-    free(path);
-    return base ? 0 : 1;
+    return 0;
 }
 
 static int smallclueDirnameCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool nul_terminate = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            nul_terminate = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "dirname: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "dirname: missing operand\n");
         return 1;
     }
-    char *path = strdup(argv[1]);
-    if (!path) {
-        perror("dirname");
-        return 1;
+    for (; argi < argc; ++argi) {
+        char *path = strdup(argv[argi]);
+        if (!path) {
+            perror("dirname");
+            return 1;
+        }
+        char *dir = dirname(path);
+        if (dir) {
+            fputs(dir, stdout);
+            putchar(nul_terminate ? '\0' : '\n');
+        }
+        free(path);
     }
-    char *dir = dirname(path);
-    if (dir) {
-        puts(dir);
-    }
-    free(path);
-    return dir ? 0 : 1;
+    return 0;
 }
 
 static int smallclueTeeCommand(int argc, char **argv) {
