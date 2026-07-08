@@ -24,6 +24,7 @@
 #include "nohup_app.h"
 #include "cmp_app.h"
 #include "dd_app.h"
+#include "od_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2065,6 +2066,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"md5sum", smallclueMd5sumCommand, "Compute or check MD5 digests"},
     {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
     {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
+    {"od", smallclueOdCommand, "Dump files in octal/hex/decimal/character format"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
@@ -2384,6 +2386,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53).\n"
                  "  -v prints hosts lookup debugging."},
+    {"od", "od [-A d|o|x|n] [-t TYPE] [-c] [-v] [FILE]\n"
+           "  Dump FILE/stdin in the given format (default: 2-byte octal words)\n"
+           "  -A: address radix (d/o/x) or n for no address column\n"
+           "  -t TYPE: x1/x2/x4 (hex), o1/o2/o4 (octal), d1/d2/d4 (signed decimal),\n"
+           "           u1/u2/u4 (unsigned decimal), c (character)\n"
+           "  -c: shorthand for -t c\n"
+           "  -v: accepted for compatibility (repeated lines are never collapsed)"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"
