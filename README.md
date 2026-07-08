@@ -64,6 +64,9 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **nl**: Number lines of files (`-b a`/`t`, `-w`, `-s`).
 * **tac**: Concatenate and print files with lines in reverse order.
 * **rev**: Reverse the characters of each line.
+* **fold**: Wrap each line to a given width (`-w`, `-s` break at whitespace).
+* **paste**: Merge corresponding lines of files side by side (`-d`, `-s`).
+* **split**: Split a file into pieces by line count or byte count (`-l`, `-b`).
 * **md5sum** / **sha1sum** / **sha256sum**: Compute or check cryptographic digests (`-c`).
 * **base64**: Base64 encode or decode (`-d`, `-i`, `-w`).
 * **expr**: Evaluate expressions (shell arithmetic/string idiom).
@@ -111,7 +114,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **nohup**: Run a command immune to hangups.
 * **git**: Built-in libgit2-backed git applet (currently supports: `init`, `clone` (including `--depth` shallow clones and `--recurse-submodules`), `submodule` (`init`/`update`/`status`/`sync`/`foreach`), `remote`, `fetch`, `ls-remote`, `pull`, `push`, `add`, `rm`, `mv`, `clean`, `commit`, `reset`, `restore`, `checkout`, `switch`, `config` (`--get`, `--get-all`, `--list`, set, `--add`, `--replace-all`, `--unset`, `--unset-all`), `symbolic-ref`, `rev-parse`, `rev-list`, `reflog`, `show-ref`, `ls-files`, `ls-tree`, `cat-file`, `status`, `branch` (list/create/delete/rename/copy/set-upstream/unset-upstream), `tag` (list/create/delete), `diff`, `log` (including `--graph` and `-p`/`--patch`), `show`, `merge`, `merge-base`, `rebase`, `stash`, `cherry-pick`, `cherry`, `revert`, `blame`, and `describe`). Credentialed transports (HTTPS token / SSH key auth) are supported via a credentials callback.
 * **type**: Describe command names.
-* **xargs**: Build and execute command lines from standard input.
+* **xargs**: Build and execute command lines from standard input (`-n`, `-0`, `-I`, `-t`; quote/backslash-aware tokenization).
 * **pbcopy** / **pbpaste**: Clipboard helpers (on iOS/iPadOS these integrate with the system clipboard).
 * **test** / **[**: Evaluate conditional expressions.
 * **true** / **false**: Return success or failure status.
