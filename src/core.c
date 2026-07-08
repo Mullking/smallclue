@@ -32,6 +32,8 @@
 #include "fold_app.h"
 #include "paste_app.h"
 #include "split_app.h"
+#include "fmt_app.h"
+#include "comm_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2177,6 +2179,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"fold", smallclueFoldCommand, "Wrap each line to a given width"},
     {"paste", smallcluePasteCommand, "Merge lines of files"},
     {"split", smallclueSplitCommand, "Split a file into pieces"},
+    {"fmt", smallclueFmtCommand, "Reflow text into filled paragraphs"},
+    {"comm", smallclueCommCommand, "Compare two sorted files line by line"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
@@ -2545,6 +2549,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"split", "split [-l LINES | -b BYTES] [FILE [PREFIX]]\n"
               "  Split FILE/stdin into PREFIXaa, PREFIXab, ... (default\n"
               "  PREFIX: x); -l 1000 lines/chunk by default, or -b BYTES"},
+    {"fmt", "fmt [-w WIDTH] [FILE...]\n"
+            "  Reflow text into filled paragraphs (default width 75);\n"
+            "  blank lines are paragraph breaks"},
+    {"comm", "comm [-1] [-2] [-3] FILE1 FILE2\n"
+             "  Compare two SORTED files; 3 columns by default (unique to\n"
+             "  FILE1, unique to FILE2, common); -N suppresses column N"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"
