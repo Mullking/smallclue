@@ -2365,9 +2365,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Simple substitution support"},
     {"sleep", "sleep SECONDS\n"
               "  Pause execution"},
-    {"sort", "sort [-r] [-n]\n"
+    {"sort", "sort [-r] [-n] [-u] [-k N] [-t SEP] [FILE...]\n"
              "  -r reverse\n"
-             "  -n numeric"},
+             "  -n numeric\n"
+             "  -u unique (after sorting)\n"
+             "  -k N sort by field N through end of line (1-based)\n"
+             "  -t SEP field separator for -k (default: runs of whitespace)"},
     {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
              "  -L follow symlinks\n"
              "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
@@ -3927,6 +3930,57 @@ static int smallclueStringCompare(const void *a, const void *b) {
     const char *const *lhs = (const char *const *)a;
     const char *const *rhs = (const char *const *)b;
     return strcmp(*lhs, *rhs);
+}
+
+/* qsort's comparator signature has no room for a context pointer, so sort's
+ * extra options (numeric/key-field/separator) live in this file-scope
+ * struct, set immediately before the one qsort() call that uses it. */
+typedef struct {
+    bool numeric;
+    bool haveKey;
+    int keyField; /* 1-based; the key runs from here to end-of-line, matching
+                    * GNU sort's own semantics for a bare "-k N" (no ",M" end
+                    * field) */
+    char keySep;  /* 0 = split on runs of whitespace (GNU sort's default) */
+} SmallclueSortOptions;
+
+static SmallclueSortOptions gSmallclueSortOpts;
+
+/* Returns a pointer into `line` (no copy) at the start of the requested
+ * sort key -- either the whole line, or from the Nth field onward. */
+static const char *smallclueSortKeyOf(const char *line) {
+    if (!gSmallclueSortOpts.haveKey) {
+        return line;
+    }
+    const char *p = line;
+    int field = 1;
+    while (field < gSmallclueSortOpts.keyField && *p) {
+        if (gSmallclueSortOpts.keySep) {
+            while (*p && *p != gSmallclueSortOpts.keySep) p++;
+            if (*p) p++;
+        } else {
+            while (*p && isspace((unsigned char)*p)) p++;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+        field++;
+    }
+    return p;
+}
+
+static int smallclueSortCompare(const void *a, const void *b) {
+    const char *lhs = *(const char *const *)a;
+    const char *rhs = *(const char *const *)b;
+    const char *lkey = smallclueSortKeyOf(lhs);
+    const char *rkey = smallclueSortKeyOf(rhs);
+    if (gSmallclueSortOpts.numeric) {
+        double lv = strtod(lkey, NULL);
+        double rv = strtod(rkey, NULL);
+        if (lv < rv) return -1;
+        if (lv > rv) return 1;
+        return 0;
+    }
+    return strcmp(lkey, rkey);
 }
 
 static FILE *smallclueOpenTempFile(const char *tag) {
@@ -14663,6 +14717,8 @@ static int smallclueResizeCommand(int argc, char **argv) {
 
 static int smallclueSortCommand(int argc, char **argv) {
     int reverse = 0;
+    bool uniqueOnly = false;
+    memset(&gSmallclueSortOpts, 0, sizeof(gSmallclueSortOpts));
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -14676,6 +14732,52 @@ static int smallclueSortCommand(int argc, char **argv) {
         if (strcmp(arg, "-r") == 0) {
             reverse = 1;
             index++;
+            continue;
+        }
+        if (strcmp(arg, "-n") == 0) {
+            gSmallclueSortOpts.numeric = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0) {
+            uniqueOnly = true;
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-t", 2) == 0) {
+            if (arg[2] != '\0') {
+                gSmallclueSortOpts.keySep = arg[2];
+                index++;
+            } else {
+                if (index + 1 >= argc || !argv[index + 1][0]) {
+                    fprintf(stderr, "sort: missing separator for -t\n");
+                    return 1;
+                }
+                gSmallclueSortOpts.keySep = argv[index + 1][0];
+                index += 2;
+            }
+            continue;
+        }
+        if (strncmp(arg, "-k", 2) == 0) {
+            const char *valStr = NULL;
+            if (arg[2] != '\0') {
+                valStr = arg + 2;
+                index++;
+            } else {
+                if (index + 1 >= argc) {
+                    fprintf(stderr, "sort: missing field for -k\n");
+                    return 1;
+                }
+                valStr = argv[index + 1];
+                index += 2;
+            }
+            int field = (int)strtol(valStr, NULL, 10);
+            if (field <= 0) {
+                fprintf(stderr, "sort: invalid -k field '%s'\n", valStr);
+                return 1;
+            }
+            gSmallclueSortOpts.haveKey = true;
+            gSmallclueSortOpts.keyField = field;
             continue;
         }
         fprintf(stderr, "sort: unsupported option '%s'\n", arg);
@@ -14699,17 +14801,17 @@ static int smallclueSortCommand(int argc, char **argv) {
         }
     }
     if (status == 0 && vec.count > 1) {
-        qsort(vec.items, vec.count, sizeof(char *), smallclueStringCompare);
+        qsort(vec.items, vec.count, sizeof(char *), smallclueSortCompare);
     }
     if (status == 0) {
-        if (reverse) {
-            for (size_t i = vec.count; i-- > 0;) {
-                fputs(vec.items[i], stdout);
+        char *lastPrinted = NULL;
+        for (size_t k = 0; k < vec.count; ++k) {
+            size_t i = reverse ? (vec.count - 1 - k) : k;
+            if (uniqueOnly && lastPrinted && smallclueSortCompare(&lastPrinted, &vec.items[i]) == 0) {
+                continue;
             }
-        } else {
-            for (size_t i = 0; i < vec.count; ++i) {
-                fputs(vec.items[i], stdout);
-            }
+            fputs(vec.items[i], stdout);
+            lastPrinted = vec.items[i];
         }
     }
     smallclueLineVectorFree(&vec);
