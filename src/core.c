@@ -23,6 +23,7 @@
 #include "base64_app.h"
 #include "nohup_app.h"
 #include "cmp_app.h"
+#include "dd_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2016,6 +2017,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
+    {"dd", smallclueDdCommand, "Convert and copy a file block by block"},
     {"diff", smallclueDiffCommand, "Compare files line by line"},
     {"cmp", smallclueCmpCommand, "Compare two files byte by byte"},
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
@@ -2196,6 +2198,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -s/--set=STRING: set the system clock to STRING, then display it\n"
              "  STRING accepts \"YYYY-MM-DD[ HH:MM[:SS]]\" (also T-separated\n"
              "  and '/'-separated) -- not full natural-language date parsing"},
+    {"dd", "dd [if=FILE] [of=FILE] [bs=N] [count=N] [skip=N] [seek=N] [conv=notrunc]\n"
+           "  Block-copy if= to of= (default stdin to stdout, bs=512)\n"
+           "  N accepts k/M/G/b/w size suffixes\n"
+           "  skip=N/seek=N: skip N input/output blocks before copying\n"
+           "  conv=notrunc: don't truncate an existing output file first\n"
+           "  Prints a records-in/records-out/bytes summary to stderr"},
     {"diff", "diff [-u] [-q] FILE1 FILE2\n"
              "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
              "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},

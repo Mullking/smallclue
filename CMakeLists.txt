@@ -185,6 +185,7 @@ set(SOURCES
     src/base64_app.c
     src/nohup_app.c
     src/cmp_app.c
+    src/dd_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
