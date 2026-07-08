@@ -175,6 +175,7 @@ set(SOURCES
     src/openssh_shim.c
     src/tar_app.c
     src/gzip_app.c
+    src/readlink_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c

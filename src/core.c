@@ -13,6 +13,7 @@
 #include "openrsync_app.h"
 #include "tar_app.h"
 #include "gzip_app.h"
+#include "readlink_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2052,6 +2053,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"pwd", smallcluePwdCommand, "Print working directory"},
     {"reboot", smallclueHaltCommand, "Reboot the system"},
     {"resize", smallclueResizeCommand, "Synchronize terminal rows/columns"},
+    {"readlink", smallclueReadlinkCommand, "Print resolved symbolic links or canonical paths"},
+    {"realpath", smallclueRealpathCommand, "Print the canonicalized absolute path"},
     {"rm", smallclueRmCommand, "Remove files"},
     {"rmdir", smallclueRmdirCommand, "Remove empty directories"},
     {"runit", smallclueRunitCommand, "System service supervisor"},
@@ -2301,6 +2304,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
+    {"readlink", "readlink [-f|-e|-m] [-n] PATH...\n"
+                 "  No flag: print the immediate symlink target\n"
+                 "  -f canonicalize (resolve all symlinks + ./..); -e requires\n"
+                 "  every component to exist; -m allows a missing final component\n"
+                 "  -n suppress trailing newline"},
+    {"realpath", "realpath [-e|-m] PATH...\n"
+                 "  Print the canonicalized absolute path\n"
+                 "  -e require full existence  -m allow a missing final component (default)"},
     {"rm", "rm [-r] [-f] [-i] FILE...\n"
            "  -r recursive\n"
            "  -f force\n"
