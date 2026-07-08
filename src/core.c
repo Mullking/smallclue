@@ -15,6 +15,7 @@
 #include "gzip_app.h"
 #include "readlink_app.h"
 #include "checksum_app.h"
+#include "diff_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2005,6 +2006,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
+    {"diff", smallclueDiffCommand, "Compare files line by line"},
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
 #if defined(SMALLCLUE_WITH_DVTM)
@@ -2152,6 +2154,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  -f fields (e.g. 1,3-5)"},
     {"date", "date [+FORMAT]\n"
              "  Show date/time"},
+    {"diff", "diff [-u] [-q] FILE1 FILE2\n"
+             "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
+             "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
     {"dirname", "dirname PATH\n"
                 "  Strip last path component"},
     {"du", "du [-h] [PATH...]\n"

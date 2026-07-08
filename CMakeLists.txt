@@ -177,6 +177,7 @@ set(SOURCES
     src/gzip_app.c
     src/readlink_app.c
     src/checksum_app.c
+    src/diff_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
