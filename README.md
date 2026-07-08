@@ -60,6 +60,10 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **tr**: Translate or delete characters.
 * **tee**: Read from standard input and write to standard output and files.
 * **sum**: BSD/SysV checksum utility.
+* **seq**: Print a sequence of numbers (`-w` zero-pad, `-s` separator, floating-point).
+* **nl**: Number lines of files (`-b a`/`t`, `-w`, `-s`).
+* **tac**: Concatenate and print files with lines in reverse order.
+* **rev**: Reverse the characters of each line.
 * **md5sum** / **sha1sum** / **sha256sum**: Compute or check cryptographic digests (`-c`).
 * **base64**: Base64 encode or decode (`-d`, `-i`, `-w`).
 * **expr**: Evaluate expressions (shell arithmetic/string idiom).
