@@ -2121,8 +2121,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Show a simple calendar"},
     {"cat", "cat [FILE ...]\n"
             "  Concatenate files to stdout"},
-    {"chmod", "chmod MODE FILE ...\n"
-              "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644"},
+    {"chmod", "chmod [-R] MODE FILE ...\n"
+              "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644\n"
+              "  -R recursive"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"
@@ -10041,33 +10042,83 @@ static int smallclueChmodApplySymbolic(const SmallclueChmodSpec *spec, const cha
     return 0;
 }
 
+static int smallclueChmodApplyOne(const char *path, bool useOctal, mode_t octalMode,
+                                  const SmallclueChmodSpec *symbolicSpec) {
+    if (useOctal) {
+        if (chmod(path, octalMode) != 0) {
+            fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
+            return 1;
+        }
+        return 0;
+    }
+    return smallclueChmodApplySymbolic(symbolicSpec, path);
+}
+
+static int smallclueChmodApplyRecursive(const char *path, bool useOctal, mode_t octalMode,
+                                        const SmallclueChmodSpec *symbolicSpec) {
+    int status = smallclueChmodApplyOne(path, useOctal, octalMode, symbolicSpec);
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return status;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char child[PATH_MAX];
+        if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+            fprintf(stderr, "chmod: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+            status = 1;
+            continue;
+        }
+        if (smallclueChmodApplyRecursive(child, useOctal, octalMode, symbolicSpec) != 0) {
+            status = 1;
+        }
+    }
+    closedir(dir);
+    return status;
+}
+
 static int smallclueChmodCommand(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: chmod mode file...\n");
+    bool recursive = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        if (strcmp(argv[argi], "-R") == 0 || strcmp(argv[argi], "-r") == 0 ||
+            strcmp(argv[argi], "--recursive") == 0) {
+            recursive = true;
+        } else {
+            break;
+        }
+    }
+    if (argc - argi < 2) {
+        fprintf(stderr, "usage: chmod [-R] mode file...\n");
         return 1;
     }
     mode_t octalMode = 0;
     SmallclueChmodSpec symbolicSpec;
-    bool useOctal = smallclueChmodParseOctal(argv[1], &octalMode);
+    bool useOctal = smallclueChmodParseOctal(argv[argi], &octalMode);
     bool useSymbolic = false;
     if (!useOctal) {
-        useSymbolic = smallclueChmodParseSymbolic(argv[1], &symbolicSpec);
+        useSymbolic = smallclueChmodParseSymbolic(argv[argi], &symbolicSpec);
     }
     if (!useOctal && !useSymbolic) {
-        fprintf(stderr, "chmod: invalid mode: %s\n", argv[1]);
+        fprintf(stderr, "chmod: invalid mode: %s\n", argv[argi]);
         return 1;
     }
+    argi++;
     int status = 0;
-    for (int i = 2; i < argc; ++i) {
-        if (useOctal) {
-            if (chmod(argv[i], octalMode) != 0) {
-                fprintf(stderr, "chmod: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-            }
-        } else {
-            if (smallclueChmodApplySymbolic(&symbolicSpec, argv[i]) != 0) {
-                status = 1;
-            }
+    for (int i = argi; i < argc; ++i) {
+        int rc = recursive
+                     ? smallclueChmodApplyRecursive(argv[i], useOctal, octalMode, &symbolicSpec)
+                     : smallclueChmodApplyOne(argv[i], useOctal, octalMode, &symbolicSpec);
+        if (rc != 0) {
+            status = 1;
         }
     }
     return status;
