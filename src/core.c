@@ -1415,6 +1415,76 @@ static int smallclueAddTabCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 
 
+/* Builds the reverse-DNS query name real nslookup/host display for a PTR
+ * lookup (e.g. "8.8.8.8" -> "8.8.8.8.in-addr.arpa", "::1" ->
+ * "1.0.0...0.ip6.arpa") -- purely for display, matching what those tools
+ * print; the actual lookup itself goes through getnameinfo(), which
+ * doesn't need this string. IPv6 uses nibble-reversed hex per RFC 3596,
+ * verified against real host/nslookup in Docker. */
+static void smallclueBuildReverseDnsName(int family, const void *addr, char *out, size_t outSize) {
+    if (family == AF_INET) {
+        const unsigned char *b = (const unsigned char *)addr;
+        snprintf(out, outSize, "%u.%u.%u.%u.in-addr.arpa", b[3], b[2], b[1], b[0]);
+    } else {
+        const unsigned char *b = (const unsigned char *)addr;
+        size_t pos = 0;
+        for (int i = 15; i >= 0 && pos + 4 < outSize; --i) {
+            pos += (size_t)snprintf(out + pos, outSize - pos, "%x.%x.", b[i] & 0xF, (b[i] >> 4) & 0xF);
+        }
+        snprintf(out + pos, outSize - pos, "ip6.arpa");
+    }
+}
+
+/* Detects an IP-address-shaped query and performs a PTR (reverse) lookup
+ * instead of the usual forward A/AAAA lookup, matching real
+ * nslookup/host's auto-detection. Returns true if `host` was IP-shaped
+ * (whether or not the lookup itself succeeded, in which case an error
+ * was already printed and *exitStatus set). */
+static bool smallclueTryReverseDnsLookup(const char *label, const char *host, bool nslookupStyle, int *exitStatus) {
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int family;
+    const void *addrBytes;
+    struct sockaddr_storage sa;
+    socklen_t saLen;
+    memset(&sa, 0, sizeof(sa));
+    if (inet_pton(AF_INET, host, &addr4) == 1) {
+        family = AF_INET;
+        addrBytes = &addr4;
+        struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+        sin->sin_family = AF_INET;
+        sin->sin_addr = addr4;
+        saLen = sizeof(*sin);
+    } else if (inet_pton(AF_INET6, host, &addr6) == 1) {
+        family = AF_INET6;
+        addrBytes = &addr6;
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&sa;
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_addr = addr6;
+        saLen = sizeof(*sin6);
+    } else {
+        return false;
+    }
+
+    char revname[256];
+    smallclueBuildReverseDnsName(family, addrBytes, revname, sizeof(revname));
+
+    char hostbuf[NI_MAXHOST];
+    int rc = getnameinfo((struct sockaddr *)&sa, saLen, hostbuf, sizeof(hostbuf), NULL, 0, NI_NAMEREQD);
+    if (rc != 0) {
+        fprintf(stderr, "%s: %s: %s\n", label, revname, gai_strerror(rc));
+        *exitStatus = 1;
+        return true;
+    }
+    if (nslookupStyle) {
+        printf("%s\tname = %s.\n", revname, hostbuf);
+    } else {
+        printf("%s domain name pointer %s.\n", revname, hostbuf);
+    }
+    *exitStatus = 0;
+    return true;
+}
+
 static int smallclueNslookupCommand(int argc, char **argv) {
     const char *usage = "usage: nslookup [-v] host [port]\n";
     bool verbose = false;
@@ -1441,6 +1511,11 @@ static int smallclueNslookupCommand(int argc, char **argv) {
     }
     const char *host = argv[optind];
     const char *service = (optind + 1 < argc) ? argv[optind + 1] : "53";
+
+    int reverseStatus = 0;
+    if (smallclueTryReverseDnsLookup("nslookup", host, true, &reverseStatus)) {
+        return reverseStatus;
+    }
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -1503,6 +1578,11 @@ static int smallclueHostCommand(int argc, char **argv) {
     const char *host = argv[optind];
     if (optind + 1 < argc) {
         fprintf(stderr, "host: server override not supported; ignoring '%s'\n", argv[optind + 1]);
+    }
+
+    int reverseStatus = 0;
+    if (smallclueTryReverseDnsLookup("host", host, false, &reverseStatus)) {
+        return reverseStatus;
     }
 
     struct addrinfo hints;
@@ -2431,7 +2511,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  to nohup.out (or $HOME/nohup.out); if stderr is also a terminal,\n"
               "  it goes to the same place."},
     {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53).\n"
+                 "  DNS lookup utility (UDP port defaults to 53);\n"
+                 "  IP-shaped queries auto-detect as PTR/reverse lookups.\n"
                  "  -v prints hosts lookup debugging."},
     {"od", "od [-A d|o|x|n] [-t TYPE] [-c] [-v] [FILE]\n"
            "  Dump FILE/stdin in the given format (default: 2-byte octal words)\n"
@@ -2479,6 +2560,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -6 IPv6 only\n"
              "  -t A|AAAA select record type\n"
              "  -v verbose (hosts debug)\n"
+             "  IP-shaped queries auto-detect as PTR/reverse lookups\n"
              "Server override is ignored."},
     {"hostname", "hostname\n"
                  "  Show system hostname"},
@@ -2712,7 +2794,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Print or control the kernel ring buffer\n"
               "  -T  show human-readable timestamps (iOS only)"},
     {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53). -v prints hosts lookup debugging."},
+                 "  DNS lookup utility (UDP port defaults to 53); IP-shaped\n"
+                 "  queries auto-detect as PTR/reverse lookups. -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
     {"addt", "addt\n"
              "  Open an additional shell tab"},
