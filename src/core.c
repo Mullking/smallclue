@@ -2132,8 +2132,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  Strip directory prefix and optional suffix"},
     {"cal", "cal [month] [year]\n"
             "  Show a simple calendar"},
-    {"cat", "cat [FILE ...]\n"
-            "  Concatenate files to stdout"},
+    {"cat", "cat [-n|-b] [-E] [-T] [-A] [-s] [FILE ...]\n"
+            "  Concatenate files to stdout\n"
+            "  -n number all lines  -b number non-blank lines only\n"
+            "  -E show $ at line end  -T show tabs as ^I  -A = -E -T\n"
+            "  -s squeeze runs of blank lines to one\n"
+            "  (previously any flag was silently treated as a filename)"},
     {"chmod", "chmod [-R] MODE FILE ...\n"
               "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644\n"
               "  -R recursive"},
@@ -9593,6 +9597,77 @@ static int cat_file(const char *path) {
     return status;
 }
 
+typedef struct {
+    bool numberAll;      /* -n */
+    bool numberNonBlank;  /* -b (takes priority over -n if both given) */
+    bool showEnds;        /* -E: '$' at end of line */
+    bool showTabs;        /* -T: tabs as ^I */
+    bool squeezeBlank;    /* -s: collapse runs of blank lines to one */
+} SmallclueCatOptions;
+
+/* Line-based formatting path, used only when any of -n/-b/-A/-E/-T/-s is
+ * given -- the flag-less case keeps using the existing raw-byte-stream
+ * print_file()/cat_file() fast path unchanged. */
+static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions *opts, long *lineNo, bool *prevBlank) {
+    FILE *fp;
+    const char *label = path ? path : "(stdin)";
+    if (!path || strcmp(path, "-") == 0) {
+        fp = stdin;
+    } else {
+        char resolved[PATH_MAX];
+        const char *open_path = smallclueResolvePath(path, resolved, sizeof(resolved));
+        if (!open_path || *open_path == '\0') open_path = path;
+        fp = fopen(open_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
+            return 1;
+        }
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    int status = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "cat: %s: %s\n", label, strerror(read_err));
+                status = 1;
+            }
+            break;
+        }
+        bool hadNewline = (len > 0 && line[len - 1] == '\n');
+        if (hadNewline) {
+            line[len - 1] = '\0';
+            len--;
+        }
+        bool isBlank = (len == 0);
+        if (opts->squeezeBlank && isBlank && *prevBlank) {
+            continue;
+        }
+        *prevBlank = isBlank;
+
+        if (opts->numberAll || opts->numberNonBlank) {
+            if (!opts->numberNonBlank || !isBlank) {
+                printf("%6ld\t", ++(*lineNo));
+            }
+        }
+        if (opts->showTabs) {
+            for (ssize_t i = 0; i < len; ++i) {
+                if (line[i] == '\t') fputs("^I", stdout);
+                else putchar(line[i]);
+            }
+        } else {
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+        if (opts->showEnds) putchar('$');
+        if (hadNewline) putchar('\n');
+    }
+    free(line);
+    if (fp != stdin) fclose(fp);
+    return status;
+}
+
 static void print_permissions(mode_t mode) {
     putchar(S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-');
     putchar(mode & S_IRUSR ? 'r' : '-');
@@ -12878,12 +12953,48 @@ static int smallclueDmesgCommand(int argc, char **argv) {
 }
 
 static int smallclueCatCommand(int argc, char **argv) {
-    int status = 0;
-    if (argc <= 1) {
-        return cat_file(NULL);
+    SmallclueCatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) break;
+        if (strcmp(arg, "--") == 0) { argi++; break; }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'n': opts.numberAll = true; break;
+                case 'b': opts.numberNonBlank = true; break;
+                case 'E': opts.showEnds = true; break;
+                case 'T': opts.showTabs = true; break;
+                case 's': opts.squeezeBlank = true; break;
+                case 'A': opts.showEnds = true; opts.showTabs = true; break;
+                default:
+                    fprintf(stderr, "cat: unsupported option -%c\n", *p);
+                    return 1;
+            }
+        }
     }
-    for (int i = 1; i < argc; ++i) {
-        status |= cat_file(argv[i]);
+
+    bool anyFlag = opts.numberAll || opts.numberNonBlank || opts.showEnds ||
+                  opts.showTabs || opts.squeezeBlank;
+    int status = 0;
+    if (!anyFlag) {
+        if (argi >= argc) {
+            return cat_file(NULL);
+        }
+        for (int i = argi; i < argc; ++i) {
+            status |= cat_file(argv[i]);
+        }
+        return status ? 1 : 0;
+    }
+
+    long lineNo = 0;
+    bool prevBlank = false;
+    if (argi >= argc) {
+        return smallclueCatFileFormatted(NULL, &opts, &lineNo, &prevBlank);
+    }
+    for (int i = argi; i < argc; ++i) {
+        status |= smallclueCatFileFormatted(argv[i], &opts, &lineNo, &prevBlank);
     }
     return status ? 1 : 0;
 }
