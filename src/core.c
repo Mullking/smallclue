@@ -57,6 +57,8 @@
 #include <grp.h>
 #include <limits.h>
 #include <libgen.h>
+#include <locale.h>
+#include <wchar.h>
 #include <pwd.h>
 #if defined(__linux__) || defined(linux) || defined(__linux)
 #include <shadow.h>
@@ -2630,8 +2632,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Alias for nextvi"},
     {"watch", "watch [-n SECONDS] [-c COUNT|--count COUNT] command...\n"
               "  Periodically run a command"},
-    {"wc", "wc [-l] [-w] [-c] [FILE...]\n"
-           "  Count lines/words/bytes"},
+    {"wc", "wc [-l] [-w] [-c] [-m] [-L] [FILE...]\n"
+           "  Count lines/words/bytes; -m chars (locale-aware),\n"
+           "  -L max line length (tabs expand to 8-col stops)"},
     {"wget", "wget [options] URL...\n"
              "  Common: -O FILE\n"
              "  --method=METHOD\n"
@@ -18792,20 +18795,11 @@ typedef struct {
     uint64_t lines;
     uint64_t words;
     uint64_t bytes;
+    uint64_t chars;
+    uint64_t max_line_length;
 } SmallclueWcCounts;
 
-static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
-    FILE *fp = NULL;
-    if (path) {
-        fp = fopen(path, "r");
-        if (!fp) {
-            fprintf(stderr, "wc: %s: %s\n", path, strerror(errno));
-            return 1;
-        }
-    } else {
-        fp = stdin;
-    }
-
+static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCounts *counts) {
     uint64_t lines = 0;
     uint64_t words = 0;
     uint64_t bytes = 0;
@@ -18868,26 +18862,152 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
     counts->lines = lines;
     counts->words = words;
     counts->bytes = bytes;
+    counts->chars = bytes;
+    counts->max_line_length = 0;
+    return read_err ? 1 : 0;
+}
+
+/* Slower path used only when -m/-L are requested: decodes multibyte
+ * characters via mbrtowc (honoring the process locale) so -m's character
+ * count and -L's column-based max-line-length match GNU wc under a UTF-8
+ * locale, instead of just approximating them as raw byte counts. -L expands
+ * tabs to the next multiple of 8 columns, matching GNU coreutils' actual
+ * behavior (verified against Linux wc). */
+static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCounts *counts) {
+    uint64_t lines = 0;
+    uint64_t words = 0;
+    uint64_t bytes = 0;
+    uint64_t chars = 0;
+    uint64_t max_line_length = 0;
+    uint64_t cur_line_length = 0;
+    int in_word = 0;
+    int read_err = 0;
+    char buf[16384];
+    ssize_t n;
+    mbstate_t mbs;
+    memset(&mbs, 0, sizeof(mbs));
+    unsigned char carry[16];
+    size_t carryLen = 0;
+
+    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        bytes += (uint64_t)n;
+
+        for (int i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') {
+                lines++;
+            }
+            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
+            if (is_sp) {
+                in_word = 0;
+            } else if (!in_word) {
+                words++;
+                in_word = 1;
+            }
+        }
+
+        /* Character decode: work off a carry buffer so a multibyte
+         * sequence split across two reads still decodes correctly. */
+        size_t avail = carryLen + (size_t)n;
+        unsigned char *scratch = (unsigned char *)malloc(avail > 0 ? avail : 1);
+        if (!scratch) {
+            fprintf(stderr, "wc: out of memory\n");
+            return 1;
+        }
+        if (carryLen) memcpy(scratch, carry, carryLen);
+        memcpy(scratch + carryLen, buf, (size_t)n);
+
+        size_t pos = 0;
+        while (pos < avail) {
+            wchar_t wc;
+            size_t rc = mbrtowc(&wc, (const char *)scratch + pos, avail - pos, &mbs);
+            if (rc == (size_t)-2) {
+                /* Incomplete sequence at the end of the buffer -- carry the
+                 * remaining bytes over to the next read. */
+                size_t remain = avail - pos;
+                if (remain > sizeof(carry)) remain = sizeof(carry);
+                memcpy(carry, scratch + pos, remain);
+                carryLen = remain;
+                pos = avail;
+                break;
+            }
+            if (rc == (size_t)-1) {
+                /* Invalid sequence -- count the single byte as one
+                 * character and resync, matching GNU wc's behavior. */
+                memset(&mbs, 0, sizeof(mbs));
+                chars++;
+                cur_line_length++;
+                pos++;
+                carryLen = 0;
+                continue;
+            }
+            if (rc == 0) rc = 1; /* embedded NUL still counts as a character */
+            chars++;
+            if (wc == L'\n') {
+                if (cur_line_length > max_line_length) max_line_length = cur_line_length;
+                cur_line_length = 0;
+            } else if (wc == L'\t') {
+                cur_line_length = (cur_line_length / 8 + 1) * 8;
+            } else {
+                cur_line_length++;
+            }
+            pos += rc;
+            carryLen = 0;
+        }
+        free(scratch);
+    }
+
+    if (cur_line_length > max_line_length) max_line_length = cur_line_length;
+
+    counts->lines = lines;
+    counts->words = words;
+    counts->bytes = bytes;
+    counts->chars = chars;
+    counts->max_line_length = max_line_length;
+    return read_err ? 1 : 0;
+}
+
+static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts, bool needWide) {
+    FILE *fp = NULL;
+    if (path) {
+        fp = fopen(path, "r");
+        if (!fp) {
+            fprintf(stderr, "wc: %s: %s\n", path, strerror(errno));
+            return 1;
+        }
+    } else {
+        fp = stdin;
+    }
+
+    int rc = needWide ? smallclueWcProcessFileWide(path, fp, counts)
+                       : smallclueWcProcessFileFast(path, fp, counts);
 
     if (fp != stdin) {
         fclose(fp);
     }
-    if (read_err) {
+    if (rc != 0) {
         fprintf(stderr, "wc: %s: read error\n", path ? path : "(stdin)");
         return 1;
     }
     return 0;
 }
 
-static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, int show_words, int show_bytes, const char *label) {
+static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, int show_words,
+                              int show_chars, int show_bytes, int show_maxline, const char *label) {
     if (show_lines) {
         printf("%12" PRIu64, counts->lines);
     }
     if (show_words) {
         printf("%12" PRIu64, counts->words);
     }
+    if (show_chars) {
+        printf("%12" PRIu64, counts->chars);
+    }
     if (show_bytes) {
         printf("%12" PRIu64, counts->bytes);
+    }
+    if (show_maxline) {
+        printf("%12" PRIu64, counts->max_line_length);
     }
     if (label) {
         printf(" %s", label);
@@ -18896,7 +19016,7 @@ static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, in
 }
 
 static int smallclueWcCommand(int argc, char **argv) {
-    int show_lines = 0, show_words = 0, show_bytes = 0;
+    int show_lines = 0, show_words = 0, show_bytes = 0, show_chars = 0, show_maxline = 0;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -18911,6 +19031,8 @@ static int smallclueWcCommand(int argc, char **argv) {
             if (*opt == 'l') show_lines = 1;
             else if (*opt == 'w') show_words = 1;
             else if (*opt == 'c') show_bytes = 1;
+            else if (*opt == 'm') show_chars = 1;
+            else if (*opt == 'L') show_maxline = 1;
             else {
                 fprintf(stderr, "wc: invalid option -- %c\n", *opt);
                 return 1;
@@ -18918,31 +19040,39 @@ static int smallclueWcCommand(int argc, char **argv) {
         }
         index++;
     }
-    if (!show_lines && !show_words && !show_bytes) {
+    if (!show_lines && !show_words && !show_bytes && !show_chars && !show_maxline) {
         show_lines = show_words = show_bytes = 1;
+    }
+    bool needWide = show_chars || show_maxline;
+    if (needWide) {
+        setlocale(LC_CTYPE, "");
     }
     int paths = argc - index;
     int status = 0;
     SmallclueWcCounts counts;
-    SmallclueWcCounts total = {0, 0, 0};
+    SmallclueWcCounts total = {0, 0, 0, 0, 0};
     if (paths <= 0) {
-        if (smallclueWcProcessFile(NULL, &counts) != 0) {
+        if (smallclueWcProcessFile(NULL, &counts, needWide) != 0) {
             return 1;
         }
-        smallclueWcPrint(&counts, show_lines, show_words, show_bytes, NULL);
+        smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL);
     } else {
         for (int i = index; i < argc; ++i) {
-            if (smallclueWcProcessFile(argv[i], &counts) != 0) {
+            if (smallclueWcProcessFile(argv[i], &counts, needWide) != 0) {
                 status = 1;
                 continue;
             }
-            smallclueWcPrint(&counts, show_lines, show_words, show_bytes, argv[i]);
+            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, argv[i]);
             total.lines += counts.lines;
             total.words += counts.words;
             total.bytes += counts.bytes;
+            total.chars += counts.chars;
+            if (counts.max_line_length > total.max_line_length) {
+                total.max_line_length = counts.max_line_length;
+            }
         }
         if (paths > 1) {
-            smallclueWcPrint(&total, show_lines, show_words, show_bytes, "total");
+            smallclueWcPrint(&total, show_lines, show_words, show_chars, show_bytes, show_maxline, "total");
         }
     }
     return status;
