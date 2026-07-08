@@ -2683,7 +2683,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -0 NUL-delimited input (pairs with find -print0)\n"
               "  -I REPLACE: one invocation per input line, substituting\n"
               "    REPLACE wherever it appears in COMMAND's arguments\n"
-              "  -t print each command line before running it"},
+              "  -t print each command line before running it\n"
+              "  Without -0: single/double quotes group whitespace into one\n"
+              "    token (quotes stripped); backslash escapes the next char"},
     {"df", "df [-h] [path ...]\n"
            "  With no path, lists every mounted filesystem (like real df)\n"
            "  -h human-readable sizes"},
@@ -3014,6 +3016,16 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
     return len;
 }
 
+/* Real xargs (without -0) gives single/double quotes and a backslash real
+ * meaning: a quoted span groups whitespace into one token (the quote chars
+ * themselves are stripped, no escape processing inside), and outside
+ * quotes a backslash escapes the very next character literally -- most
+ * commonly used to keep an embedded space from splitting a token. An
+ * unmatched quote is a hard error, matching real xargs (verified against
+ * GNU findutils xargs in Docker: `'hello world' foo` -> two tokens
+ * "hello world" and "foo"; `a\ b c` -> "a b" and "c"; an unterminated
+ * quote errors and exits 1 rather than silently absorbing the rest of
+ * the input). */
 static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char *token = NULL;
     size_t tokcap = 0;
@@ -3021,21 +3033,38 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char buf[16384];
     int read_err = 0;
     ssize_t n;
+    char quoteChar = '\0'; /* '\'' or '"' while inside a quoted span, else '\0' */
+    bool sawBackslash = false;
+    bool haveContent = false; /* true once any char (even from an empty "" pair) started this token */
 
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
         for (ssize_t i = 0; i < n; ++i) {
             int ch = (unsigned char)buf[i];
-            /* Bolt optimization: inline isspace equivalent to reduce function call overhead */
-            if ((ch == ' ') || (ch >= '\t' && ch <= '\r')) {
-                if (toklen > 0) {
+            if (sawBackslash) {
+                sawBackslash = false;
+            } else if (quoteChar == '\0' && ch == '\\') {
+                sawBackslash = true;
+                haveContent = true;
+                continue;
+            } else if (quoteChar == '\0' && (ch == '\'' || ch == '"')) {
+                quoteChar = (char)ch;
+                haveContent = true;
+                continue;
+            } else if (quoteChar != '\0' && ch == quoteChar) {
+                quoteChar = '\0';
+                continue;
+            } else if (quoteChar == '\0' && ((ch == ' ') || (ch >= '\t' && ch <= '\r'))) {
+                if (haveContent) {
                     if (!smallclueLineVectorAppend(vec, token, toklen)) {
                         free(token);
                         return false;
                     }
                     toklen = 0;
+                    haveContent = false;
                 }
                 continue;
             }
+            haveContent = true;
             if (toklen + 1 >= tokcap) {
                 size_t newcap = tokcap ? tokcap * 2 : 64;
                 char *tmp = (char *)realloc(token, newcap);
@@ -3053,7 +3082,15 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
         free(token);
         return false;
     }
-    if (toklen > 0) {
+    if (quoteChar != '\0') {
+        fprintf(stderr, "xargs: unmatched %s quote; by default quotes are special to xargs "
+                        "unless you use the -0 option\n",
+                quoteChar == '\'' ? "single" : "double");
+        free(token);
+        errno = 0; /* signals to the caller that this message is already complete */
+        return false;
+    }
+    if (haveContent) {
         bool ok = smallclueLineVectorAppend(vec, token, toklen);
         free(token);
         return ok;
@@ -4766,7 +4803,14 @@ static int smallclueXargsCommand(int argc, char **argv) {
     SmallclueLineVector extra = {0};
     bool ok = nulDelimited ? smallclueReadNulTokensFromStdin(&extra) : smallclueReadTokensFromStdin(&extra);
     if (!ok) {
-        perror("xargs");
+        /* smallclueReadTokensFromStdin already reports unmatched-quote
+         * errors itself; only an out-of-memory condition reaches here
+         * without having printed anything, so perror() still applies. */
+        if (!nulDelimited && errno == 0) {
+            /* message already printed */
+        } else {
+            perror("xargs");
+        }
         smallclueLineVectorFree(&extra);
         return 1;
     }
