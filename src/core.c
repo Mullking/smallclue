@@ -12,6 +12,7 @@
 #include "openssh_app.h"
 #include "openrsync_app.h"
 #include "tar_app.h"
+#include "gzip_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2014,6 +2015,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
     {"git", smallclueGitCommand, "Git plumbing and porcelain"},
+    {"gzip", smallclueGzipCommand, "Compress files"},
+    {"gunzip", smallclueGunzipCommand, "Decompress files"},
+    {"zcat", smallclueZcatCommand, "Decompress files to standard output"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
     {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
@@ -2153,6 +2157,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Identify file types"},
     {"find", "find PATH... [expression]\n"
              "  Common: -name PATTERN -type f|d"},
+    {"gzip", "gzip [-c] [-k] [-f] [-d] FILE...\n"
+             "  -c stdout  -k keep original  -f force overwrite  -d decompress"},
+    {"gunzip", "gunzip [-c] [-k] [-f] FILE...\n"
+               "  -c stdout  -k keep original  -f force overwrite"},
+    {"zcat", "zcat FILE...\n"
+             "  Decompress to standard output"},
     {"grep", "grep [-i] [-n] [-v] PATTERN [FILE...]\n"
              "  -i ignore case\n"
              "  -n line numbers\n"
