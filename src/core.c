@@ -2462,10 +2462,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v version\n"
               "  -m machine\n"
               "  -p processor"},
-    {"uniq", "uniq [-c] [-d] [-u] [FILE]\n"
+    {"uniq", "uniq [-c] [-d] [-u] [-i] [FILE]\n"
              "  -c count\n"
              "  -d duplicates only\n"
-             "  -u unique only"},
+             "  -u unique only\n"
+             "  -i ignore case when comparing"},
     {"uptime", "uptime [-s]\n"
                "  Show app uptime since launch\n"
                "  -s show system uptime"},
@@ -14818,7 +14819,28 @@ static int smallclueSortCommand(int argc, char **argv) {
     return status;
 }
 
-static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
+typedef struct {
+    bool printCounts;
+    bool duplicatesOnly; /* -d: only print lines that had at least one repeat */
+    bool uniquesOnly;    /* -u: only print lines that had NO repeats */
+    bool ignoreCase;     /* -i */
+} SmallclueUniqOptions;
+
+static int smallclueUniqCompareLines(const SmallclueUniqOptions *opts, const char *a, const char *b) {
+    return opts->ignoreCase ? strcasecmp(a, b) : strcmp(a, b);
+}
+
+static void smallclueUniqEmit(const SmallclueUniqOptions *opts, const char *line, long count) {
+    if (opts->duplicatesOnly && count < 2) return;
+    if (opts->uniquesOnly && count > 1) return;
+    if (opts->printCounts) {
+        printf("%7ld %s", count, line);
+    } else {
+        fputs(line, stdout);
+    }
+}
+
+static int smallclueUniqStream(FILE *fp, const char *path, const SmallclueUniqOptions *opts) {
     char *line = NULL;
     size_t cap = 0;
     char *prev = NULL;
@@ -14836,13 +14858,9 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
             }
             break;
         }
-        if (!prev || strcmp(prev, line) != 0) {
+        if (!prev || smallclueUniqCompareLines(opts, prev, line) != 0) {
             if (prev) {
-                if (print_counts) {
-                    printf("%7ld %s", count, prev);
-                } else {
-                    fputs(prev, stdout);
-                }
+                smallclueUniqEmit(opts, prev, count);
                 free(prev);
             }
             prev = strdup(line);
@@ -14857,11 +14875,7 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
         }
     }
     if (status == 0 && prev) {
-        if (print_counts) {
-            printf("%7ld %s", count, prev);
-        } else {
-            fputs(prev, stdout);
-        }
+        smallclueUniqEmit(opts, prev, count);
     }
     free(prev);
     free(line);
@@ -14869,7 +14883,8 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
 }
 
 static int smallclueUniqCommand(int argc, char **argv) {
-    int print_counts = 0;
+    SmallclueUniqOptions opts;
+    memset(&opts, 0, sizeof(opts));
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -14881,7 +14896,22 @@ static int smallclueUniqCommand(int argc, char **argv) {
             break;
         }
         if (strcmp(arg, "-c") == 0) {
-            print_counts = 1;
+            opts.printCounts = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-d") == 0) {
+            opts.duplicatesOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0) {
+            opts.uniquesOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-i") == 0) {
+            opts.ignoreCase = true;
             index++;
             continue;
         }
@@ -14889,7 +14919,7 @@ static int smallclueUniqCommand(int argc, char **argv) {
         return 1;
     }
     if (index >= argc) {
-        return smallclueUniqStream(stdin, "(stdin)", print_counts);
+        return smallclueUniqStream(stdin, "(stdin)", &opts);
     }
     int status = 0;
     for (int i = index; i < argc; ++i) {
@@ -14899,7 +14929,7 @@ static int smallclueUniqCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= smallclueUniqStream(fp, argv[i], print_counts);
+        status |= smallclueUniqStream(fp, argv[i], &opts);
         fclose(fp);
     }
     return status;
