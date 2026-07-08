@@ -14,6 +14,7 @@
 #include "tar_app.h"
 #include "gzip_app.h"
 #include "readlink_app.h"
+#include "checksum_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2042,6 +2043,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"umount", smallclueUmountCommand, "Unmount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
+    {"md5sum", smallclueMd5sumCommand, "Compute or check MD5 digests"},
+    {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
+    {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"passwd", smallcluePasswdCommand, "Change user password"},
@@ -2273,6 +2277,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
            "  Move or rename files"},
+    {"md5sum", "md5sum [-c] [FILE...]\n"
+               "  -c verify against a checksums file (\"HEXDIGEST  path\" per line)"},
+    {"sha1sum", "sha1sum [-c] [FILE...]\n"
+                "  -c verify against a checksums file"},
+    {"sha256sum", "sha256sum [-c] [FILE...]\n"
+                  "  -c verify against a checksums file"},
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53).\n"
                  "  -v prints hosts lookup debugging."},
