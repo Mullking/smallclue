@@ -2437,8 +2437,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Prints: <checksum> <blocks> [filename]\n"},
     {"tty", "tty [-s]\n"
             "  Print terminal name"},
-    {"tr", "tr SET1 SET2\n"
-           "  Translate/delete characters"},
+    {"tr", "tr [-d] [-s] [-c] SET1 [SET2]\n"
+           "  -d delete characters in SET1\n"
+           "  -s squeeze repeats (of SET2 chars in translate mode,\n"
+           "     SET1 chars if used alone or with -d)\n"
+           "  -c/-C complement SET1\n"
+           "  Sets support a-z ranges, [:alpha:]-style POSIX classes,\n"
+           "  [c*n]/[c*] repeats, and \\n/\\t/\\\\ escapes"},
     {"true", "true\n"
              "  Exit status 0"},
     {"type", "type NAME...\n"
@@ -15255,107 +15260,180 @@ static int smallclueCutCommand(int argc, char **argv) {
     return status;
 }
 
+/* Expands a tr SET specification into a flat, ORDER-PRESERVING array of
+ * bytes: character ranges (a-z), POSIX classes ([:alpha:] etc), [c*n]/
+ * [c*] repeats, and \n/\t/\\ backslash escapes. Order matters for
+ * translate mode (SET1[i] -> SET2[i]), so classes/ranges expand in
+ * ascending byte order, matching the conventional interpretation. */
+static bool smallclueTrExpandSet(const char *spec, unsigned char *outBuf, size_t outCap, size_t *outLen) {
+    *outLen = 0;
+    size_t i = 0;
+    size_t specLen = strlen(spec);
+    while (i < specLen && *outLen < outCap) {
+        if (spec[i] == '[' && i + 1 < specLen && spec[i + 1] == ':') {
+            const char *end = strstr(spec + i + 2, ":]");
+            if (end) {
+                size_t nameLen = (size_t)(end - (spec + i + 2));
+                const char *name = spec + i + 2;
+                int (*pred)(int) = NULL;
+                if (nameLen == 5 && strncmp(name, "alpha", 5) == 0) pred = isalpha;
+                else if (nameLen == 5 && strncmp(name, "digit", 5) == 0) pred = isdigit;
+                else if (nameLen == 5 && strncmp(name, "upper", 5) == 0) pred = isupper;
+                else if (nameLen == 5 && strncmp(name, "lower", 5) == 0) pred = islower;
+                else if (nameLen == 5 && strncmp(name, "space", 5) == 0) pred = isspace;
+                else if (nameLen == 5 && strncmp(name, "punct", 5) == 0) pred = ispunct;
+                else if (nameLen == 5 && strncmp(name, "alnum", 5) == 0) pred = isalnum;
+                else if (nameLen == 5 && strncmp(name, "blank", 5) == 0) pred = isblank;
+                else if (nameLen == 5 && strncmp(name, "cntrl", 5) == 0) pred = iscntrl;
+                else if (nameLen == 5 && strncmp(name, "print", 5) == 0) pred = isprint;
+                else if (nameLen == 5 && strncmp(name, "graph", 5) == 0) pred = isgraph;
+                else if (nameLen == 6 && strncmp(name, "xdigit", 6) == 0) pred = isxdigit;
+                if (pred) {
+                    for (int c = 0; c < 256 && *outLen < outCap; ++c) {
+                        if (pred(c)) outBuf[(*outLen)++] = (unsigned char)c;
+                    }
+                    i = (size_t)((end + 2) - spec);
+                    continue;
+                }
+            }
+        }
+        if (spec[i] == '[' && i + 2 < specLen && spec[i + 2] == '*') {
+            unsigned char repChar = (unsigned char)spec[i + 1];
+            size_t j = i + 3;
+            long count = 0;
+            bool hasCount = false;
+            while (j < specLen && isdigit((unsigned char)spec[j])) {
+                count = count * 10 + (spec[j] - '0');
+                hasCount = true;
+                j++;
+            }
+            if (j < specLen && spec[j] == ']') {
+                if (!hasCount) count = 1; /* "[c*]" (fill-to-length) -- caller pads with the last char anyway */
+                for (long k = 0; k < count && *outLen < outCap; ++k) {
+                    outBuf[(*outLen)++] = repChar;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if (i + 2 < specLen && spec[i + 1] == '-' && spec[i] != '\\') {
+            unsigned char from = (unsigned char)spec[i];
+            unsigned char to = (unsigned char)spec[i + 2];
+            if (from <= to) {
+                for (unsigned int c = from; c <= to && *outLen < outCap; ++c) {
+                    outBuf[(*outLen)++] = (unsigned char)c;
+                }
+                i += 3;
+                continue;
+            }
+        }
+        if (spec[i] == '\\' && i + 1 < specLen) {
+            unsigned char actual;
+            switch (spec[i + 1]) {
+                case 'n': actual = '\n'; break;
+                case 't': actual = '\t'; break;
+                case 'r': actual = '\r'; break;
+                case '\\': actual = '\\'; break;
+                case '0': actual = '\0'; break;
+                default: actual = (unsigned char)spec[i + 1]; break;
+            }
+            outBuf[(*outLen)++] = actual;
+            i += 2;
+            continue;
+        }
+        outBuf[(*outLen)++] = (unsigned char)spec[i];
+        i++;
+    }
+    return true;
+}
+
 static int smallclueTrCommand(int argc, char **argv) {
-    if (argc < 3) {
+    bool deleteMode = false, squeezeMode = false, complementMode = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) { argi++; break; }
+        if (arg[0] != '-' || arg[1] == '\0') break;
+        for (const char *p = arg + 1; *p; ++p) {
+            if (*p == 'd') deleteMode = true;
+            else if (*p == 's') squeezeMode = true;
+            else if (*p == 'c' || *p == 'C') complementMode = true;
+            else {
+                fprintf(stderr, "tr: unsupported option '%c'\n", *p);
+                return 1;
+            }
+        }
+    }
+    int operandCount = argc - argi;
+    if (operandCount < 1) {
         fprintf(stderr, "tr: missing operand\n");
         return 1;
     }
-    const char *set1 = argv[1];
-    const char *set2 = argv[2];
-    size_t len1 = strlen(set1);
-    size_t len2 = strlen(set2);
+
+    unsigned char expanded1[512], expanded2[512];
+    size_t len1 = 0, len2 = 0;
+    smallclueTrExpandSet(argv[argi], expanded1, sizeof(expanded1), &len1);
+    bool haveSet2 = (operandCount >= 2);
+    if (haveSet2) {
+        smallclueTrExpandSet(argv[argi + 1], expanded2, sizeof(expanded2), &len2);
+    }
+
+    if (complementMode) {
+        bool inSet[256] = {false};
+        for (size_t i = 0; i < len1; ++i) inSet[expanded1[i]] = true;
+        size_t newLen = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (!inSet[c]) expanded1[newLen++] = (unsigned char)c;
+        }
+        len1 = newLen;
+    }
+
+    bool set1Member[256] = {false};
+    for (size_t i = 0; i < len1; ++i) set1Member[expanded1[i]] = true;
+    bool set2Member[256] = {false};
+    for (size_t i = 0; i < len2; ++i) set2Member[expanded2[i]] = true;
+
     unsigned char map[256];
-    bool delete_map[256];
-    bool delete_only = (len2 == 0);
-    for (int i = 0; i < 256; ++i) {
-        map[i] = (unsigned char)i;
-        delete_map[i] = false;
-    }
-    if (delete_only) {
+    for (int i = 0; i < 256; ++i) map[i] = (unsigned char)i;
+    if (!deleteMode && haveSet2 && len2 > 0) {
         for (size_t i = 0; i < len1; ++i) {
-            delete_map[(unsigned char)set1[i]] = true;
+            unsigned char to = (unsigned char)(i < len2 ? expanded2[i] : expanded2[len2 - 1]);
+            map[expanded1[i]] = to;
         }
-    } else {
-        for (size_t i = 0; i < len1; ++i) {
-            unsigned char from = (unsigned char)set1[i];
-            unsigned char to = (unsigned char)(i < len2 ? set2[i] : set2[len2 - 1]);
-            map[from] = to;
-        }
+    } else if (!deleteMode && !haveSet2 && !squeezeMode) {
+        fprintf(stderr, "tr: missing operand after '%s'\n", argv[argi]);
+        return 1;
     }
+
+    int lastOutput = -1;
     char buf[16384];
-    char out_buf[16384];
+    char outBuf[16384];
     ssize_t n;
     int read_err = 0;
 
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        if (delete_only) {
-            size_t out_idx = 0;
-            #define PROCESS_DELETE(idx) do { \
-                unsigned char c = (unsigned char)buf[idx]; \
-                if (!delete_map[c]) { \
-                    out_buf[out_idx++] = c; \
-                } \
-            } while (0)
-
-            for (; i + 15 < n; i += 16) {
-                PROCESS_DELETE(i);
-                PROCESS_DELETE(i+1);
-                PROCESS_DELETE(i+2);
-                PROCESS_DELETE(i+3);
-                PROCESS_DELETE(i+4);
-                PROCESS_DELETE(i+5);
-                PROCESS_DELETE(i+6);
-                PROCESS_DELETE(i+7);
-                PROCESS_DELETE(i+8);
-                PROCESS_DELETE(i+9);
-                PROCESS_DELETE(i+10);
-                PROCESS_DELETE(i+11);
-                PROCESS_DELETE(i+12);
-                PROCESS_DELETE(i+13);
-                PROCESS_DELETE(i+14);
-                PROCESS_DELETE(i+15);
+        size_t outIdx = 0;
+        for (ssize_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            bool squeezeCandidate;
+            if (deleteMode) {
+                if (set1Member[c]) continue;
+                squeezeCandidate = squeezeMode && haveSet2 && set2Member[c];
+            } else if (haveSet2) {
+                c = map[c];
+                squeezeCandidate = squeezeMode && set2Member[c];
+            } else {
+                /* squeeze-only, no translation */
+                squeezeCandidate = squeezeMode && set1Member[c];
             }
-            #undef PROCESS_DELETE
-            for (; i < n; ++i) {
-                unsigned char c = (unsigned char)buf[i];
-                if (!delete_map[c]) {
-                    out_buf[out_idx++] = c;
-                }
+            if (squeezeCandidate && lastOutput == (int)c) {
+                continue;
             }
-            if (out_idx > 0) {
-                fwrite(out_buf, 1, out_idx, stdout);
-            }
-        } else {
-            #define PROCESS_MAP(idx) do { \
-                unsigned char c = (unsigned char)buf[idx]; \
-                buf[idx] = map[c]; \
-            } while (0)
-
-            for (; i + 15 < n; i += 16) {
-                PROCESS_MAP(i);
-                PROCESS_MAP(i+1);
-                PROCESS_MAP(i+2);
-                PROCESS_MAP(i+3);
-                PROCESS_MAP(i+4);
-                PROCESS_MAP(i+5);
-                PROCESS_MAP(i+6);
-                PROCESS_MAP(i+7);
-                PROCESS_MAP(i+8);
-                PROCESS_MAP(i+9);
-                PROCESS_MAP(i+10);
-                PROCESS_MAP(i+11);
-                PROCESS_MAP(i+12);
-                PROCESS_MAP(i+13);
-                PROCESS_MAP(i+14);
-                PROCESS_MAP(i+15);
-            }
-            #undef PROCESS_MAP
-            for (; i < n; ++i) {
-                unsigned char c = (unsigned char)buf[i];
-                buf[i] = map[c];
-            }
-            fwrite(buf, 1, (size_t)n, stdout);
+            outBuf[outIdx++] = (char)c;
+            lastOutput = squeezeCandidate ? (int)c : -1;
+        }
+        if (outIdx > 0) {
+            fwrite(outBuf, 1, outIdx, stdout);
         }
     }
 
@@ -15363,7 +15441,6 @@ static int smallclueTrCommand(int argc, char **argv) {
         fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
         return 1;
     }
-
     return 0;
 }
 
