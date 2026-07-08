@@ -2219,8 +2219,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"dirname", "dirname PATH...\n"
                 "  Strip last path component from each PATH, one per line\n"
                 "  -z/--zero: NUL-terminate output instead of newline"},
-    {"du", "du [-h] [PATH...]\n"
-           "  -h human-readable sizes"},
+    {"du", "du [-s] [-h] [-k] [-c] [-x] [-d N|--max-depth=N] [PATH...]\n"
+           "  Default: print a subtotal for every directory (not files)\n"
+           "  -s: only the grand total per PATH argument\n"
+           "  -h: human-readable sizes  -k: force 1K-block units\n"
+           "  -c: print a grand total after all arguments\n"
+           "  -x: don't cross onto a different filesystem\n"
+           "  -d N/--max-depth=N: only print subtotals down to depth N"},
 #if defined(SMALLCLUE_WITH_DVTM)
     {"dvtm", "dvtm\n"
              "  Launch dvtm terminal multiplexer"},
@@ -18083,6 +18088,10 @@ typedef struct {
     int summarize_only;
     int use_kilobytes;
     int human_readable;
+    int max_depth;      /* -1 = unlimited */
+    int grand_total;    /* -c */
+    int one_filesystem; /* -x */
+    dev_t root_dev;     /* set per top-level argument when -x is active */
 } SmallclueDuOptions;
 
 static void smallclueDuPrintSize(long long bytes,
@@ -18111,6 +18120,14 @@ static void smallclueDuPrintSize(long long bytes,
         } else {
             value = -(((-value) + 1023) / 1024);
         }
+    } else {
+        /* POSIX/real du's actual default unit is 512-byte blocks, not
+         * raw bytes (matches `ls -s`'s own block-count column). */
+        if (value >= 0) {
+            value = (value + 511) / 512;
+        } else {
+            value = -(((-value) + 511) / 512);
+        }
     }
     printf("%lld\t%s\n", value, path);
 }
@@ -18125,7 +18142,10 @@ static long long smallclueDuVisit(const char *path,
         if (status) *status = 1;
         return 0;
     }
-    long long total = st.st_size;
+    /* Real du measures actual disk usage (allocated 512-byte blocks),
+     * not apparent file size -- st_size would badly undercount small
+     * files on filesystems with block sizes larger than the file. */
+    long long total = (long long)st.st_blocks * 512;
     if (S_ISDIR(st.st_mode)) {
         DIR *dir = opendir(path);
         if (!dir) {
@@ -18144,21 +18164,57 @@ static long long smallclueDuVisit(const char *path,
                 if (status) *status = 1;
                 continue;
             }
+            if (opts && opts->one_filesystem) {
+                struct stat childSt;
+                if (lstat(child, &childSt) == 0 && childSt.st_dev != opts->root_dev) {
+                    continue; /* -x: don't cross onto a different filesystem */
+                }
+            }
             total += smallclueDuVisit(child, status, opts, depth + 1);
         }
         closedir(dir);
     }
-    if (!opts || !opts->summarize_only || depth == 0) {
-        smallclueDuPrintSize(total, path, opts);
+
+    bool isDir = S_ISDIR(st.st_mode);
+    if (opts && opts->summarize_only) {
+        if (depth == 0) {
+            smallclueDuPrintSize(total, path, opts);
+        }
+    } else {
+        /* GNU du's real default: print a subtotal for every DIRECTORY at
+         * every depth, but never an individual file -- the top-level
+         * operand itself is always printed even if it's a plain file
+         * (matching `du somefile` still reporting that file's size). */
+        bool withinDepth = !opts || opts->max_depth < 0 || depth <= opts->max_depth;
+        if ((isDir || depth == 0) && withinDepth) {
+            smallclueDuPrintSize(total, path, opts);
+        }
     }
     return total;
 }
 
 static int smallclueDuCommand(int argc, char **argv) {
-    SmallclueDuOptions opts = {0, 0, 0};
+    SmallclueDuOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = -1;
+
+    /* --max-depth=N is a GNU long option with no getopt()-friendly
+     * short form other than -d N (which getopt handles fine); strip the
+     * "=N" long form out first, matching the convention used elsewhere
+     * in this file (e.g. stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--max-depth=", 12) == 0) {
+            opts.max_depth = atoi(argv[i] + 12);
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "skh")) != -1) {
+    while ((opt = getopt(argc, argv, "skhcxd:")) != -1) {
         switch (opt) {
             case 's':
                 opts.summarize_only = 1;
@@ -18169,18 +18225,35 @@ static int smallclueDuCommand(int argc, char **argv) {
             case 'h':
                 opts.human_readable = 1;
                 break;
+            case 'c':
+                opts.grand_total = 1;
+                break;
+            case 'x':
+                opts.one_filesystem = 1;
+                break;
+            case 'd':
+                opts.max_depth = atoi(optarg);
+                break;
             default:
                 return 1;
         }
     }
 
     int status = 0;
-    if (optind >= argc) {
-        smallclueDuVisit(".", &status, &opts, 0);
-    } else {
-        for (int i = optind; i < argc; ++i) {
-            smallclueDuVisit(argv[i], &status, &opts, 0);
+    long long grandTotal = 0;
+    int pathCount = (optind < argc) ? (argc - optind) : 1;
+    for (int i = 0; i < pathCount; ++i) {
+        const char *path = (optind < argc) ? argv[optind + i] : ".";
+        if (opts.one_filesystem) {
+            struct stat rootSt;
+            if (lstat(path, &rootSt) == 0) {
+                opts.root_dev = rootSt.st_dev;
+            }
         }
+        grandTotal += smallclueDuVisit(path, &status, &opts, 0);
+    }
+    if (opts.grand_total) {
+        smallclueDuPrintSize(grandTotal, "total", &opts);
     }
     return status ? 1 : 0;
 }
