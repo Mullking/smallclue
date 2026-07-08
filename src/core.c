@@ -2381,8 +2381,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -r report terminal type\n"
              "  -Q quiet, -I skip init\n"
              "  -e/-i/-k set erase/intr/kill chars"},
-    {"touch", "touch FILE...\n"
-              "  Update timestamps or create empty file"},
+    {"touch", "touch [-c] [-a] [-m] [-r REFFILE|-t STAMP|-d STRING] FILE...\n"
+              "  Update timestamps or create empty file\n"
+              "  -c no-create  -a access-time-only  -m mtime-only\n"
+              "  -r REFFILE: copy REFFILE's timestamps\n"
+              "  -t [[CC]YY]MMDDhhmm[.ss]\n"
+              "  -d STRING: ISO-ish date (\"YYYY-MM-DD[ HH:MM[:SS]]\")"},
     {"sum", "sum [-r|-s] [FILE...]\n"
             "  BSD (-r, default): rotate-right checksum, 1K blocks.\n"
             "  SysV (-s, --sysv): simple sum, 512-byte blocks.\n"
@@ -13498,19 +13502,191 @@ static int smallclueTailCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
+/* Parses touch -t's [[CC]YY]MMDDhhmm[.ss] compact timestamp form. The
+ * digit count before an optional ".ss" suffix tells us which of the three
+ * year-width variants we're looking at. */
+static bool smallclueTouchParseDashT(const char *spec, struct tm *out) {
+    memset(out, 0, sizeof(*out));
+    out->tm_isdst = -1;
+    char digits[13];
+    int seconds = 0;
+    const char *dot = strchr(spec, '.');
+    size_t digitLen = dot ? (size_t)(dot - spec) : strlen(spec);
+    if (dot) {
+        if (strlen(dot + 1) != 2 || !isdigit((unsigned char)dot[1]) || !isdigit((unsigned char)dot[2])) {
+            return false;
+        }
+        seconds = (dot[1] - '0') * 10 + (dot[2] - '0');
+    }
+    if (digitLen != 8 && digitLen != 10 && digitLen != 12) {
+        return false;
+    }
+    if (digitLen >= sizeof(digits)) {
+        return false;
+    }
+    for (size_t i = 0; i < digitLen; ++i) {
+        if (!isdigit((unsigned char)spec[i])) {
+            return false;
+        }
+        digits[i] = spec[i];
+    }
+    digits[digitLen] = '\0';
+
+    int year = -1;
+    const char *rest = digits;
+    if (digitLen == 12) {
+        char century[3] = {digits[0], digits[1], '\0'};
+        char yy[3] = {digits[2], digits[3], '\0'};
+        year = atoi(century) * 100 + atoi(yy);
+        rest = digits + 4;
+    } else if (digitLen == 10) {
+        char yy[3] = {digits[0], digits[1], '\0'};
+        int yyVal = atoi(yy);
+        year = (yyVal < 69) ? 2000 + yyVal : 1900 + yyVal; /* POSIX pivot */
+        rest = digits + 2;
+    } else {
+        time_t now = time(NULL);
+        struct tm nowTm;
+        localtime_r(&now, &nowTm);
+        year = nowTm.tm_year + 1900;
+    }
+    char mm[3] = {rest[0], rest[1], '\0'};
+    char dd[3] = {rest[2], rest[3], '\0'};
+    char hh[3] = {rest[4], rest[5], '\0'};
+    char min[3] = {rest[6], rest[7], '\0'};
+    out->tm_year = year - 1900;
+    out->tm_mon = atoi(mm) - 1;
+    out->tm_mday = atoi(dd);
+    out->tm_hour = atoi(hh);
+    out->tm_min = atoi(min);
+    out->tm_sec = seconds;
+    return true;
+}
+
+/* Supports the common, unambiguous date-string shapes real scripts use.
+ * Full natural-language parsing (GNU coreutils' "getdate" grammar --
+ * "yesterday", "next monday", "+1 day") is a much larger feature and out
+ * of scope here; this covers explicit ISO-8601-ish timestamps. */
+static bool smallclueTouchParseDashD(const char *spec, struct tm *out) {
+    static const char *formats[] = {
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+    };
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+        memset(out, 0, sizeof(*out));
+        out->tm_isdst = -1;
+        char *end = strptime(spec, formats[i], out);
+        if (end && *end == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int smallclueTouchCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool noCreate = false;
+    bool accessOnly = false;
+    bool modifyOnly = false;
+    const char *refFile = NULL;
+    const char *tSpec = NULL;
+    const char *dSpec = NULL;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--no-create") == 0) {
+            noCreate = true;
+        } else if (strcmp(arg, "-a") == 0) {
+            accessOnly = true;
+        } else if (strcmp(arg, "-m") == 0) {
+            modifyOnly = true;
+        } else if (strcmp(arg, "-r") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -r requires a reference file\n");
+                return 1;
+            }
+            refFile = argv[++argi];
+        } else if (strncmp(arg, "-r", 2) == 0 && arg[2] != '\0') {
+            refFile = arg + 2;
+        } else if (strcmp(arg, "-t") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -t requires a timestamp argument\n");
+                return 1;
+            }
+            tSpec = argv[++argi];
+        } else if (strcmp(arg, "-d") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -d requires a date string\n");
+                return 1;
+            }
+            dSpec = argv[++argi];
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "touch: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "touch: missing file operand\n");
         return 1;
     }
-    int status = 0;
+
     struct timeval times[2];
-    if (gettimeofday(&times[0], NULL) != 0) {
-        times[0].tv_sec = time(NULL);
+    if (refFile) {
+        struct stat refStat;
+        if (stat(refFile, &refStat) != 0) {
+            fprintf(stderr, "touch: %s: %s\n", refFile, strerror(errno));
+            return 1;
+        }
+        times[0].tv_sec = refStat.st_atime;
         times[0].tv_usec = 0;
+        times[1].tv_sec = refStat.st_mtime;
+        times[1].tv_usec = 0;
+    } else if (tSpec) {
+        struct tm tmVal;
+        if (!smallclueTouchParseDashT(tSpec, &tmVal)) {
+            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
+            return 1;
+        }
+        time_t t = mktime(&tmVal);
+        if (t == (time_t)-1) {
+            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
+            return 1;
+        }
+        times[0].tv_sec = times[1].tv_sec = t;
+        times[0].tv_usec = times[1].tv_usec = 0;
+    } else if (dSpec) {
+        struct tm tmVal;
+        if (!smallclueTouchParseDashD(dSpec, &tmVal)) {
+            fprintf(stderr, "touch: unrecognized -d date string '%s'\n", dSpec);
+            return 1;
+        }
+        time_t t = mktime(&tmVal);
+        if (t == (time_t)-1) {
+            fprintf(stderr, "touch: invalid -d date string '%s'\n", dSpec);
+            return 1;
+        }
+        times[0].tv_sec = times[1].tv_sec = t;
+        times[0].tv_usec = times[1].tv_usec = 0;
+    } else {
+        if (gettimeofday(&times[0], NULL) != 0) {
+            times[0].tv_sec = time(NULL);
+            times[0].tv_usec = 0;
+        }
+        times[1] = times[0];
     }
-    times[1] = times[0];
-    for (int i = 1; i < argc; ++i) {
+
+    int status = 0;
+    for (int i = argi; i < argc; ++i) {
         const char *path = argv[i];
         if (!path || !*path) {
             fprintf(stderr, "touch: invalid path\n");
@@ -13524,6 +13700,23 @@ static int smallclueTouchCommand(int argc, char **argv) {
             target = expanded;
         }
 #endif
+        struct timeval useTimes[2] = {times[0], times[1]};
+        if (accessOnly || modifyOnly) {
+            struct stat existing;
+            if (stat(target, &existing) == 0) {
+                if (accessOnly && !modifyOnly) {
+                    useTimes[1].tv_sec = existing.st_mtime;
+                    useTimes[1].tv_usec = 0;
+                } else if (modifyOnly && !accessOnly) {
+                    useTimes[0].tv_sec = existing.st_atime;
+                    useTimes[0].tv_usec = 0;
+                }
+            }
+        }
+
+        if (noCreate && access(target, F_OK) != 0) {
+            continue;
+        }
         int fd = openat(AT_FDCWD, target, O_WRONLY | O_CREAT, 0666);
         if (fd < 0) {
             fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
@@ -13533,7 +13726,7 @@ static int smallclueTouchCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        if (futimes(fd, times) != 0) {
+        if (futimes(fd, useTimes) != 0) {
             fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
 #if defined(PSCAL_TARGET_IOS)
             smallclueLogPathExpansion("touch-futimes-failed", target);
