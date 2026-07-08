@@ -1382,6 +1382,8 @@ typedef struct {
     char **headers;       /* array of "Key: Value" strings */
     int headerCount;
     const char *postData; /* NULL = no request body */
+    const char *userpwd;  /* NULL = no auth; else "user:password" */
+    bool insecureTls;     /* true = skip TLS certificate/host verification */
 } SmallclueHttpRequestOptions;
 
 static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
@@ -2198,7 +2200,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -L (follow)\n"
              "  -X METHOD\n"
              "  -d DATA (repeatable, joined with '&')\n"
-             "  -H HEADER (repeatable)"},
+             "  -H HEADER (repeatable)\n"
+             "  -u USER:PASS (basic auth)\n"
+             "  -k (skip TLS verification)"},
     {"cut", "cut -f LIST [-d DELIM] [-s] [FILE...]\n"
             "       cut -c LIST [FILE...]\n"
             "  -f fields, -c characters/bytes: LIST is N, N-M, N-, or -M,\n"
@@ -2640,6 +2644,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  --method=METHOD\n"
              "  --header=HEADER (repeatable)\n"
              "  --post-data=DATA\n"
+             "  --user=USER --password=PASS\n"
+             "  --no-check-certificate\n"
              "  -q\n"
              "  -nv"},
     {"which", "which [-a] program ...\n"
@@ -10361,6 +10367,19 @@ static struct curl_slist *smallclueCurlApplyRequestOptions(CURL *curl, const Sma
     if (reqOpts->method && *reqOpts->method) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, reqOpts->method);
     }
+    if (reqOpts->userpwd && *reqOpts->userpwd) {
+        /* Real curl's default (without --anyauth/--digest/etc.) is
+         * preemptive Basic auth, sent on the first request without
+         * waiting for a 401 challenge -- CURLAUTH_ANY would instead defer
+         * until challenged, which is wrong for the common case and was
+         * caught by comparing against real curl's actual wire behavior. */
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, reqOpts->userpwd);
+    }
+    if (reqOpts->insecureTls) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
     return headerList;
 }
 
@@ -14571,8 +14590,10 @@ static int smallclueCurlCommand(int argc, char **argv) {
     int headerCount = 0, headerCap = 0;
     char *postData = NULL;
     size_t postDataLen = 0;
+    const char *userpwd = NULL;
+    bool insecureTls = false;
     int opt;
-    while ((opt = getopt(argc, argv, "o:OX:H:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "o:OX:H:d:u:k")) != -1) {
         switch (opt) {
             case 'o':
                 output_path = optarg;
@@ -14582,6 +14603,12 @@ static int smallclueCurlCommand(int argc, char **argv) {
                 break;
             case 'X':
                 method = optarg;
+                break;
+            case 'u':
+                userpwd = optarg;
+                break;
+            case 'k':
+                insecureTls = true;
                 break;
             case 'H': {
                 if (headerCount == headerCap) {
@@ -14618,7 +14645,7 @@ static int smallclueCurlCommand(int argc, char **argv) {
                 break;
             }
             default:
-                fprintf(stderr, "usage: curl [-o file | -O] [-X METHOD] [-H HEADER]... [-d DATA]... url...\n");
+                fprintf(stderr, "usage: curl [-o file | -O] [-X METHOD] [-H HEADER]... [-d DATA]... [-u USER:PASS] [-k] url...\n");
                 free(headers);
                 free(postData);
                 return 1;
@@ -14648,6 +14675,8 @@ static int smallclueCurlCommand(int argc, char **argv) {
     reqOpts.headers = headers;
     reqOpts.headerCount = headerCount;
     reqOpts.postData = postData;
+    reqOpts.userpwd = userpwd;
+    reqOpts.insecureTls = insecureTls;
 
     int status = 0;
     for (int i = optind; i < argc; ++i) {
@@ -14672,11 +14701,17 @@ static int smallclueWgetCommand(int argc, char **argv) {
     char **headers = NULL;
     int headerCount = 0, headerCap = 0;
     char *postData = NULL;
+    const char *wgetUser = NULL;
+    const char *wgetPassword = NULL;
+    bool insecureTls = false;
+    char userpwdBuf[512];
+    userpwdBuf[0] = '\0';
 
     /* Real wget has no short forms for these, only --header=/--post-data=/
-     * --method= (repeated GNU long options with no getopt()-friendly short
-     * equivalent) -- strip them out before calling getopt(), matching the
-     * convention used elsewhere in this file (e.g. stat's --format=). */
+     * --method=/--user=/--password=/--no-check-certificate (repeated GNU
+     * long options with no getopt()-friendly short equivalent) -- strip
+     * them out before calling getopt(), matching the convention used
+     * elsewhere in this file (e.g. stat's --format=). */
     for (int i = 1; i < argc; ) {
         if (strncmp(argv[i], "--header=", 9) == 0) {
             if (headerCount == headerCap) {
@@ -14708,7 +14743,28 @@ static int smallclueWgetCommand(int argc, char **argv) {
             argc--;
             continue;
         }
+        if (strncmp(argv[i], "--user=", 7) == 0) {
+            wgetUser = argv[i] + 7;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--password=", 11) == 0) {
+            wgetPassword = argv[i] + 11;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-check-certificate") == 0) {
+            insecureTls = true;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
         i++;
+    }
+    if (wgetUser) {
+        snprintf(userpwdBuf, sizeof(userpwdBuf), "%s:%s", wgetUser, wgetPassword ? wgetPassword : "");
     }
 
     smallclueResetGetopt();
@@ -14720,7 +14776,8 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 output_path = optarg;
                 break;
             default:
-                fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA] url...\n");
+                fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
+                                "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
                 free(headers);
                 free(postData);
                 return 1;
@@ -14745,6 +14802,8 @@ static int smallclueWgetCommand(int argc, char **argv) {
     reqOpts.headers = headers;
     reqOpts.headerCount = headerCount;
     reqOpts.postData = postData;
+    reqOpts.userpwd = wgetUser ? userpwdBuf : NULL;
+    reqOpts.insecureTls = insecureTls;
 
     int status = 0;
     for (int i = optind; i < argc; ++i) {
