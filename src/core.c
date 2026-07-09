@@ -3046,6 +3046,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"ipaddr", "ipaddr [-4|-6] [-a]\n"
                "  Show interface IP addresses\n"
                "  ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+               "  ipaddr flush dev IFACE\n"
                "  ipaddr link set IFACE up|down\n"
                "  ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]\n"
                "  (Linux only, needs CAP_NET_ADMIN; IPv4 only)"},
@@ -14135,6 +14136,7 @@ static int smallclueAddTabCommand(int argc, char **argv) {
 static void smallclueIpAddrUsage(void) {
     fputs("usage: ipaddr [-4|-6] [-a]\n"
           "       ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+          "       ipaddr flush dev IFACE\n"
           "       ipaddr link set IFACE up|down\n"
           "       ipaddr route add|del DEST/PREFIXLEN|default [via GATEWAY] [dev IFACE]\n",
           stderr);
@@ -14243,6 +14245,58 @@ static int smallclueIpAddrModify(const char *ifaceName, const char *addrSpec, bo
     }
     fprintf(stderr, "ipaddr: no netlink ACK received\n");
     return 1;
+}
+
+/* Counts set bits in a netmask -- correct regardless of host/network
+ * byte order, since only the bit *count* matters for a prefix length,
+ * not which byte holds which bits. */
+static int smallclueNetmaskToPrefixLen(uint32_t mask) {
+    int count = 0;
+    while (mask) {
+        count += (int)(mask & 1);
+        mask >>= 1;
+    }
+    return count;
+}
+
+/* `ipaddr flush dev IFACE`: enumerates every IPv4 address currently on
+ * IFACE (via getifaddrs, matching the "show" path's enumeration) and
+ * RTM_DELADDRs each one via the existing smallclueIpAddrModify(), the
+ * same real netlink delete `ipaddr del` already uses. IPv6 is out of
+ * scope, matching add/del's existing IPv4-only scope. Interfaces with
+ * no addresses are a silent no-op success, matching real `ip addr
+ * flush`. */
+static int smallclueIpAddrFlush(const char *ifaceName) {
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) {
+        fprintf(stderr, "ipaddr: getifaddrs failed: %s\n", strerror(errno));
+        return 1;
+    }
+    int removed = 0;
+    int failures = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_name || !ifa->ifa_netmask) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (strcmp(ifa->ifa_name, ifaceName) != 0) continue;
+
+        char addrStr[INET_ADDRSTRLEN];
+        struct in_addr addr4 = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+        if (!inet_ntop(AF_INET, &addr4, addrStr, sizeof(addrStr))) continue;
+        uint32_t mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr;
+        int prefixLen = smallclueNetmaskToPrefixLen(mask);
+
+        char addrSpec[80];
+        snprintf(addrSpec, sizeof(addrSpec), "%s/%d", addrStr, prefixLen);
+        if (smallclueIpAddrModify(ifaceName, addrSpec, false) == 0) {
+            removed++;
+        } else {
+            failures++;
+        }
+    }
+    freeifaddrs(ifaddr);
+    if (failures > 0) return 1;
+    (void)removed;
+    return 0;
 }
 
 /* Reads one netlink ACK/error reply and reports it; shared by the link
@@ -14473,6 +14527,19 @@ static int smallclueIpAddrCommand(int argc, char **argv) {
         return smallclueIpAddrModify(argv[4], argv[2], isAdd);
 #else
         fprintf(stderr, "ipaddr: add/del is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "flush") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* flush dev IFACE */
+        if (argc != 4 || strcmp(argv[2], "dev") != 0) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpAddrFlush(argv[3]);
+#else
+        fprintf(stderr, "ipaddr: flush is only supported on Linux (needs netlink)\n");
         return 1;
 #endif
     }
