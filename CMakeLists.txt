@@ -228,6 +228,7 @@ set(SOURCES
     ${OPENRSYNC_ROOT}/socket.c
     ${OPENRSYNC_ROOT}/symlinks.c
     ${OPENRSYNC_ROOT}/uploader.c
+    ${OPENRSYNC_ROOT}/zcompress.c
 )
 
 set_source_files_properties(${NEXTVI_SOURCES} PROPERTIES COMPILE_DEFINITIONS "main=nextvi_main_entry")
@@ -274,6 +275,7 @@ set_source_files_properties(
     ${OPENRSYNC_ROOT}/socket.c
     ${OPENRSYNC_ROOT}/symlinks.c
     ${OPENRSYNC_ROOT}/uploader.c
+    ${OPENRSYNC_ROOT}/zcompress.c
     PROPERTIES
     COMPILE_DEFINITIONS
         "err=pscal_openrsync_err;errc=pscal_openrsync_errc;errx=pscal_openrsync_errx;warn=pscal_openrsync_warn;warnc=pscal_openrsync_warnc;warnx=pscal_openrsync_warnx;exit=pscal_openrsync_request_exit;getprogname=pscal_openrsync_getprogname;main=pscal_openrsync_main;freeargs=pscal_openrsync_freeargs;scan_scaled=pscal_openrsync_scan_scaled;addargs=pscal_openrsync_addargs;fmt_scaled=pscal_openrsync_fmt_scaled"
