@@ -88,7 +88,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **ping**: ICMP echo request/reply utility, IPv4 and IPv6 (`-4`/`-6` to force a family).
 * **curl** / **wget**: libcurl-backed HTTP(S) client wrappers (`-o`/`-O`, `-X`/`--method`, `-H`/`--header`, `-d`/`--post-data`, `-u`/`--user`+`--password` basic auth, `-k`/`--no-check-certificate` insecure TLS).
 * **telnet**: Telnet client with real IAC option negotiation (declines every DO/WILL request, handles subnegotiation blocks and escaped IAC bytes) -- no actual options are supported, but it interoperates cleanly with real telnetd servers instead of showing negotiation bytes as garbage.
-* **nslookup** / **host**: DNS lookup utilities; IP-shaped queries auto-detect as PTR/reverse lookups (no custom DNS server override).
+* **nslookup** / **host**: DNS lookup utilities; IP-shaped queries auto-detect as PTR/reverse lookups. An optional trailing `server` argument queries that DNS server directly over UDP/53 via a from-scratch DNS client (raw wire-format encode/decode, name compression, A/AAAA/PTR/CNAME), instead of going through the system resolver.
 * **traceroute**: Trace the route packets take to a network host.
 * **ipaddr**: Display network interface addresses; on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`): `ipaddr add|del ADDR/PREFIXLEN dev IFACE`, `ipaddr link set IFACE up|down`, `ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]`.
 

@@ -1490,8 +1490,328 @@ static bool smallclueTryReverseDnsLookup(const char *label, const char *host, bo
     return true;
 }
 
+/* ---- Minimal raw DNS client, for querying an explicit server (nslookup/
+ * host's optional trailing SERVER argument) -- getaddrinfo/getnameinfo
+ * have no per-call server override, so a custom-server query needs a
+ * real (if minimal) DNS message encoder/decoder over UDP. Supports A
+ * (1), AAAA (28), and PTR (12) queries against a recursive resolver;
+ * CNAME records in the answer section are skipped rather than followed
+ * (a normal recursive resolver returns the final A/AAAA alongside any
+ * CNAME in the same response, so this covers the common case without
+ * needing a second round-trip). */
+
+#define SMALLCLUE_DNS_TYPE_A 1
+#define SMALLCLUE_DNS_TYPE_PTR 12
+#define SMALLCLUE_DNS_TYPE_AAAA 28
+#define SMALLCLUE_DNS_TYPE_CNAME 5
+
+static size_t smallclueDnsEncodeName(const char *name, unsigned char *buf, size_t bufSize) {
+    size_t pos = 0;
+    const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t labelLen = dot ? (size_t)(dot - p) : strlen(p);
+        if (labelLen == 0 || labelLen > 63 || pos + labelLen + 1 >= bufSize) return 0;
+        buf[pos++] = (unsigned char)labelLen;
+        memcpy(buf + pos, p, labelLen);
+        pos += labelLen;
+        p += labelLen;
+        if (*p == '.') p++;
+    }
+    if (pos + 1 >= bufSize) return 0;
+    buf[pos++] = 0;
+    return pos;
+}
+
+/* Decodes a (possibly compressed) name starting at `pos` into `out`,
+ * and advances `*afterPos` past the name AS IT APPEARS AT `pos` (i.e.
+ * past the pointer itself if compressed, not into the target it points
+ * to) -- the correct semantics for skipping past a name inline in the
+ * message. Returns false on a malformed/truncated name. */
+static bool smallclueDnsDecodeName(const unsigned char *msg, size_t msgLen, size_t pos,
+                                    char *out, size_t outSize, size_t *afterPos) {
+    size_t outLen = 0;
+    if (out && outSize > 0) out[0] = '\0';
+    bool first = true;
+    bool jumped = false;
+    size_t cur = pos;
+    size_t guard = 0;
+    for (;;) {
+        if (guard++ > 128 || cur >= msgLen) return false;
+        unsigned char lenByte = msg[cur];
+        if (lenByte == 0) {
+            cur++;
+            if (!jumped) *afterPos = cur;
+            break;
+        }
+        if ((lenByte & 0xC0) == 0xC0) {
+            if (cur + 1 >= msgLen) return false;
+            size_t offset = (size_t)((lenByte & 0x3F) << 8) | msg[cur + 1];
+            if (!jumped) *afterPos = cur + 2;
+            jumped = true;
+            cur = offset;
+            continue;
+        }
+        if ((lenByte & 0xC0) != 0) return false; /* reserved bits set */
+        size_t labelLen = lenByte;
+        cur++;
+        if (cur + labelLen > msgLen) return false;
+        if (out) {
+            if (!first && outLen + 1 < outSize) out[outLen++] = '.';
+            for (size_t i = 0; i < labelLen && outLen + 1 < outSize; ++i) out[outLen++] = (char)msg[cur + i];
+            out[outLen] = '\0';
+        }
+        first = false;
+        cur += labelLen;
+    }
+    return true;
+}
+
+/* Sends one query to `server` (IPv4/IPv6 literal or hostname) for
+ * `qname`/`qtype`, and appends every matching answer record's value
+ * (an IP address string for A/AAAA, or a hostname for PTR) to
+ * `*outAnswers`. Returns 0 on success (even with zero answers -- caller
+ * checks *outCount), or a negative value on a real query failure
+ * (unreachable server, timeout, malformed response). */
+static const char *smallclueDnsRcodeName(int rcode) {
+    static const char *rcodeNames[] = {
+        "no error", "format error", "server failure", "name error (NXDOMAIN)",
+        "not implemented", "refused"
+    };
+    return (rcode >= 0 && rcode < 6) ? rcodeNames[rcode] : "unknown error";
+}
+
+static int smallclueDnsQueryServer(const char *server, const char *qname, int qtype,
+                                    char ***outAnswers, int *outCount, int *outRcode) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(server, "53", &hints, &res) != 0 || !res) {
+        fprintf(stderr, "dns: %s: server address not found\n", server);
+        return -1;
+    }
+
+    int sock = socket(res->ai_family, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    struct timeval tv = { 5, 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    unsigned char query[512];
+    memset(query, 0, sizeof(query));
+    uint16_t qid = (uint16_t)(getpid() & 0xffff);
+    query[0] = (unsigned char)(qid >> 8);
+    query[1] = (unsigned char)(qid & 0xff);
+    query[2] = 0x01; /* RD=1 */
+    query[3] = 0x00;
+    query[4] = 0x00; query[5] = 0x01; /* QDCOUNT=1 */
+    /* ANCOUNT/NSCOUNT/ARCOUNT already zero */
+    size_t nameLen = smallclueDnsEncodeName(qname, query + 12, sizeof(query) - 12);
+    if (nameLen == 0) {
+        fprintf(stderr, "dns: %s: name too long\n", qname);
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+    size_t qlen = 12 + nameLen;
+    query[qlen++] = 0; query[qlen++] = (unsigned char)qtype;
+    query[qlen++] = 0; query[qlen++] = 1; /* QCLASS=IN */
+
+    if (sendto(sock, query, qlen, 0, res->ai_addr, res->ai_addrlen) < 0) {
+        fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    unsigned char reply[2048];
+    ssize_t n = recv(sock, reply, sizeof(reply), 0);
+    close(sock);
+    if (n < 12) {
+        fprintf(stderr, "dns: %s: no reply (timed out or unreachable)\n", server);
+        return -1;
+    }
+    uint16_t rid = (uint16_t)((reply[0] << 8) | reply[1]);
+    if (rid != qid) {
+        fprintf(stderr, "dns: %s: reply ID mismatch\n", server);
+        return -1;
+    }
+    int rcode = reply[3] & 0x0F;
+    uint16_t qdcount = (uint16_t)((reply[4] << 8) | reply[5]);
+    uint16_t ancount = (uint16_t)((reply[6] << 8) | reply[7]);
+    if (outRcode) *outRcode = rcode;
+    if (rcode != 0) {
+        /* Left to the caller to report (once, not once per record type
+         * queried) -- querying A then AAAA separately would otherwise
+         * print the same NXDOMAIN/SERVFAIL/etc. twice. */
+        *outCount = 0;
+        return 0;
+    }
+
+    size_t pos = 12;
+    for (int i = 0; i < qdcount; ++i) {
+        size_t after;
+        if (!smallclueDnsDecodeName(reply, (size_t)n, pos, NULL, 0, &after)) {
+            fprintf(stderr, "dns: %s: malformed reply\n", server);
+            return -1;
+        }
+        pos = after + 4; /* QTYPE + QCLASS */
+    }
+
+    char **answers = NULL;
+    int count = 0;
+    for (int i = 0; i < ancount; ++i) {
+        char nameBuf[256];
+        size_t after;
+        if (!smallclueDnsDecodeName(reply, (size_t)n, pos, nameBuf, sizeof(nameBuf), &after)) break;
+        pos = after;
+        if (pos + 10 > (size_t)n) break;
+        int rtype = (reply[pos] << 8) | reply[pos + 1];
+        uint16_t rdlength = (uint16_t)((reply[pos + 8] << 8) | reply[pos + 9]);
+        size_t rdataPos = pos + 10;
+        if (rdataPos + rdlength > (size_t)n) break;
+
+        if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_A && rdlength == 4) {
+            char addrStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, reply + rdataPos, addrStr, sizeof(addrStr));
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(addrStr);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_AAAA && rdlength == 16) {
+            char addrStr[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reply + rdataPos, addrStr, sizeof(addrStr));
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(addrStr);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_PTR) {
+            char ptrName[256];
+            size_t ptrAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos, ptrName, sizeof(ptrName), &ptrAfter)) {
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(ptrName);
+            }
+        }
+        /* CNAME and any other record type in the answer section is
+         * skipped -- rdlength already lets us jump past it uniformly. */
+        pos = rdataPos + rdlength;
+    }
+    *outAnswers = answers;
+    *outCount = count;
+    return 0;
+}
+
+static void smallclueDnsFreeAnswers(char **answers, int count) {
+    for (int i = 0; i < count; ++i) free(answers[i]);
+    free(answers);
+}
+
+/* Handles nslookup/host's optional trailing SERVER argument by actually
+ * querying that server (A, then AAAA, unless -4/-6 restricts it) rather
+ * than rejecting/ignoring it. Returns true if it handled the whole
+ * command (a server was given), setting *exitStatus; false if no server
+ * was given and the caller should fall through to the normal
+ * getaddrinfo-based path. */
+static bool smallclueTryServerDnsLookup(const char *label, const char *host, const char *server,
+                                        int forcedFamily, bool nslookupStyle, int *exitStatus) {
+    if (!server) return false;
+
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    bool isReverse = inet_pton(AF_INET, host, &addr4) == 1 || inet_pton(AF_INET6, host, &addr6) == 1;
+
+    if (nslookupStyle) {
+        printf("Server:\t\t%s\n", server);
+        printf("Address:\t%s#53\n\n", server);
+    }
+
+    if (isReverse) {
+        int family = inet_pton(AF_INET, host, &addr4) == 1 ? AF_INET : AF_INET6;
+        const void *addrBytes = (family == AF_INET) ? (void *)&addr4 : (void *)&addr6;
+        char revname[256];
+        smallclueBuildReverseDnsName(family, addrBytes, revname, sizeof(revname));
+        char **answers = NULL;
+        int count = 0;
+        int rcode = 0;
+        if (smallclueDnsQueryServer(server, revname, SMALLCLUE_DNS_TYPE_PTR, &answers, &count, &rcode) != 0) {
+            *exitStatus = 1;
+            return true;
+        }
+        if (count == 0) {
+            if (rcode != 0) {
+                fprintf(stderr, "%s: %s: %s\n", label, host, smallclueDnsRcodeName(rcode));
+            } else {
+                fprintf(stderr, "%s: %s: no PTR record found via %s\n", label, host, server);
+            }
+            *exitStatus = 1;
+            smallclueDnsFreeAnswers(answers, count);
+            return true;
+        }
+        for (int i = 0; i < count; ++i) {
+            if (nslookupStyle) printf("%s\tname = %s.\n", revname, answers[i]);
+            else printf("%s domain name pointer %s.\n", revname, answers[i]);
+        }
+        smallclueDnsFreeAnswers(answers, count);
+        *exitStatus = 0;
+        return true;
+    }
+
+    bool printed = false;
+    int status = 0;
+    int lastRcode = 0;
+    bool haveRcode = false;
+    if (forcedFamily != AF_INET6) {
+        char **answers = NULL; int count = 0; int rcode = 0;
+        if (smallclueDnsQueryServer(server, host, SMALLCLUE_DNS_TYPE_A, &answers, &count, &rcode) == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (nslookupStyle) {
+                    if (!printed) printf("Non-authoritative answer:\n");
+                    printf("Name:\t%s\nAddress: %s\n", host, answers[i]);
+                } else {
+                    printf("%s has address %s\n", host, answers[i]);
+                }
+                printed = true;
+            }
+            if (count == 0 && rcode != 0) { lastRcode = rcode; haveRcode = true; }
+        } else {
+            status = 1;
+        }
+        smallclueDnsFreeAnswers(answers, count);
+    }
+    if (forcedFamily != AF_INET) {
+        char **answers = NULL; int count = 0; int rcode = 0;
+        if (smallclueDnsQueryServer(server, host, SMALLCLUE_DNS_TYPE_AAAA, &answers, &count, &rcode) == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (nslookupStyle) {
+                    if (!printed) printf("Non-authoritative answer:\n");
+                    printf("Name:\t%s\nAddress: %s\n", host, answers[i]);
+                } else {
+                    printf("%s has IPv6 address %s\n", host, answers[i]);
+                }
+                printed = true;
+            }
+            if (count == 0 && rcode != 0) { lastRcode = rcode; haveRcode = true; }
+        } else {
+            status = 1;
+        }
+        smallclueDnsFreeAnswers(answers, count);
+    }
+    if (!printed && status == 0) {
+        if (haveRcode) {
+            fprintf(stderr, "%s: %s: %s\n", label, host, smallclueDnsRcodeName(lastRcode));
+        } else {
+            fprintf(stderr, "%s: %s: no records found via %s\n", label, host, server);
+        }
+        status = 1;
+    }
+    *exitStatus = status;
+    return true;
+}
+
 static int smallclueNslookupCommand(int argc, char **argv) {
-    const char *usage = "usage: nslookup [-v] host [port]\n";
+    const char *usage = "usage: nslookup [-v] host [server]\n";
     bool verbose = false;
     smallclueResetGetopt();
     int opt;
@@ -1515,7 +1835,12 @@ static int smallclueNslookupCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
-    const char *service = (optind + 1 < argc) ? argv[optind + 1] : "53";
+    const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    int serverStatus = 0;
+    if (smallclueTryServerDnsLookup("nslookup", host, server, AF_UNSPEC, true, &serverStatus)) {
+        return serverStatus;
+    }
 
     int reverseStatus = 0;
     if (smallclueTryReverseDnsLookup("nslookup", host, true, &reverseStatus)) {
@@ -1527,7 +1852,7 @@ static int smallclueNslookupCommand(int argc, char **argv) {
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_family = AF_UNSPEC;
     struct addrinfo *res = NULL;
-    int gai = pscalHostsGetAddrInfo(host, service, &hints, &res);
+    int gai = pscalHostsGetAddrInfo(host, "53", &hints, &res);
     if (gai != 0 || !res) {
 #if defined(PSCAL_TARGET_IOS)
         fprintf(stderr, "nslookup: hosts lookup paths: %s first, then /etc/hosts\n",
@@ -1581,8 +1906,11 @@ static int smallclueHostCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
-    if (optind + 1 < argc) {
-        fprintf(stderr, "host: server override not supported; ignoring '%s'\n", argv[optind + 1]);
+    const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    int serverStatus = 0;
+    if (smallclueTryServerDnsLookup("host", host, server, family, false, &serverStatus)) {
+        return serverStatus;
     }
 
     int reverseStatus = 0;
@@ -2522,9 +2850,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  terminal hanging up. If stdout is a terminal, output is appended\n"
               "  to nohup.out (or $HOME/nohup.out); if stderr is also a terminal,\n"
               "  it goes to the same place."},
-    {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53);\n"
-                 "  IP-shaped queries auto-detect as PTR/reverse lookups.\n"
+    {"nslookup", "nslookup [-v] host [server]\n"
+                 "  DNS lookup utility; queries SERVER directly (port 53) if\n"
+                 "  given, else uses the system resolver. IP-shaped queries\n"
+                 "  auto-detect as PTR/reverse lookups.\n"
                  "  -v prints hosts lookup debugging."},
     {"od", "od [-A d|o|x|n] [-t TYPE] [-c] [-v] [FILE]\n"
            "  Dump FILE/stdin in the given format (default: 2-byte octal words)\n"
@@ -2814,9 +3143,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"dmesg", "dmesg [-T]\n"
               "  Print or control the kernel ring buffer\n"
               "  -T  show human-readable timestamps (iOS only)"},
-    {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53); IP-shaped\n"
-                 "  queries auto-detect as PTR/reverse lookups. -v prints hosts lookup debugging."},
+    {"nslookup", "nslookup [-v] host [server]\n"
+                 "  DNS lookup utility; queries SERVER directly (port 53) if given,\n"
+                 "  else uses the system resolver. IP-shaped queries auto-detect as\n"
+                 "  PTR/reverse lookups. -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
     {"addt", "addt\n"
              "  Open an additional shell tab"},
