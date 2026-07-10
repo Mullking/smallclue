@@ -656,8 +656,8 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
         case SHELL_COMMAND_SUBSHELL: {
             if (applyRedirections(interp, &command->redirections, &saved) != 0) {
                 restoreFds(saved);
-                interp->last_status = 1;
-                return 1;
+                interp->last_status = 2; /* redirection failure */
+                return 2;
             }
             applied_redirs = true;
             pid_t pid = fork();
@@ -688,8 +688,8 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
             if (applyRedirections(interp, &command->data.brace_group.redirections, &saved) != 0 ||
                 applyRedirections(interp, &command->redirections, &saved) != 0) {
                 restoreFds(saved);
-                interp->last_status = 1;
-                return 1;
+                interp->last_status = 2; /* redirection failure */
+                return 2;
             }
             applied_redirs = true;
             status = shRunProgram(interp, command->data.brace_group.body);
@@ -699,8 +699,8 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
             if (applyRedirections(interp, &command->data.loop->redirections, &saved) != 0 ||
                 applyRedirections(interp, &command->redirections, &saved) != 0) {
                 restoreFds(saved);
-                interp->last_status = 1;
-                return 1;
+                interp->last_status = 2; /* redirection failure */
+                return 2;
             }
             applied_redirs = true;
             status = runLoop(interp, command);
@@ -708,8 +708,8 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
         case SHELL_COMMAND_CONDITIONAL:
             if (applyRedirections(interp, &command->redirections, &saved) != 0) {
                 restoreFds(saved);
-                interp->last_status = 1;
-                return 1;
+                interp->last_status = 2; /* redirection failure */
+                return 2;
             }
             applied_redirs = true;
             status = runConditional(interp, command);
@@ -717,8 +717,8 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
         case SHELL_COMMAND_CASE:
             if (applyRedirections(interp, &command->redirections, &saved) != 0) {
                 restoreFds(saved);
-                interp->last_status = 1;
-                return 1;
+                interp->last_status = 2; /* redirection failure */
+                return 2;
             }
             applied_redirs = true;
             status = runCase(interp, command);
@@ -1329,11 +1329,11 @@ static int runSimpleCommand(ShInterp *interp, const ShellCommand *command) {
         status = interp->subst_ran ? interp->subst_status : 0;
         for (size_t i = 0; i < assign_count; ++i) {
             if (shVarSet(interp, assign_names[i], assign_values[i], false) != 0) {
-                status = 1;
+                status = 2; /* readonly-variable assignment: sh convention */
                 /* Assignment errors (readonly) abort a non-interactive shell. */
                 if (!interp->interactive) {
                     interp->flow = SH_FLOW_EXIT;
-                    interp->exit_status = 1;
+                    interp->exit_status = 2;
                 }
             }
         }
@@ -1365,7 +1365,7 @@ static int runSimpleCommand(ShInterp *interp, const ShellCommand *command) {
         SavedFd *saved = NULL;
         if (applyRedirections(interp, &command->redirections, &saved) != 0) {
             restoreFds(saved);
-            status = 1;
+            status = 2; /* redirection failure: sh convention, not a plain command failure */
             goto cleanup;
         }
         /* Assignments prefix a builtin: for special builtins they persist;

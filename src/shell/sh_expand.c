@@ -160,7 +160,7 @@ static void emitUnsetError(ExpCtx *ctx, const char *name, const char *msg) {
     ctx->error = true;
     if (!ctx->interp->interactive) {
         ctx->interp->flow = SH_FLOW_EXIT;
-        ctx->interp->exit_status = 1;
+        ctx->interp->exit_status = 2; /* set -u violation: sh convention */
     }
 }
 
