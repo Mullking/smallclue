@@ -445,6 +445,23 @@ if(FTS_LIBRARY)
     target_link_libraries(smallclue PRIVATE ${FTS_LIBRARY})
 endif()
 
+# openrsync (vendored OpenBSD source) calls strlcpy/strlcat/recallocarray/
+# strtonum/major/minor -- present in BSD libc and in Darwin's, but glibc only
+# gained strlcpy/strlcat in 2.38 and never shipped the rest. Same story as
+# FTS_LIBRARY above: link the distro's libbsd (apt/dnf package libbsd-dev)
+# when present.
+if(UNIX AND NOT APPLE)
+    set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    find_library(BSD_LIBRARY bsd)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+    if(BSD_LIBRARY)
+        target_link_libraries(smallclue PRIVATE ${BSD_LIBRARY})
+    else()
+        message(WARNING "libbsd not found; openrsync needs strlcpy/strlcat/recallocarray/strtonum/major/minor. Install libbsd-dev (Debian/Ubuntu) or equivalent.")
+    endif()
+endif()
+
 # Link OpenSSH dependencies
 # Same static-vs-shared story as the FTS_LIBRARY lookup above: FindZLIB/
 # FindOpenSSL also default to preferring .so on Linux, which this fully
