@@ -21,10 +21,6 @@ if [ ! -d "third-party/openssh" ] || [ ! -f "third-party/openssh/ssh.c" ] || [ !
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
-if [ ! -d "third-party/dash" ]; then
-    echo "Dash missing."
-    MISSING_DEPS=1
-fi
 if [ ! -d "third-party/dvtm/.git" ] || [ ! -f "third-party/dvtm/dvtm.c" ] || [ ! -f "third-party/dvtm/vt.c" ] || [ ! -f "third-party/dvtm/config.def.h" ]; then
     echo "dvtm repository missing or incomplete."
     MISSING_DEPS=1
@@ -153,7 +149,7 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     return false; /* Did not modify */
 }
 
-/* exsh stubs removed as dash is used for sh */
+/* exsh stubs removed: standalone builds use smallclue's built-in sh */
 EOF
 
 # 3. Compile smallclue
@@ -163,6 +159,14 @@ EXTRA_LD_FLAGS=""
 if [ "$(uname -s)" = "Darwin" ]; then
     # Keep BSD typedefs (u_int/u_char/u_short) visible in macOS SDK networking headers.
     EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
+    # macOS ships no libcrypto in the SDK; point the final link at the same
+    # OpenSSL the OpenSSH configure step found (homebrew, typically).
+    for ssl_prefix in "$(brew --prefix openssl@3 2>/dev/null)" /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+        if [ -n "$ssl_prefix" ] && [ -d "$ssl_prefix/lib" ]; then
+            EXTRA_LD_FLAGS="-L$ssl_prefix/lib"
+            break
+        fi
+    done
 fi
 if [ "$(uname -s)" = "Linux" ]; then
     EXTRA_LD_FLAGS="-static"
@@ -348,12 +352,16 @@ if [ -d "$OPENSSH_DIR" ]; then
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
 
-    # sftp-client.c
-    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+    # sftp-client.c. The pscal_openssh_ checks make these idempotent: the
+    # plain substring guards used to match their own output, stacking the
+    # prefix on every rebuild (pscal_openssh_pscal_openssh_...).
+    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c" && \
+       ! grep -q "pscal_openssh_interrupted" "$OPENSSH_DIR/sftp-client.c"; then
         sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
-    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c"; then
+    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c" && \
+       ! grep -q "pscal_openssh_showprogress" "$OPENSSH_DIR/sftp-client.c"; then
         sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
         if ! grep -q "extern int pscal_openssh_showprogress;" "$OPENSSH_DIR/sftp-client.c"; then
             awk '
@@ -391,29 +399,16 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
     if [ "$(uname -s)" = "Linux" ]; then
         OPENSSH_LIBS="$OPENSSH_LIBS -lcrypt"
     fi
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # openbsd-compat's getrrsetbyname uses the BIND resolver state.
+        OPENSSH_LIBS="$OPENSSH_LIBS -lresolv"
+    fi
 
     # Include globals and stubs
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
 
     # Do not link shim if using real openssh (avoid dns symbol conflict)
     OPENSSH_SHIM=""
-fi
-
-# Build dash if present. Non-fatal: smallclue ships its own sh applet, so a
-# missing autotools chain (aclocal etc.) just means /bin/sh falls back to it.
-DASH_DIR="third-party/dash"
-if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
-    echo "Building dash..."
-    (
-        set -e
-        cd "$DASH_DIR"
-        # Git checkout needs autogen
-        if [ ! -f configure ]; then
-            echo "Generating dash configure script..."
-            ./autogen.sh
-        fi
-        ./configure --enable-static && make -j4
-    ) || echo "Warning: dash build failed; /bin/sh will use smallclue's built-in shell."
 fi
 
 if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
@@ -510,6 +505,10 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
     LIBGIT2_EXTRA_DEFS="-DPSCAL_HAS_LIBGIT2"
     LIBGIT2_EXTRA_CFLAGS="-I${LIBGIT2_DIR}/include"
     LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # libgit2's HTTPS/keychain backends use SecureTransport on macOS.
+        LIBGIT2_LIBS="$LIBGIT2_LIBS -framework Security -framework CoreFoundation -liconv"
+    fi
 fi
 
 gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
@@ -519,6 +518,7 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALL
     src/core.c \
     src/runtime_support.c \
     src/micro_app.c \
+    src/micro_main_stub.c \
     src/dvtm_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
@@ -636,7 +636,7 @@ elif [ "$(uname -s)" = "Darwin" ]; then
     mknod -m 666 "$ROOTFS/dev/urandom" c 14 1 || echo "Failed to create /dev/urandom"
 fi
 
-# 5. Install smallclue and dash
+# 5. Install smallclue
 cp smallclue "$ROOTFS/bin/"
 if [ -x "third-party/micro-bin/micro" ]; then
     echo "Installing micro..."
@@ -651,15 +651,6 @@ if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; th
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
 fi
 
-if [ -f "third-party/dash/src/dash" ]; then
-    echo "Installing dash..."
-    cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
-    mkdir -p "$ROOTFS/usr/share/doc/dash"
-    cp "third-party/dash/COPYING" "$ROOTFS/usr/share/doc/dash/"
-    # Symlink /bin/sh to dash
-    ln -sf dash "$ROOTFS/bin/sh"
-fi
-
 # 6. Create symlinks
 echo "Creating symlinks..."
 # Extract applet names from ./smallclue output
@@ -669,10 +660,6 @@ APPLETS=$(./smallclue 2>&1 | grep "^  " | awk '{print $1}' | grep -v "smallclue"
 for applet in $APPLETS; do
     # Skip if it is smallclue itself (already handled)
     if [ "$applet" == "smallclue" ]; then
-        continue
-    fi
-    # If dash is present, do not overwrite sh
-    if [ "$applet" == "sh" ] && [ -f "$ROOTFS/bin/dash" ]; then
         continue
     fi
     ln -sf smallclue "$ROOTFS/bin/$applet"
@@ -758,14 +745,14 @@ chown 1000:1000 "$ROOTFS/home/username/.exshrc"
 
 echo "Creating .profile..."
 cat > "$ROOTFS/home/username/.profile" <<EOF
-export ENV=\$HOME/.dashrc
+export ENV=\$HOME/.shrc
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 EOF
 chown 1000:1000 "$ROOTFS/home/username/.profile"
 
-echo "Creating .dashrc..."
-cat > "$ROOTFS/home/username/.dashrc" <<EOF
-# Basic dash configuration
+echo "Creating .shrc..."
+cat > "$ROOTFS/home/username/.shrc" <<EOF
+# Basic sh configuration
 
 # Get username if not set
 if [ -z "\$USER" ]; then
@@ -793,17 +780,17 @@ alias la='ls -A'
 alias l='ls -CF'
 alias ls='ls --color=auto'
 EOF
-chown 1000:1000 "$ROOTFS/home/username/.dashrc"
+chown 1000:1000 "$ROOTFS/home/username/.shrc"
 
 echo "Creating root .profile..."
 cat > "$ROOTFS/root/.profile" <<EOF
-export ENV=\$HOME/.dashrc
+export ENV=\$HOME/.shrc
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 EOF
 
-echo "Creating root .dashrc..."
-cat > "$ROOTFS/root/.dashrc" <<EOF
-# Basic dash configuration
+echo "Creating root .shrc..."
+cat > "$ROOTFS/root/.shrc" <<EOF
+# Basic sh configuration
 
 # Get username if not set
 if [ -z "\$USER" ]; then

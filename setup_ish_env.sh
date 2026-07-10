@@ -578,7 +578,8 @@ if [ -d "$OPENSSH_DIR" ]; then
     fi
 
     # sftp-client.c
-    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c" && \
+       ! grep -q "pscal_openssh_interrupted" "$OPENSSH_DIR/sftp-client.c"; then
         sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
@@ -606,48 +607,6 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
     OPENSSH_SHIM=""
     OPENSSH_ENABLED=1
     fi
-fi
-
-# Dash
-DASH_DIR="third-party/dash"
-if [ -d "$DASH_DIR" ]; then
-    echo "Configuring Dash for i686..."
-    DASH_AR="ar"
-    DASH_RANLIB="ranlib"
-    if [ "$TARGET_IS_CROSS" -eq 1 ]; then
-        if command -v i686-linux-gnu-ar >/dev/null 2>&1; then
-            DASH_AR="i686-linux-gnu-ar"
-        fi
-        if command -v i686-linux-gnu-ranlib >/dev/null 2>&1; then
-            DASH_RANLIB="i686-linux-gnu-ranlib"
-        fi
-    fi
-    if [ -f "$DASH_DIR/Makefile" ]; then
-        (cd "$DASH_DIR" && make distclean >/dev/null 2>&1 || true)
-    fi
-    if [ ! -f "$DASH_DIR/configure" ]; then
-        (cd "$DASH_DIR" && ./autogen.sh)
-    fi
-    DASH_CC_FOR_BUILD="$BUILD_CC"
-    (cd "$DASH_DIR" && AR="$DASH_AR" RANLIB="$DASH_RANLIB" CC_FOR_BUILD="$DASH_CC_FOR_BUILD" ./configure --build="$BUILD_TRIPLET" --host="$TARGET_HOST" --enable-static CC="$CC_PRINT" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
-    echo "Building Dash..."
-    (cd "$DASH_DIR" && make -j4 CC="$CC_PRINT" CC_FOR_BUILD="$DASH_CC_FOR_BUILD" AR="$DASH_AR" RANLIB="$DASH_RANLIB" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
-
-    if [ ! -f "$DASH_DIR/src/dash" ]; then
-        echo "Error: dash build did not produce $DASH_DIR/src/dash"
-        exit 1
-    fi
-    DASH_BUILD_FILE_INFO="$(file "$DASH_DIR/src/dash" || true)"
-    echo "$DASH_BUILD_FILE_INFO" | grep -Eq "ELF 32-bit|Intel 80386|i386" || {
-        echo "Error: dash is not an i686 binary."
-        echo "  file: $DASH_BUILD_FILE_INFO"
-        exit 1
-    }
-    echo "$DASH_BUILD_FILE_INFO" | grep -q "statically linked" || {
-        echo "Error: dash is not statically linked."
-        echo "  file: $DASH_BUILD_FILE_INFO"
-        exit 1
-    }
 fi
 
 DISABLE_NEXTVI="${DISABLE_NEXTVI:-0}"
@@ -888,19 +847,6 @@ mkdir -p "$ROOTFS/dev/pts"
 # Install binaries
 cp smallclue "$ROOTFS/bin/"
 
-DASH_USABLE=0
-if [ -f "third-party/dash/src/dash" ]; then
-    DASH_FILE_INFO="$(file "third-party/dash/src/dash" || true)"
-    if echo "$DASH_FILE_INFO" | grep -Eq "ELF 32-bit|Intel 80386|i386" && echo "$DASH_FILE_INFO" | grep -q "statically linked"; then
-        echo "Installing dash..."
-        cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
-        ln -sf dash "$ROOTFS/bin/sh"
-        DASH_USABLE=1
-    else
-        echo "Warning: dash exists but is not a static i686 binary; skipping /bin/sh -> dash."
-    fi
-fi
-
 # Create symlinks
 if ./smallclue >/dev/null 2>&1; then
     SMALLCLUE_RUNNER_CMD=(./smallclue)
@@ -933,20 +879,14 @@ fi
 
 for applet in $APPLETS; do
     if [ "$applet" == "smallclue" ]; then continue; fi
-    if [ "$applet" == "sh" ] && [ -f "$ROOTFS/bin/dash" ]; then continue; fi
     ln -sf smallclue "$ROOTFS/bin/$applet"
 done
 
-if [ "$DASH_USABLE" -eq 0 ]; then
-    if printf '%s\n' "$APPLETS" | grep -qx "sh"; then
-        ln -sf smallclue "$ROOTFS/bin/sh"
-    else
-        echo "Error: no runnable /bin/sh candidate found."
-        echo "Need either:"
-        echo "  1) static i686 dash at third-party/dash/src/dash, or"
-        echo "  2) smallclue built with 'sh' applet."
-        exit 1
-    fi
+if printf '%s\n' "$APPLETS" | grep -qx "sh"; then
+    ln -sf smallclue "$ROOTFS/bin/sh"
+else
+    echo "Error: smallclue was built without the 'sh' applet; no /bin/sh available."
+    exit 1
 fi
 
 # iSH default launch command is /bin/login -f root; provide a simple wrapper.

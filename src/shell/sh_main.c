@@ -142,6 +142,39 @@ static void setShellName(ShInterp *interp, const char *arg0) {
     interp->script_name = interp->arg0;
 }
 
+/* Source a startup file in the current shell, ignoring missing files. */
+static void sourceIfReadable(ShInterp *interp, const char *path) {
+    if (!path || !*path || access(path, R_OK) != 0) {
+        return;
+    }
+    char *source = readWholeFile(path);
+    if (source) {
+        shRunString(interp, source, path);
+        free(source);
+        interp->flow = SH_FLOW_NONE;
+    }
+}
+
+/* Login shells read /etc/profile and ~/.profile; interactive shells then
+ * read the file named by $ENV (after expansion), as BusyBox ash does. */
+static void runStartupFiles(ShInterp *interp, bool login_shell) {
+    if (login_shell) {
+        sourceIfReadable(interp, "/etc/profile");
+        const char *home = shVarGet(interp, "HOME");
+        if (home && *home) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/.profile", home);
+            sourceIfReadable(interp, path);
+        }
+    }
+    const char *env = shVarGet(interp, "ENV");
+    if (env && *env) {
+        char *expanded = shExpandHereDocument(interp, env);
+        sourceIfReadable(interp, expanded ? expanded : env);
+        free(expanded);
+    }
+}
+
 static int runInteractive(ShInterp *interp) {
     interp->interactive = true;
     interp->tty_fd = STDIN_FILENO;
@@ -292,6 +325,7 @@ int shMain(int argc, char **argv) {
     const char *script_path = NULL;
     bool read_stdin = false;
     bool force_interactive = false;
+    bool login_shell = argv && argv[0] && argv[0][0] == '-';
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -332,7 +366,7 @@ int shMain(int argc, char **argv) {
                     case 'a': interp->opt_allexport = true; break;
                     case 'v': interp->opt_verbose = true; break;
                     case 'm': interp->opt_monitor = true; break;
-                    case 'l': break; /* login shell: accepted */
+                    case 'l': login_shell = true; break;
                     default: ok = false; break;
                 }
                 if (!ok) {
@@ -408,6 +442,8 @@ int shMain(int argc, char **argv) {
         }
         if (force_interactive || isatty(STDIN_FILENO)) {
             interp->opt_monitor = true;
+            interp->interactive = true;
+            runStartupFiles(interp, login_shell);
             status = runInteractive(interp);
         } else {
             status = runStdinNonInteractive(interp);
