@@ -301,11 +301,18 @@ if [ -d "$OPENSSH_DIR" ]; then
             fi
 
             if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}"); then
-                echo "Error: OpenSSH configure failed."
-                if [ -f "$OPENSSH_DIR/config.log" ]; then
-                    echo "See: $OPENSSH_DIR/config.log"
+                # Retry relaxing the OpenSSL header/library version cross-check:
+                # some systems (e.g. a locally-built OpenSSL alongside an older
+                # system libcrypto) have headers and library reporting different
+                # versions even though they're ABI-compatible for our purposes.
+                echo "OpenSSH configure failed; retrying with --without-openssl-header-check..."
+                if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}" --without-openssl-header-check); then
+                    echo "Error: OpenSSH configure failed."
+                    if [ -f "$OPENSSH_DIR/config.log" ]; then
+                        echo "See: $OPENSSH_DIR/config.log"
+                    fi
+                    exit 1
                 fi
-                exit 1
             fi
         else
             echo "Error: configure script not found and could not be generated."
