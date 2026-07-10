@@ -423,6 +423,13 @@ if(APPLE)
     target_link_libraries(smallclue PRIVATE resolv)
 endif()
 
+if(UNIX AND NOT APPLE)
+    # awk_interp.c's builtins (sin/cos/exp/log/sqrt/atan2/fmod/pow) and
+    # OpenSSH/su's crypt() calls are in libm/libcrypt on glibc; both are
+    # part of libSystem on Darwin, hence the UNIX-and-not-APPLE guard.
+    target_link_libraries(smallclue PRIVATE m crypt)
+endif()
+
 # musl libc (Alpine, aarch64-linux-musl) has no <fts.h>/libfts -- glibc and
 # Darwin both ship it in libc itself, so this is a no-op there. On musl,
 # install musl-fts-dev (ships both the header at the normal system include
