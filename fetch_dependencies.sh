@@ -353,7 +353,14 @@ new_struct = ("/* Not every translation unit that reaches this fallback branch (
               " * has an entirely separate config.h that never mentions getopt at all. The\n"
               " * GNU-style struct option/getopt_long/getopt_long_only ABI below is stable\n"
               " * across every platform this project targets (Linux glibc, macOS, *BSD),\n"
-              " * so it's safe to always provide it here rather than gating it further. */\n"
+              " * so it's safe to always provide it here rather than gating it further --\n"
+              " * EXCEPT for openbsd-compat/getopt_long.c itself, which reaches this same\n"
+              " * fallback branch (via includes.h) on any libc with getopt but no BSD\n"
+              " * optreset (glibc among them) and ALSO defines this exact struct/functions\n"
+              " * a few lines further down in that same file -- a real double-definition,\n"
+              " * not a redundant-but-harmless one. It defines the sentinel below before\n"
+              " * including anything, specifically to skip this copy. */\n"
+              "#ifndef SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION\n"
               "struct option {")
 assert old_struct in text, "getopt.h struct option shape changed upstream, patch needs review"
 text = text.replace(old_struct, new_struct, 1)
@@ -369,10 +376,38 @@ new_tail = """int\t getopt_long(int, char * const *, const char *,
 \t    const struct option *, int *);
 int\t getopt_long_only(int, char * const *, const char *,
 \t    const struct option *, int *);
+#endif /* !SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION */
 
 #ifndef _GETOPT_DEFINED_"""
 assert old_tail in text, "getopt.h tail shape changed upstream, patch needs review"
 text = text.replace(old_tail, new_tail, 1)
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+    fi
+
+    GETOPT_LONG_C="$OPENSSH_DIR/openbsd-compat/getopt_long.c"
+    if [ -f "$GETOPT_LONG_C" ] && ! grep -q "SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION" "$GETOPT_LONG_C"; then
+        echo "Patching openbsd-compat/getopt_long.c to skip getopt.h's own struct option copy..."
+        python3 - "$GETOPT_LONG_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+old = '/* OPENBSD ORIGINAL: lib/libc/stdlib/getopt_long.c */\n#include "includes.h"'
+new = ('/* OPENBSD ORIGINAL: lib/libc/stdlib/getopt_long.c */\n'
+       '/* This file defines its own struct option/getopt_long/getopt_long_only\n'
+       ' * (guarded below by !HAVE_GETOPT || !HAVE_GETOPT_OPTRESET) whenever the\n'
+       ' * platform lacks BSD optreset -- true on glibc. includes.h pulls in this\n'
+       ' * same directory\'s own getopt.h too (via openbsd-compat.h), which in its\n'
+       ' * fallback branch also defines that struct for OTHER consumers (notably\n'
+       ' * openrsync) that never define it themselves. Without this sentinel both\n'
+       ' * copies land in this one translation unit -- a real redefinition, not a\n'
+       ' * redundant-but-harmless one. */\n'
+       '#define SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION 1\n'
+       '#include "includes.h"')
+assert old in text, "getopt_long.c shape changed upstream, patch needs review"
+text = text.replace(old, new, 1)
 with open(path, "w") as f:
     f.write(text)
 PYEOF
