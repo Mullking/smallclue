@@ -608,6 +608,7 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALL
     src/base64_app.c \
     src/checksum_app.c \
     src/chown_app.c \
+    src/chroot_app.c \
     src/cmp_app.c \
     src/comm_app.c \
     src/dd_app.c \
