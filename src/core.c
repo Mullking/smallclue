@@ -20,6 +20,7 @@
 #include "printf_app.h"
 #include "expr_app.h"
 #include "chown_app.h"
+#include "chroot_app.h"
 #include "base64_app.h"
 #include "nohup_app.h"
 #include "cmp_app.h"
@@ -2717,6 +2718,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"chmod", smallclueChmodCommand, "Change file permissions"},
     {"chown", smallclueChownCommand, "Change file owner and group"},
     {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
+    {"chroot", smallclueChrootCommand, "Run a command with a new root directory"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files and directories"},
@@ -2892,6 +2894,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"chgrp", "chgrp [-R] [-h] GROUP FILE ...\n"
               "  Change group ownership of each FILE (numeric ID or name)\n"
               "  -R recursive  -h affect symlinks themselves, not their targets"},
+    {"chroot", "chroot [-u USER] [-g GROUP] NEWROOT [COMMAND [ARG]...]\n"
+               "  Run COMMAND (default: $SHELL or /bin/sh) with NEWROOT as its root\n"
+               "  -u drop to USER (numeric ID or name) after chrooting\n"
+               "  -g drop to GROUP (numeric ID or name) after chrooting"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"

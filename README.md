@@ -30,6 +30,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **du**: Estimate file space usage (GNU-default directory-subtotal behavior, `--max-depth`, `-c` grand total, `-x` one-filesystem, `-h`).
 * **df**: Report file system disk space usage (enumerates all mounts from `/proc/mounts` when no path is given).
 * **chown** / **chgrp**: Change file ownership/group.
+* **chroot**: Run a command (or shell) with a new root directory, optionally dropping to another user/group.
 * **file**: Determine file type.
 * **stat**: Display file status.
 * **basename** / **dirname**: Parse path components (multi-operand support; `basename` supports a `SUFFIX` operand).
