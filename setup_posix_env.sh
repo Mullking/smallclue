@@ -464,7 +464,19 @@ if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
 int main(void) { initscr(); endwin(); return 0; }
 EOF
 
-    for try_libs in "-lncursesw -lutil" "-lncursesw" "-lncurses -lutil" "-lncurses" "-lcurses -lutil" "-lcurses"; do
+    # Debian/glibc splits terminfo out of libncurses*.a for STATIC linking
+    # (dynamic linking doesn't need this -- libncurses.so already pulls
+    # tinfo symbols in via its own NEEDED entry). A static-only build (our
+    # EXTRA_LD_FLAGS=-static path) sees undefined references to `SP`/
+    # `_nc_screen_of`/etc without an explicit -ltinfo, even though
+    # libncursesw.a/libncurses.a themselves link fine dynamically. Every
+    # existing combo gets a -ltinfo-augmented counterpart so this doesn't
+    # regress platforms where tinfo is already folded into libncurses*.a.
+    for try_libs in "-lncursesw -lutil" "-lncursesw" \
+                     "-lncursesw -lutil -ltinfo" "-lncursesw -ltinfo" \
+                     "-lncurses -lutil" "-lncurses" \
+                     "-lncurses -lutil -ltinfo" "-lncurses -ltinfo" \
+                     "-lcurses -lutil" "-lcurses"; do
         if gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${EXTRA_LD_FLAGS} \
             "$DVTM_PROBE_SRC" ${try_libs} -o "$DVTM_BUILD_DIR/curses_probe.bin" >/dev/null 2>&1; then
             DVTM_LIBS="$try_libs"
@@ -474,7 +486,7 @@ EOF
 
     if [ -z "$DVTM_LIBS" ]; then
         echo "Error: failed to locate a curses+util link combination for dvtm."
-        echo "Tried: -lncursesw/-lncurses/-lcurses with and without -lutil."
+        echo "Tried: -lncursesw/-lncurses/-lcurses with and without -lutil/-ltinfo."
         exit 1
     fi
 
