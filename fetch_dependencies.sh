@@ -95,6 +95,13 @@ if [ -f "$TERM_C" ] && ! grep -q "ICRNL" "$TERM_C"; then
 fi
 
 # --- dvtm ---
+# Tracked as a git submodule pinned to emkey1/dvtm (a fork of
+# martanne/dvtm with a small Darwin build fix), the same fork/commit
+# PSCAL's third-party tree uses. No source patching needed here.
+if [ -f .gitmodules ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Initializing dvtm submodule..."
+    git submodule update --init --recursive -- "$THIRD_PARTY_DIR/dvtm"
+fi
 reset_incomplete_repo "$THIRD_PARTY_DIR/dvtm" "1" "dvtm.c" "vt.c" "config.def.h"
 if [ ! -d "$THIRD_PARTY_DIR/dvtm" ]; then
     if [ -d "../../third-party/dvtm/.git" ]; then
@@ -104,8 +111,8 @@ if [ ! -d "$THIRD_PARTY_DIR/dvtm" ]; then
         echo "Copying dvtm from ../third-party/dvtm..."
         cp -a "../third-party/dvtm" "$THIRD_PARTY_DIR/dvtm"
     else
-        echo "Cloning dvtm..."
-        git clone https://github.com/martanne/dvtm "$THIRD_PARTY_DIR/dvtm"
+        echo "Cloning dvtm (submodule unavailable)..."
+        git clone https://github.com/emkey1/dvtm "$THIRD_PARTY_DIR/dvtm"
     fi
 fi
 
