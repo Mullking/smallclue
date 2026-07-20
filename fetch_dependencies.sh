@@ -488,4 +488,20 @@ with open(path, "w") as f:
 PYEOF
 fi
 
+if [ -f "$OPENSSH_DIR/sftp-client.c" ] && grep -q "^extern int showprogress;$" "$OPENSSH_DIR/sftp-client.c"; then
+    echo "Aliasing sftp-client.c's showprogress extern to the shared openssh_globals.c one..."
+    python3 - "$OPENSSH_DIR/sftp-client.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+text = text.replace(
+    "extern int showprogress;\n",
+    "extern int pscal_openssh_showprogress;\n"
+    "#define showprogress pscal_openssh_showprogress\n", 1)
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+fi
+
 echo "Dependencies fetched and patched."
