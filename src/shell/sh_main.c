@@ -179,12 +179,17 @@ static int runInteractive(ShInterp *interp) {
     interp->interactive = true;
     interp->tty_fd = STDIN_FILENO;
     interp->tty_pgid = getpgrp();
+    /* Remember the pgid that owned the terminal before we seize it below, so
+     * we can hand it back on the way out; interp->tty_pgid gets overwritten
+     * to our own new pgid once we seize control. */
+    pid_t orig_tty_pgid = interp->tty_pgid;
 
     if (interp->opt_monitor) {
         /* Take the terminal. */
         while (tcgetpgrp(interp->tty_fd) != (interp->tty_pgid = getpgrp())) {
             kill(-interp->tty_pgid, SIGTTIN);
         }
+        orig_tty_pgid = interp->tty_pgid;
         signal(SIGTTIN, SIG_IGN);
         signal(SIGTTOU, SIG_IGN);
         signal(SIGTSTP, SIG_IGN);
@@ -276,6 +281,15 @@ static int runInteractive(ShInterp *interp) {
     free(pending);
 
     shLineEditSaveHistory();
+
+    if (interp->opt_monitor) {
+        /* Hand the terminal's foreground process group back to whoever owned
+         * it before we seized it in the block above; otherwise the invoking
+         * parent's next read() from this tty gets EIO or a SIGTTIN stop it
+         * can never recover from, since our process group is about to exit. */
+        tcsetpgrp(interp->tty_fd, orig_tty_pgid);
+    }
+
     return interp->flow == SH_FLOW_EXIT ? interp->exit_status : interp->last_status;
 }
 
