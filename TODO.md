@@ -2,18 +2,16 @@
 
 ## Build & dependency infrastructure
 
-- [ ] **Fork + submodule the remaining third-party deps.** libgit2 and openrsync
-      are done (pinned submodules of the emkey1 forks, same as PSCAL's tree).
-      Remaining, in rough order of difficulty:
-  - [ ] `nextvi` — plain clone of upstream HEAD (unpinned!) plus small sed
-        patches in `fetch_dependencies.sh` (main rename, CR handling, ICRNL).
-        Fork it, bake the patches into the fork, submodule it.
-  - [ ] `dvtm` — plain clone, no patching. Same treatment; easiest of the three.
-  - [ ] `openssh` — hardest. Fetched as a release tarball (not git) and patched
-        by a dozen-plus sed/python edits (main renames, musl include guards,
-        showprogress/interrupted aliasing). A fork means owning rebases onto
-        upstream releases, including security updates — decide if that upkeep
-        is worth it before starting.
+- [x] **Fork + submodule the remaining third-party deps.** libgit2, openrsync,
+      nextvi, and dvtm are done (pinned submodules of emkey1 forks, matching
+      PSCAL's tree; nextvi's 4 sed patches were baked into commits on a
+      dedicated `smallclue` branch of the fork rather than `master`, which
+      carries an unrelated PSCAL snapshot).
+  - [ ] `openssh` — the one deliberately left out. Fetched as a release
+        tarball (not git) and patched by a dozen-plus sed/python edits (main
+        renames, musl include guards, showprogress/interrupted aliasing). A
+        fork means owning rebases onto upstream releases, including security
+        updates — decide if that upkeep is worth it before starting.
 - [ ] **Make the standalone (non-PSCAL-nested) build less fragile.** CMake
       configure currently fails cryptically if:
   - `third-party/openrsync/config_pscal.h` is absent (now fixed by the
@@ -48,5 +46,5 @@
       exsh (the PSCAL frontend), but standalone builds now use smallclue's own
       native POSIX shell (`src/shell/`); exsh is only the embedded-PSCAL
       (`WITH_EXSH`) behavior. README has it right.
-- [ ] `fetch_dependencies.sh` pins nothing for nextvi/dvtm (HEAD of upstream) —
-      document or fix (fixing = the fork/submodule item above).
+- [x] `fetch_dependencies.sh` pinned nothing for nextvi/dvtm (HEAD of
+      upstream) — fixed by the submodule conversion above.
