@@ -2,6 +2,7 @@ build/
 third-party/*
 !third-party/libgit2
 !third-party/openrsync
+!third-party/nextvi
 rootfs/
 smallclue
 src/core/build_info.h

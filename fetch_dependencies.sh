@@ -39,76 +39,59 @@ reset_incomplete_repo() {
 }
 
 # --- Nextvi ---
+# Tracked as a git submodule pinned to the `smallclue` branch of
+# emkey1/nextvi (a fork of kyx0r/nextvi with the main()-rename,
+# CR-handling, and ICRNL patches below baked in as commits, instead of
+# reapplying them via sed on every fetch). Falls back to a plain
+# clone+patch for non-git (tarball) checkouts.
+if [ -f .gitmodules ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Initializing nextvi submodule..."
+    git submodule update --init --recursive -- "$THIRD_PARTY_DIR/nextvi"
+fi
 reset_incomplete_repo "$THIRD_PARTY_DIR/nextvi" "1" "vi.c" "term.c"
 if [ ! -d "$THIRD_PARTY_DIR/nextvi" ]; then
-    echo "Cloning nextvi..."
-    git clone https://github.com/kyx0r/nextvi "$THIRD_PARTY_DIR/nextvi"
-    # Pin to a known working commit/tag if possible. Using HEAD for now as it is stable.
-    # (cd "$THIRD_PARTY_DIR/nextvi" && git checkout <hash>)
+    echo "Cloning nextvi (submodule unavailable)..."
+    git clone -b smallclue https://github.com/emkey1/nextvi "$THIRD_PARTY_DIR/nextvi"
+fi
 
-    # Find main file for nextvi
-    NEXTVI_MAIN=$(grep -l "int main" "$THIRD_PARTY_DIR/nextvi"/*.c | head -n 1)
-    if [ -f "$NEXTVI_MAIN" ]; then
-        echo "Patching nextvi main in $NEXTVI_MAIN..."
-        # Match "int main(" and replace with "int nextvi_main_entry("
-        sed -i.bak 's/int main(/int nextvi_main_entry(/g' "$NEXTVI_MAIN"
-        rm -f "${NEXTVI_MAIN}.bak"
-
-        # Add nextvi_reset_state stub if not present
-        if ! grep -q "void nextvi_reset_state" "$NEXTVI_MAIN"; then
-            echo "" >> "$NEXTVI_MAIN"
-            echo "void nextvi_reset_state(void) {}" >> "$NEXTVI_MAIN"
-        fi
-
-    else
-        echo "Could not find nextvi main file."
+# Sanity-check the patches are present (they should already be baked into
+# the fork above; this only fires for the plain-clone fallback pointed at
+# unpatched upstream nextvi).
+NEXTVI_MAIN=$(grep -l "int main" "$THIRD_PARTY_DIR/nextvi"/*.c 2>/dev/null | head -n 1)
+if [ -n "$NEXTVI_MAIN" ]; then
+    echo "Patching nextvi main in $NEXTVI_MAIN..."
+    sed -i.bak 's/int main(/int nextvi_main_entry(/g' "$NEXTVI_MAIN"
+    rm -f "${NEXTVI_MAIN}.bak"
+    if ! grep -q "void nextvi_reset_state" "$NEXTVI_MAIN"; then
+        echo "" >> "$NEXTVI_MAIN"
+        echo "void nextvi_reset_state(void) {}" >> "$NEXTVI_MAIN"
     fi
 fi
 
-# Patch CR handling for nextvi (idempotent)
 VI_C="$THIRD_PARTY_DIR/nextvi/vi.c"
-if [ -f "$VI_C" ]; then
-    # Check if patch is already applied
-    if ! grep -q "case '\\\r':" "$VI_C"; then
-        echo "Patching nextvi CR handling in vi.c..."
-        # Handle CR in command mode
-        # Use single quotes for sed command to handle backslashes correctly
-        sed -i.bak 's/case '\''\\n'\'':/case '\''\\n'\'': case '\''\\r'\'':/g' "$VI_C"
-        rm -f "${VI_C}.bak"
-    else
-        echo "nextvi vi.c already patched for CR handling."
-    fi
+if [ -f "$VI_C" ] && ! grep -q "case '\\\r':" "$VI_C"; then
+    echo "Patching nextvi CR handling in vi.c..."
+    sed -i.bak 's/case '\''\\n'\'':/case '\''\\n'\'': case '\''\\r'\'':/g' "$VI_C"
+    rm -f "${VI_C}.bak"
 fi
 
 LED_C="$THIRD_PARTY_DIR/nextvi/led.c"
-if [ -f "$LED_C" ]; then
-    # Check if patch is already applied (checking one of the changes)
-    if ! grep -q "return c == '\\\r' ? '\\\n' : c;" "$LED_C"; then
-        echo "Patching nextvi CR handling in led.c..."
-        # Handle CR in insert mode (treat as newline)
-        sed -i.bak '/if (c == '\''\\n'\'' || TK_INT(c))/{
-            N
-            s/return c;/return c == '\''\\r'\'' ? '\''\\n'\'' : c;/
-            s/if (c == '\''\\n'\'' || TK_INT(c))/if (c == '\''\\n'\'' || c == '\''\\r'\'' || TK_INT(c))/
-        }' "$LED_C"
-        rm -f "${LED_C}.bak"
-    else
-        echo "nextvi led.c already patched for CR handling."
-    fi
+if [ -f "$LED_C" ] && ! grep -q "return c == '\\\r' ? '\\\n' : c;" "$LED_C"; then
+    echo "Patching nextvi CR handling in led.c..."
+    sed -i.bak '/if (c == '\''\\n'\'' || TK_INT(c))/{
+        N
+        s/return c;/return c == '\''\\r'\'' ? '\''\\n'\'' : c;/
+        s/if (c == '\''\\n'\'' || TK_INT(c))/if (c == '\''\\n'\'' || c == '\''\\r'\'' || TK_INT(c))/
+    }' "$LED_C"
+    rm -f "${LED_C}.bak"
 fi
 
-# Patch term.c to enable ICRNL (map CR to NL on input)
 TERM_C="$THIRD_PARTY_DIR/nextvi/term.c"
-if [ -f "$TERM_C" ]; then
-    if ! grep -q "ICRNL" "$TERM_C"; then
-        echo "Patching nextvi term.c to enable ICRNL..."
-        # Find the line disabling ICANON | ISIG | ECHO and add ICRNL to c_iflag
-        sed -i.bak '/newtermios.c_lflag &= ~(ICANON | ISIG | ECHO);/a \
+if [ -f "$TERM_C" ] && ! grep -q "ICRNL" "$TERM_C"; then
+    echo "Patching nextvi term.c to enable ICRNL..."
+    sed -i.bak '/newtermios.c_lflag &= ~(ICANON | ISIG | ECHO);/a \
 	newtermios.c_iflag |= ICRNL;' "$TERM_C"
-        rm -f "${TERM_C}.bak"
-    else
-        echo "nextvi term.c already patched for ICRNL."
-    fi
+    rm -f "${TERM_C}.bak"
 fi
 
 # --- dvtm ---
