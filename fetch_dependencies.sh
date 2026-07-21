@@ -516,4 +516,34 @@ with open(path, "w") as f:
 PYEOF
 fi
 
+# --- curl (vendored static build) ---
+# Not a submodule/fork like libgit2/openrsync/nextvi/dvtm above -- curl needs
+# no smallclue-specific patching, just a source tree CMakeLists.txt can build
+# itself with its own flags (see the ENABLE_CURL block there for why: the
+# *system* libcurl4-openssl-dev on Debian/Ubuntu bakes in gssapi support that
+# has no static libgssapi_krb5.a to link against at all, so this build vendors
+# and configures its own curl instead of ever relying on that system package).
+# Fetched as a plain release tarball, same pattern as OpenSSH above (release
+# tarballs ship a pre-generated ./configure, no autoreconf needed here either).
+CURL_VERSION="8.21.0"
+if [ -d "$THIRD_PARTY_DIR/curl" ] && [ ! -f "$THIRD_PARTY_DIR/curl/configure" ]; then
+    echo "Removing incomplete curl source at $THIRD_PARTY_DIR/curl..."
+    rm -rf "$THIRD_PARTY_DIR/curl"
+fi
+if [ -d "$THIRD_PARTY_DIR/curl" ] && [ -f "$THIRD_PARTY_DIR/curl/include/curl/curlver.h" ]; then
+    if ! grep -q "LIBCURL_VERSION \"$CURL_VERSION\"" "$THIRD_PARTY_DIR/curl/include/curl/curlver.h"; then
+        echo "Removing outdated curl source (need $CURL_VERSION)..."
+        rm -rf "$THIRD_PARTY_DIR/curl"
+    fi
+fi
+if [ ! -d "$THIRD_PARTY_DIR/curl" ]; then
+    echo "Fetching curl $CURL_VERSION release source..."
+    CURL_TARBALL="$THIRD_PARTY_DIR/curl-${CURL_VERSION}.tar.gz"
+    CURL_URL="https://curl.se/download/curl-${CURL_VERSION}.tar.gz"
+    curl -fL --retry 3 --retry-delay 2 -o "$CURL_TARBALL" "$CURL_URL"
+    mkdir -p "$THIRD_PARTY_DIR/curl"
+    tar -xzf "$CURL_TARBALL" --strip-components=1 -C "$THIRD_PARTY_DIR/curl"
+    rm -f "$CURL_TARBALL"
+fi
+
 echo "Dependencies fetched and patched."

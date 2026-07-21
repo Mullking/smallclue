@@ -77,8 +77,78 @@ int main(void) {
         set(CMAKE_REQUIRED_LIBRARIES "${_smallclue_saved_req_libs}")
         set(CMAKE_REQUIRED_INCLUDES "${_smallclue_saved_req_incs}")
         if(NOT SMALLCLUE_CURL_STATIC_LINKS)
-            message(WARNING "libcurl was found but a real static test-link against it failed in this environment (commonly: this system's curl needs gssapi, and Debian/Ubuntu never ships a static libgssapi_krb5.a at all). Disabling curl support for this static build.")
+            message(WARNING "libcurl was found but a real static test-link against it failed in this environment (commonly: this system's curl needs gssapi, and Debian/Ubuntu never ships a static libgssapi_krb5.a at all). Falling back to a vendored static curl build instead of this system package.")
             set(CURL_FOUND FALSE)
+        endif()
+    endif()
+
+    # The system package is missing, or its static link just failed above --
+    # build our own static libcurl from vendored source instead of the
+    # system one. The Debian/Ubuntu failure this exists to work around is
+    # specifically that their libcurl4-openssl-dev is built with GSS-
+    # Negotiate (gssapi) support baked in, and gssapi/nghttp2/libidn2 are all
+    # auto-probed by curl's own ./configure whenever the matching dev
+    # package happens to be present on the *build* system -- rather than
+    # hand-enumerate and strip each one back out of a moving-target system
+    # curl (fragile, distro-specific, and the gssapi case is flatly
+    # unfixable there at all -- see above), vendor upstream curl's own
+    # release source (fetched by fetch_dependencies.sh, same tarball-fetch
+    # pattern as OpenSSH below) and build it ourselves with those features
+    # explicitly turned off from the start, so the collision this whole
+    # block exists to catch can't recur no matter what else happens to be
+    # installed on the build machine.
+    if(NOT CURL_FOUND AND UNIX AND NOT APPLE)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/curl/configure)
+            find_program(SMALLCLUE_MAKE NAMES make gmake)
+            if(NOT SMALLCLUE_MAKE)
+                message(WARNING "make not found; can't build the vendored static curl. Building without curl support.")
+            else()
+                # curl ships its own autotools ./configure (pre-generated in
+                # the release tarball fetch_dependencies.sh downloads, no
+                # autoreconf needed) -- ExternalProject_Add's CMAKE_ARGS form
+                # doesn't apply here since curl isn't a CMake project;
+                # CONFIGURE_COMMAND/BUILD_COMMAND/INSTALL_COMMAND drive its
+                # configure/make/make-install directly instead. Deliberately
+                # not ${CMAKE_MAKE_PROGRAM} for BUILD_COMMAND/INSTALL_COMMAND:
+                # that's whatever the *outer* project's generator uses (e.g.
+                # ninja, which can't read curl's autotools-generated
+                # Makefile), not necessarily plain make.
+                include(ExternalProject)
+                set(CURL_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third-party/curl)
+                set(CURL_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/curl-build)
+                set(CURL_INSTALL_DIR ${CURL_PREFIX}/install)
+                set(SMALLCLUE_CURL_STATIC_LIBRARY ${CURL_INSTALL_DIR}/lib/libcurl.a)
+                ExternalProject_Add(curl_external
+                    SOURCE_DIR ${CURL_SOURCE_DIR}
+                    PREFIX ${CURL_PREFIX}
+                    CONFIGURE_COMMAND ${CURL_SOURCE_DIR}/configure
+                        --prefix=${CURL_INSTALL_DIR}
+                        CC=${CMAKE_C_COMPILER}
+                        --disable-shared
+                        --enable-static
+                        --with-openssl
+                        --without-nghttp2
+                        --without-libssh2
+                        --without-libpsl
+                        --without-brotli
+                        --without-zstd
+                        --without-libidn2
+                        --disable-ldap
+                        --disable-ldaps
+                        --without-gssapi
+                        --disable-manual
+                    BUILD_COMMAND ${SMALLCLUE_MAKE}
+                    INSTALL_COMMAND ${SMALLCLUE_MAKE} install
+                    BUILD_BYPRODUCTS ${SMALLCLUE_CURL_STATIC_LIBRARY}
+                    BUILD_IN_SOURCE 0
+                )
+                set(CURL_FOUND TRUE)
+                set(SMALLCLUE_CURL_VENDORED TRUE)
+                set(CURL_INCLUDE_DIRS ${CURL_INSTALL_DIR}/include)
+                set(CURL_LIBRARIES ${SMALLCLUE_CURL_STATIC_LIBRARY})
+            endif()
+        else()
+            message(WARNING "third-party/curl missing; run ./fetch_dependencies.sh to vendor a static-link-safe curl build. Building without curl support.")
         endif()
     endif()
 
@@ -613,8 +683,110 @@ int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
 " SMALLCLUE_LIBSSH2_STATIC_LINKS)
             set(CMAKE_REQUIRED_FLAGS "${_smallclue_saved_req_flags}")
             if(NOT SMALLCLUE_LIBSSH2_STATIC_LINKS)
-                message(WARNING "libssh2 found, but its bundled chachapoly cipher collides (duplicate symbol) with OpenSSH's own once both are statically archived into the same binary. Disabling libgit2's SSH transport for this static build -- git/ssh/scp/sftp over SSH still work via the separately-linked OpenSSH applets, just not libgit2's own git+ssh:// remote support.")
-                set(LIBSSH2_FOUND FALSE)
+                # Real fix, instead of just disabling: rename libssh2's two
+                # colliding symbols in a private copy of its static archive,
+                # so its chachapoly.o and OpenSSH's own cipher-chachapoly-
+                # libcrypto.o can both be statically archived into the same
+                # binary without a duplicate-symbol error. Neither `ar` nor
+                # `objcopy` can rewrite symbols inside a .a in place in one
+                # shot portably, so: extract every member out with `ar x`,
+                # run `objcopy --redefine-sym` on each .o (a harmless no-op
+                # on members that don't define either symbol), then
+                # re-archive the renamed members with `ar rcs`.
+                find_program(SMALLCLUE_AR NAMES ar)
+                find_program(SMALLCLUE_OBJCOPY NAMES objcopy)
+                set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+                set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+                find_library(SMALLCLUE_LIBSSH2_STATIC_PATH NAMES ssh2 HINTS ${LIBSSH2_LIBRARY_DIRS})
+                set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+
+                set(SMALLCLUE_LIBSSH2_RENAMED FALSE)
+                if(SMALLCLUE_AR AND SMALLCLUE_OBJCOPY AND SMALLCLUE_LIBSSH2_STATIC_PATH)
+                    set(_smallclue_libssh2_extract_dir ${CMAKE_CURRENT_BINARY_DIR}/libssh2-renamed/extract)
+                    set(SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/libssh2-renamed/libssh2.a)
+                    file(REMOVE_RECURSE ${_smallclue_libssh2_extract_dir})
+                    file(MAKE_DIRECTORY ${_smallclue_libssh2_extract_dir})
+                    execute_process(
+                        COMMAND ${SMALLCLUE_AR} x ${SMALLCLUE_LIBSSH2_STATIC_PATH}
+                        WORKING_DIRECTORY ${_smallclue_libssh2_extract_dir}
+                        RESULT_VARIABLE _smallclue_libssh2_ar_x_result
+                    )
+                    file(GLOB _smallclue_libssh2_objs ${_smallclue_libssh2_extract_dir}/*.o)
+                    set(_smallclue_libssh2_objcopy_ok TRUE)
+                    foreach(_smallclue_obj ${_smallclue_libssh2_objs})
+                        execute_process(
+                            COMMAND ${SMALLCLUE_OBJCOPY}
+                                --redefine-sym chachapoly_crypt=smallclue_libssh2_chachapoly_crypt
+                                --redefine-sym chachapoly_get_length=smallclue_libssh2_chachapoly_get_length
+                                ${_smallclue_obj}
+                            RESULT_VARIABLE _smallclue_libssh2_objcopy_result
+                        )
+                        if(NOT _smallclue_libssh2_objcopy_result EQUAL 0)
+                            set(_smallclue_libssh2_objcopy_ok FALSE)
+                        endif()
+                    endforeach()
+                    if(_smallclue_libssh2_objs AND _smallclue_libssh2_ar_x_result EQUAL 0 AND _smallclue_libssh2_objcopy_ok)
+                        file(REMOVE ${SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE})
+                        execute_process(
+                            COMMAND ${SMALLCLUE_AR} rcs ${SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE} ${_smallclue_libssh2_objs}
+                            RESULT_VARIABLE _smallclue_libssh2_ar_rcs_result
+                        )
+                        if(_smallclue_libssh2_ar_rcs_result EQUAL 0)
+                            # Retest, this time against the renamed archive --
+                            # confirms the rename actually resolved the
+                            # collision instead of just assuming it did (same
+                            # rationale as the original whole-archive test
+                            # above: a plain link that never touches the
+                            # renamed chachapoly members wouldn't prove
+                            # anything either way).
+                            #
+                            # libssh2.a's own crypto backend (crypto.o) and
+                            # optional zlib compression (comp.o) need real
+                            # OpenSSL/zlib symbols to resolve at all -- find_
+                            # package(OpenSSL)/find_package(ZLIB) haven't run
+                            # yet this far up the file (they're below, after
+                            # this whole SMALLCLUE_WITH_LIBGIT2 block), so a
+                            # bare whole-archive link against just libssh2.a
+                            # would fail on unrelated undefined EVP_*/BN_*
+                            # references and misreport this as the rename
+                            # not having worked. Look them up locally instead
+                            # (same .a-preference dance as everywhere else in
+                            # this file) purely to make this probe link
+                            # complete; the real final link further down
+                            # still does its own find_package(OpenSSL)/
+                            # find_package(ZLIB) and target_link_libraries()
+                            # independently of this.
+                            set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+                            set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+                            find_library(SMALLCLUE_LIBSSH2_RETEST_CRYPTO NAMES crypto)
+                            find_library(SMALLCLUE_LIBSSH2_RETEST_Z NAMES z)
+                            find_library(SMALLCLUE_LIBSSH2_RETEST_ZSTD NAMES zstd)
+                            set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+
+                            set(_smallclue_saved_req_flags "${CMAKE_REQUIRED_FLAGS}")
+                            set(_smallclue_saved_req_libs "${CMAKE_REQUIRED_LIBRARIES}")
+                            set(CMAKE_REQUIRED_FLAGS "-static -Wl,--whole-archive ${SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE} -Wl,--no-whole-archive")
+                            set(CMAKE_REQUIRED_LIBRARIES ${SMALLCLUE_LIBSSH2_RETEST_CRYPTO} ${SMALLCLUE_LIBSSH2_RETEST_Z} ${SMALLCLUE_LIBSSH2_RETEST_ZSTD})
+                            check_c_source_compiles("
+int chachapoly_crypt(void) { return 0; }
+int chachapoly_get_length(void) { return 0; }
+int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
+" SMALLCLUE_LIBSSH2_RENAMED_STATIC_LINKS)
+                            set(CMAKE_REQUIRED_FLAGS "${_smallclue_saved_req_flags}")
+                            set(CMAKE_REQUIRED_LIBRARIES "${_smallclue_saved_req_libs}")
+                            if(SMALLCLUE_LIBSSH2_RENAMED_STATIC_LINKS)
+                                set(SMALLCLUE_LIBSSH2_RENAMED TRUE)
+                            endif()
+                        endif()
+                    endif()
+                endif()
+
+                if(SMALLCLUE_LIBSSH2_RENAMED)
+                    message(STATUS "libssh2's chachapoly symbols collided with OpenSSH's; renamed them in a private copy of libssh2's static archive instead of disabling libgit2's SSH transport (${SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE}).")
+                else()
+                    message(WARNING "libssh2 found, but its bundled chachapoly cipher collides (duplicate symbol) with OpenSSH's own once both are statically archived into the same binary, and renaming its symbols via objcopy didn't resolve it either (ar/objcopy missing, or the rename+retest itself failed -- see any errors above). Disabling libgit2's SSH transport for this static build -- git/ssh/scp/sftp over SSH still work via the separately-linked OpenSSH applets, just not libgit2's own git+ssh:// remote support.")
+                    set(LIBSSH2_FOUND FALSE)
+                endif()
             endif()
         endif()
 
@@ -686,6 +858,9 @@ target_link_libraries(smallclue PRIVATE Threads::Threads)
 
 if(ENABLE_CURL)
     target_link_libraries(smallclue PRIVATE ${CURL_LIBRARIES})
+    if(SMALLCLUE_CURL_VENDORED)
+        add_dependencies(smallclue curl_external)
+    endif()
 endif()
 
 if(APPLE)
@@ -785,7 +960,11 @@ if(SMALLCLUE_WITH_LIBGIT2)
     add_dependencies(smallclue libgit2_external)
     target_link_libraries(smallclue PRIVATE ${LIBGIT2_LIBRARY})
     if(SMALLCLUE_LIBGIT2_USE_SSH)
-        target_link_libraries(smallclue PRIVATE PkgConfig::LIBSSH2)
+        if(SMALLCLUE_LIBSSH2_RENAMED)
+            target_link_libraries(smallclue PRIVATE ${SMALLCLUE_LIBSSH2_RENAMED_ARCHIVE})
+        else()
+            target_link_libraries(smallclue PRIVATE PkgConfig::LIBSSH2)
+        endif()
     endif()
     # libgit2.a's openssl.c needs SSL_*/OPENSSL_* symbols, but static linking
     # on Linux is a single left-to-right pass -- since OpenSSL::SSL/Crypto
