@@ -24,9 +24,8 @@
       steps don't need root — only the rootfs/chroot assembly does.
 - [x] **Add CI.** `.github/workflows/build.yml` runs `fetch_dependencies.sh`
       + openssh `./configure` + cmake configure/build/smoke-test on macOS and
-      Linux, on every push/PR to main. macOS path verified locally end-to-end
-      against a fresh clone; Linux path is unverified (no Linux runner
-      available locally) — watch its first run.
+      Linux, on every push/PR to main. Both jobs green on the first real run
+      (github.com/emkey1/smallclue/actions).
 
 ## Known bugs / behavior gaps
 
