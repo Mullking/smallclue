@@ -12,24 +12,21 @@
         renames, musl include guards, showprogress/interrupted aliasing). A
         fork means owning rebases onto upstream releases, including security
         updates — decide if that upkeep is worth it before starting.
-- [ ] **Make the standalone (non-PSCAL-nested) build less fragile.** CMake
-      configure currently fails cryptically if:
-  - `third-party/openrsync/config_pscal.h` is absent (now fixed by the
-    submodule, but the `../../third-party/openrsync` PSCAL-path fallback in
-    CMakeLists.txt is still the first thing tried);
-  - the `setup_posix_env.sh`-generated sources don't exist yet
-    (`src/openssh_globals.c`, `src/runtime_stubs_extra.c`,
-    `src/core/build_info.h`, `third-party/openssh/pscal_runtime_hooks.h`) —
-    these are static content and CMake could just generate them itself;
-  - openssh hasn't been `./configure`d (no `config.h`) — at minimum emit a
-    clear "run X first" error instead of a compiler include failure.
+- [x] **Make the standalone (non-PSCAL-nested) build less fragile.** CMake now
+      self-generates the 4 static stub files that `setup_posix_env.sh` used to
+      (only if absent, so root-built/PSCAL trees are untouched) and fails with
+      a clear, actionable `FATAL_ERROR` naming the exact `./configure` command
+      if `third-party/openssh/config.h` is missing, instead of a bare compiler
+      "file not found". The openrsync `config_pscal.h` gap is separately fixed
+      by the submodule conversion above.
 - [ ] **Split `setup_posix_env.sh` into non-root and root halves.** It demands
       sudo up front, but stub-file generation and the openssh configure/build
       steps don't need root — only the rootfs/chroot assembly does.
-- [ ] **Add CI.** A GitHub Actions job doing `./fetch_dependencies.sh` + cmake
-      configure + build on macOS and Linux would have caught both the
-      sftp-client.c `showprogress` link error and the standalone-openrsync
-      configure failure before any user hit them.
+- [x] **Add CI.** `.github/workflows/build.yml` runs `fetch_dependencies.sh`
+      + openssh `./configure` + cmake configure/build/smoke-test on macOS and
+      Linux, on every push/PR to main. macOS path verified locally end-to-end
+      against a fresh clone; Linux path is unverified (no Linux runner
+      available locally) — watch its first run.
 
 ## Known bugs / behavior gaps
 
