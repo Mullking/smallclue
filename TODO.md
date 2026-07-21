@@ -38,9 +38,8 @@
 
 ## Documentation
 
-- [ ] **COMPARISON.md is stale on the shell:** it says the `sh` applet launches
-      exsh (the PSCAL frontend), but standalone builds now use smallclue's own
-      native POSIX shell (`src/shell/`); exsh is only the embedded-PSCAL
-      (`WITH_EXSH`) behavior. README has it right.
+- [x] **COMPARISON.md was stale on the shell:** fixed to say standalone builds
+      use smallclue's own native POSIX shell (`src/shell/`), with `exsh` only
+      for embedded-PSCAL (`WITH_EXSH`) builds, matching README.
 - [x] `fetch_dependencies.sh` pinned nothing for nextvi/dvtm (HEAD of
       upstream) — fixed by the submodule conversion above.
