@@ -46,11 +46,47 @@ if(ENABLE_CURL)
     if(UNIX AND NOT APPLE)
         set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
     endif()
+
+    if(CURL_FOUND AND UNIX AND NOT APPLE)
+        # A .a on disk doesn't mean it can actually finish a *static* link:
+        # curl packages commonly need gssapi/nghttp2/zstd/brotli/... too,
+        # and which of those apply depends on how this system's curl was
+        # built. Rather than hand-enumerate that transitive set (fragile,
+        # distro-specific, and some of it is unfixable from here at all --
+        # Debian/Ubuntu never ships a static libgssapi_krb5.a, because MIT
+        # krb5's mechanism-glue plugins are designed around dlopen, not
+        # static linking), actually attempt the static link and see.
+        include(CheckCSourceCompiles)
+        set(_smallclue_saved_req_flags "${CMAKE_REQUIRED_FLAGS}")
+        set(_smallclue_saved_req_libs "${CMAKE_REQUIRED_LIBRARIES}")
+        set(_smallclue_saved_req_incs "${CMAKE_REQUIRED_INCLUDES}")
+        set(CMAKE_REQUIRED_FLAGS "-static")
+        set(CMAKE_REQUIRED_LIBRARIES ${CURL_LIBRARIES})
+        set(CMAKE_REQUIRED_INCLUDES ${CURL_INCLUDE_DIRS})
+        check_c_source_compiles("
+#include <curl/curl.h>
+int main(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL *h = curl_easy_init();
+    curl_easy_cleanup(h);
+    curl_global_cleanup();
+    return 0;
+}
+" SMALLCLUE_CURL_STATIC_LINKS)
+        set(CMAKE_REQUIRED_FLAGS "${_smallclue_saved_req_flags}")
+        set(CMAKE_REQUIRED_LIBRARIES "${_smallclue_saved_req_libs}")
+        set(CMAKE_REQUIRED_INCLUDES "${_smallclue_saved_req_incs}")
+        if(NOT SMALLCLUE_CURL_STATIC_LINKS)
+            message(WARNING "libcurl was found but a real static test-link against it failed in this environment (commonly: this system's curl needs gssapi, and Debian/Ubuntu never ships a static libgssapi_krb5.a at all). Disabling curl support for this static build.")
+            set(CURL_FOUND FALSE)
+        endif()
+    endif()
+
     if(CURL_FOUND)
         add_definitions(-DPSCAL_HAS_LIBCURL)
         include_directories(${CURL_INCLUDE_DIRS})
     else()
-        message(WARNING "CURL not found. Building without curl support.")
+        message(WARNING "CURL not found or not usable. Building without curl support.")
         set(ENABLE_CURL OFF)
     endif()
 endif()
@@ -534,6 +570,54 @@ if(SMALLCLUE_WITH_LIBGIT2)
         if(UNIX AND NOT APPLE)
             set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
         endif()
+
+        if(LIBSSH2_FOUND AND UNIX AND NOT APPLE)
+            # libssh2 vendors its own chacha20-poly1305 cipher
+            # (cipher-chachapoly.o: chachapoly_crypt/chachapoly_get_length).
+            # third-party/openssh/cipher-chachapoly-libcrypto.c defines the
+            # exact same two symbol names for smallclue's own ssh/scp/sftp
+            # applets. Dynamically linked, ELF symbol interposition papers
+            # over this; both statically archived into the same binary is a
+            # real "multiple definition" link error. Test-link against
+            # libssh2 with stand-in definitions of the same two symbols to
+            # catch this before it breaks the real (much slower) build.
+            # A plain test link isn't enough: static archives only pull in
+            # the specific .o members needed to resolve some other
+            # outstanding reference, and a trivial test program that never
+            # calls libssh2's real API won't happen to need cipher-
+            # chachapoly.o at all, so the two same-named stand-in symbols
+            # below would just never collide -- proven empirically (an
+            # earlier version of this check, without --whole-archive,
+            # passed here despite the real build failing, and a manual gcc
+            # -static stub.c -Wl,--whole-archive -lssh2 -Wl,--no-whole-archive
+            # reproducing the real "multiple definition" error). Force the
+            # *entire* archive to be linked in instead, so this reflects the
+            # true worst case rather than depending on which specific
+            # libssh2 entry points a minimal test program happens to touch.
+            #
+            # Passed as CMAKE_REQUIRED_FLAGS (a literal flags string), not
+            # CMAKE_REQUIRED_LIBRARIES: the latter goes through CMake's own
+            # target_link_libraries library-graph handling, which is free to
+            # reorder/deduplicate entries and silently breaks the exact
+            # --whole-archive/--no-whole-archive bracketing this needs --
+            # confirmed empirically (that form also reported a false
+            # "Success" here despite the real collision).
+            include(CheckCSourceCompiles)
+            string(REPLACE ";" " " _smallclue_libssh2_ldflags "${LIBSSH2_LDFLAGS}")
+            set(_smallclue_saved_req_flags "${CMAKE_REQUIRED_FLAGS}")
+            set(CMAKE_REQUIRED_FLAGS "-static -Wl,--whole-archive ${_smallclue_libssh2_ldflags} -Wl,--no-whole-archive")
+            check_c_source_compiles("
+int chachapoly_crypt(void) { return 0; }
+int chachapoly_get_length(void) { return 0; }
+int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
+" SMALLCLUE_LIBSSH2_STATIC_LINKS)
+            set(CMAKE_REQUIRED_FLAGS "${_smallclue_saved_req_flags}")
+            if(NOT SMALLCLUE_LIBSSH2_STATIC_LINKS)
+                message(WARNING "libssh2 found, but its bundled chachapoly cipher collides (duplicate symbol) with OpenSSH's own once both are statically archived into the same binary. Disabling libgit2's SSH transport for this static build -- git/ssh/scp/sftp over SSH still work via the separately-linked OpenSSH applets, just not libgit2's own git+ssh:// remote support.")
+                set(LIBSSH2_FOUND FALSE)
+            endif()
+        endif()
+
         if(LIBSSH2_FOUND)
             set(SMALLCLUE_LIBGIT2_USE_SSH ON)
         endif()
