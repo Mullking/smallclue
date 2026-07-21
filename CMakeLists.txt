@@ -32,7 +32,20 @@ endif()
 find_package(Threads REQUIRED)
 
 if(ENABLE_CURL)
+    # Same static-vs-shared story as the FTS_LIBRARY/BSD_LIBRARY/ZLIB/OpenSSL
+    # lookups further down this file: this build links fully static on
+    # UNIX-and-not-Apple (see the target_link_options(-static) block below),
+    # and find_package(CURL) defaults to preferring libcurl.so, which a
+    # static link can't use ("attempted static link of dynamic object").
+    # Prefer the .a explicitly; libcurl4-openssl-dev/libcurl-dev ship both.
+    if(UNIX AND NOT APPLE)
+        set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    endif()
     find_package(CURL)
+    if(UNIX AND NOT APPLE)
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+    endif()
     if(CURL_FOUND)
         add_definitions(-DPSCAL_HAS_LIBCURL)
         include_directories(${CURL_INCLUDE_DIRS})
@@ -506,7 +519,21 @@ if(SMALLCLUE_WITH_LIBGIT2)
         # LIBSSH2_LIBRARIES variable is just "ssh2" with no -L, which fails
         # to link unless libssh2 happens to already be on the linker's
         # default search path.
+        #
+        # Same static-vs-shared story as the FTS_LIBRARY/CURL/ZLIB/OpenSSL
+        # lookups elsewhere in this file: IMPORTED_TARGET resolves the
+        # library to an absolute path via find_library() under the hood, so
+        # it needs the same .a preference on this fully-static
+        # (UNIX-and-not-Apple) build, or the linker fails with "attempted
+        # static link of dynamic object" against libssh2.so.
+        if(UNIX AND NOT APPLE)
+            set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+            set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+        endif()
         pkg_check_modules(LIBSSH2 QUIET IMPORTED_TARGET libssh2)
+        if(UNIX AND NOT APPLE)
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+        endif()
         if(LIBSSH2_FOUND)
             set(SMALLCLUE_LIBGIT2_USE_SSH ON)
         endif()
@@ -586,6 +613,20 @@ if(UNIX AND NOT APPLE)
     # OpenSSH/su's crypt() calls are in libm/libcrypt on glibc; both are
     # part of libSystem on Darwin, hence the UNIX-and-not-APPLE guard.
     target_link_libraries(smallclue PRIVATE m crypt)
+
+    # Every consumer that has relied on this build (AetherOS's initramfs
+    # stage-1 /bin/sh chief among them) needs a fully static binary, and the
+    # rest of this file already assumes one -- the FTS_LIBRARY/BSD_LIBRARY
+    # and ZLIB/OpenSSL .a-preference blocks below only make sense against a
+    # static final link. Nothing actually forced -static, though, so a plain
+    # `cmake --build` silently produced a dynamically-linked binary: no
+    # build-time warning, just a binary that needs libc/libm/libcrypt.so at
+    # runtime instead of none, surfacing (for the initramfs case) as an
+    # opaque kernel panic at boot, stages removed from the build. Apple
+    # platforms (including the PSCAL/iOS embedded target, which links into a
+    # host app rather than running standalone) are excluded on purpose:
+    # Darwin ships no static libc to link against.
+    target_link_options(smallclue PRIVATE -static)
 endif()
 
 # musl libc (Alpine, aarch64-linux-musl) has no <fts.h>/libfts -- glibc and
@@ -630,9 +671,31 @@ set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
 set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
+# This system's libcrypto.a was built with its optional zlib/zstd BIO
+# compression filters compiled in (c_zlib.o/c_zstd.o) -- those object files
+# get pulled into any static link that needs libcrypto.a at all (regardless
+# of whether smallclue itself calls BIO_f_zlib()/BIO_f_zstd()), and they
+# reference zlib's compress()/uncompress() and libzstd's ZSTD_* API in turn.
+# Optional (not REQUIRED): older/leaner OpenSSL builds (e.g. Alpine's,
+# musl) don't compile zstd support in at all, so libzstd may legitimately
+# not be needed there.
+find_library(ZSTD_LIBRARY zstd)
 set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
 target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
 target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+# Static linking on Linux is a single left-to-right pass -- ZLIB::ZLIB was
+# already listed *before* OpenSSL::SSL/Crypto above, so by the time the
+# linker reaches libcrypto.a's own internal reference to zlib's
+# compress()/uncompress(), it has already passed libz.a in the link line and
+# won't look back. Re-list ZLIB::ZLIB (and libzstd, if present) after
+# OpenSSL so they're available on this later pass too -- same fix as the
+# libgit2.a re-list of OpenSSL::SSL/Crypto below.
+target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
+if(ZSTD_LIBRARY)
+    target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
+else()
+    message(WARNING "libzstd not found; if this OpenSSL build has zstd BIO support compiled in, the static link will fail with undefined ZSTD_* references. Install libzstd-dev (Debian/Ubuntu) or equivalent.")
+endif()
 
 if(SMALLCLUE_WITH_LIBGIT2)
     add_dependencies(smallclue libgit2_external)
@@ -647,6 +710,9 @@ if(SMALLCLUE_WITH_LIBGIT2)
     # unresolved references. Re-list them after libgit2.a so they're
     # available on this later pass too.
     target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(ZSTD_LIBRARY)
+        target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
+    endif()
 endif()
 
 if(APPLE)
@@ -656,6 +722,29 @@ if(APPLE)
         # libgit2's default macOS TLS backend is SecureTransport (stransport.c),
         # which needs Security.framework and CoreFoundation.
         target_link_libraries(smallclue PRIVATE "-framework Security" "-framework CoreFoundation")
+    endif()
+endif()
+
+# Fail the build loudly if the -static request above didn't actually take
+# (e.g. a future change to this file drops it, or a toolchain silently
+# ignores it). Checking readelf's dynamic-section NEEDED entries rather than
+# `ldd`'s exit status: it only parses ELF headers instead of ever executing
+# the freshly-built binary, and its behavior doesn't vary between glibc and
+# musl targets the way `ldd` invocations can. Deferring this to boot time (a
+# static-only consumer like AetherOS's initramfs stage-1 /bin/sh gets an
+# opaque "cannot open shared object file" -> kernel panic three build stages
+# later) is exactly the failure mode this exists to catch at build time
+# instead.
+if(UNIX AND NOT APPLE)
+    find_program(SMALLCLUE_READELF readelf)
+    if(SMALLCLUE_READELF)
+        add_custom_command(TARGET smallclue POST_BUILD
+            COMMAND sh -c "if \"${SMALLCLUE_READELF}\" -d \"$<TARGET_FILE:smallclue>\" 2>/dev/null | grep -q NEEDED; then echo 'FATAL: smallclue linked dynamically (found NEEDED entries) -- expected a fully static binary on UNIX-and-not-Apple builds. See CMakeLists.txt UNIX-AND-NOT-APPLE target_link_options(-static) block.' >&2; \"${SMALLCLUE_READELF}\" -d \"$<TARGET_FILE:smallclue>\" >&2; exit 1; fi"
+            COMMENT "Verifying smallclue linked fully static"
+            VERBATIM
+        )
+    else()
+        message(WARNING "readelf not found; skipping the post-build static-link check for smallclue. Verify manually (e.g. `ldd`/`readelf -d`) before relying on this binary as a static bootstrap/initramfs userland.")
     endif()
 endif()
 
