@@ -16335,11 +16335,19 @@ static int smallclueDateCommand(int argc, char **argv) {
             return 1;
         }
         if (set_spec) {
+#if defined(PSCAL_TARGET_IOS)
+            /* clock_settime() is unavailable on iOS, and a sandboxed app could not
+               set the system clock even if it were. Fail rather than silently
+               pretending the date was changed. */
+            fprintf(stderr, "date: cannot set date: not supported on iOS\n");
+            return 1;
+#else
             struct timespec ts = {.tv_sec = now, .tv_nsec = 0};
             if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
                 fprintf(stderr, "date: cannot set date: %s\n", strerror(errno));
                 return 1;
             }
+#endif
         }
     } else {
         now = time(NULL);
