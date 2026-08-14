@@ -4,6 +4,7 @@
  * See Docs/notes_smallclu_ios.md for the full checklist before landing changes.
  */
 #include "smallclue.h"
+#include "spawn.h"
 
 #include "common/runtime_tty.h"
 #include "dvtm_app.h"
@@ -3935,15 +3936,10 @@ static int smallclueXargsRunOne(char **cmdArgv, int cmdArgc, bool verbose) {
     if (target) {
         return smallclueDispatchApplet(target, cmdArgc, cmdArgv);
     }
-    pid_t pid = fork();
+    pid_t pid = smallclueSpawnSimple(cmdArgv[0], cmdArgv, 1);
     if (pid < 0) {
-        fprintf(stderr, "xargs: fork: %s\n", strerror(errno));
-        return 1;
-    }
-    if (pid == 0) {
-        execvp(cmdArgv[0], cmdArgv);
         fprintf(stderr, "xargs: %s: %s\n", cmdArgv[0], strerror(errno));
-        _exit(127);
+        return 1;
     }
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
@@ -5356,16 +5352,12 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
     }
     char **cmdArgv = &argv[argi];
 
-    pid_t pid = fork();
+    SmallclueSpawnAttempt timeoutAttempt = { cmdArgv[0], cmdArgv, 1 };
+    SmallclueSpawnRequest timeoutRequest = { &timeoutAttempt, 1, 1 };
+    pid_t pid = smallclueSpawn(&timeoutRequest);
     if (pid < 0) {
-        fprintf(stderr, "timeout: fork: %s\n", strerror(errno));
-        return 125;
-    }
-    if (pid == 0) {
-        setpgid(0, 0);
-        execvp(cmdArgv[0], cmdArgv);
         fprintf(stderr, "timeout: %s: %s\n", cmdArgv[0], strerror(errno));
-        _exit(127);
+        return 125;
     }
     setpgid(pid, pid);
 
@@ -21169,16 +21161,11 @@ static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc)
     }
     argvCopy[execArgc] = NULL;
 
-    pid_t pid = fork();
+    pid_t pid = smallclueSpawnSimple(argvCopy[0], argvCopy, 1);
     if (pid < 0) {
-        fprintf(stderr, "find: fork: %s\n", strerror(errno));
+        fprintf(stderr, "find: %s: %s\n", argvCopy[0], strerror(errno));
         free(argvCopy);
         return 1;
-    }
-    if (pid == 0) {
-        execvp(argvCopy[0], argvCopy);
-        fprintf(stderr, "find: %s: %s\n", argvCopy[0], strerror(errno));
-        _exit(127);
     }
     free(argvCopy);
     int childStatus = 0;
