@@ -4860,7 +4860,72 @@ static unsigned long long smallclueTopPrevTicksFor(const SmallclueTopPrevTicks *
     return 0;
 }
 
+
+/* Interactive quit for top.
+ *
+ * The loop below used to end only at --iterations or on a signal, so `q` did
+ * nothing -- there was no key handling in this build at all. (The
+ * PSCAL_TARGET_IOS variant above has its own.)
+ *
+ * Reads are made non-blocking through termios rather than O_NONBLOCK or
+ * select(): VMIN=0/VTIME=0 makes read() return 0 immediately when no key is
+ * waiting, which needs nothing beyond tcsetattr and works on a host where
+ * select is unavailable.
+ *
+ * ISIG is deliberately left enabled, so ^C and ^Z keep working as before; only
+ * line-buffering and echo are turned off. If the process is killed rather than
+ * quitting through 'q', the terminal is left in cbreak -- `stty sane` restores
+ * it -- which is the usual trade for a full-screen tool.
+ */
+#define SMALLCLUE_TOP_POLL_SECONDS 0.1
+
+typedef struct {
+    bool active;
+    struct termios saved;
+} SmallclueTopKeys;
+
+static void smallclueTopSetupKeys(SmallclueTopKeys *keys) {
+    keys->active = false;
+    if (!isatty(STDIN_FILENO)) {
+        return;   /* piped or redirected: nothing to read, leave it alone */
+    }
+    if (tcgetattr(STDIN_FILENO, &keys->saved) != 0) {
+        return;
+    }
+    struct termios raw = keys->saved;
+    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+        return;
+    }
+    keys->active = true;
+}
+
+static void smallclueTopRestoreKeys(SmallclueTopKeys *keys) {
+    if (keys->active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &keys->saved);
+        keys->active = false;
+    }
+}
+
+static bool smallclueTopQuitRequested(SmallclueTopKeys *keys) {
+    if (!keys->active) {
+        return false;
+    }
+    char c;
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, &c, 1)) > 0) {
+        if (c == 'q' || c == 'Q') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int smallclueTopCommand(int argc, char **argv) {
+    SmallclueTopKeys keys;
+    smallclueTopSetupKeys(&keys);
     smallclueResetGetopt();
     smallclueClearPendingSignals();
     double delay = 3.0;
@@ -5048,19 +5113,36 @@ static int smallclueTopCommand(int argc, char **argv) {
             if (iterations >= max_iterations) break;
         }
 
-        struct timespec ts;
-        ts.tv_sec = (time_t)delay;
-        ts.tv_nsec = (long)((delay - (double)ts.tv_sec) * 1e9);
-        if (ts.tv_nsec < 0) ts.tv_nsec = 0;
-        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-            if (smallclueShouldAbort(&abort_status)) {
-                status = abort_status;
-                free(prev);
-                return status;
+        /* Sleep in slices so a keypress is noticed promptly, instead of one
+         * long nanosleep that only ends on a signal. This is what makes 'q'
+         * work: the interval is still `delay`, just checked in pieces. */
+        double remaining = delay;
+        bool quit = false;
+        while (remaining > 0.0) {
+            double slice = remaining < SMALLCLUE_TOP_POLL_SECONDS
+                               ? remaining : SMALLCLUE_TOP_POLL_SECONDS;
+            struct timespec ts;
+            ts.tv_sec = (time_t)slice;
+            ts.tv_nsec = (long)((slice - (double)ts.tv_sec) * 1e9);
+            if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+            while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+                if (smallclueShouldAbort(&abort_status)) {
+                    status = abort_status;
+                    smallclueTopRestoreKeys(&keys);
+                    free(prev);
+                    return status;
+                }
             }
+            if (smallclueTopQuitRequested(&keys)) {
+                quit = true;
+                break;
+            }
+            remaining -= slice;
         }
+        if (quit) break;
     }
 
+    smallclueTopRestoreKeys(&keys);
     free(prev);
     return status;
 }
