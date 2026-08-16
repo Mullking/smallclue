@@ -4,6 +4,7 @@ third-party/*
 !third-party/openrsync
 !third-party/nextvi
 !third-party/dvtm
+!third-party/openssh
 rootfs/
 smallclue
 src/core/build_info.h

@@ -11,3 +11,6 @@
 [submodule "third-party/dvtm"]
 	path = third-party/dvtm
 	url = https://github.com/emkey1/dvtm.git
+[submodule "third-party/openssh"]
+	path = third-party/openssh
+	url = https://github.com/emkey1/openssh.git
