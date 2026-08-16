@@ -21524,35 +21524,50 @@ static int smallclueFindCommand(int argc, char **argv) {
     }
 
     /* -maxdepth/-mindepth are global traversal options in real find, not
-     * expression terms -- pull them out of argv wherever they appear
-     * (compacting the array in place) before handing the rest to the
-     * boolean-expression parser. */
-    for (int i = index; i < argc; ) {
+     * expression terms -- pull them out wherever they appear before handing
+     * the rest to the boolean-expression parser, gathering the survivors into
+     * a vector of our own rather than compacting argv (see
+     * smallclueBorrowArgs). Unlike the other applets these two options take a
+     * value, so a removal drops a pair; that only makes compacting in place
+     * worse, as it would leave TWO stale pointers in the tail. */
+    int nargs = 0;
+    char **args = smallclueBorrowArgs("find", argc, argv, &nargs);
+    if (!args) {
+        return 1;
+    }
+    for (int i = 1; i < index; ++i) {
+        args[nargs++] = argv[i];
+    }
+    for (int i = index; i < argc; ++i) {
         if (strcmp(argv[i], "-maxdepth") == 0 || strcmp(argv[i], "-mindepth") == 0) {
             bool isMax = (argv[i][2] == 'a');
             if (i + 1 >= argc) {
                 fprintf(stderr, "find: missing argument to %s\n", argv[i]);
+                free(args);
                 return 1;
             }
             int value = atoi(argv[i + 1]);
             if (isMax) opts.maxDepth = value; else opts.minDepth = value;
-            for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
-            argc -= 2;
+            ++i; /* the value goes with it */
             continue;
         }
-        i++;
+        args[nargs++] = argv[i];
     }
 
+    /* An -exec node keeps a slice of this vector (node->execArgv), so args has
+     * to stay alive across the walk below, not just the parse. */
     bool hadAction = false;
     int parseIdx = index;
     SmallclueFindNode *root = NULL;
-    if (parseIdx < argc) {
-        root = smallclueFindParseOr(argv, argc, &parseIdx, &hadAction);
+    if (parseIdx < nargs) {
+        root = smallclueFindParseOr(args, nargs, &parseIdx, &hadAction);
         if (!root) {
+            free(args);
             return 1;
         }
-        if (parseIdx != argc) {
-            fprintf(stderr, "find: unexpected token '%s'\n", argv[parseIdx]);
+        if (parseIdx != nargs) {
+            fprintf(stderr, "find: unexpected token '%s'\n", args[parseIdx]);
+            free(args);
             return 1;
         }
     }
@@ -21573,6 +21588,7 @@ static int smallclueFindCommand(int argc, char **argv) {
 
     int status = 0;
     smallclueFindVisit(start, &opts, &status, 0);
+    free(args);
     return status ? 1 : 0;
 }
 
