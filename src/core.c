@@ -5197,7 +5197,13 @@ static bool smallclueParseSignal(const char *spec, int *out) {
         char *end = NULL;
         errno = 0;
         long val = strtol(spec, &end, 10);
-        if (errno != 0 || !end || *end != '\0' || val <= 0 || val > NSIG) {
+        /* 0 is a real signal number to kill(2): it validates the pid and
+         * permission and sends nothing, which is the standard "does this
+         * process still exist" idiom (`kill -0 $pid`). Rejecting it made
+         * that read as "kill: invalid signal '0'". timeout's parser shares
+         * this function; `timeout -s 0` is merely useless there, not
+         * dangerous, and kill(pid, 0) is what it would do. */
+        if (errno != 0 || !end || *end != '\0' || val < 0 || val > NSIG) {
             return false;
         }
         *out = (int)val;
@@ -5235,11 +5241,22 @@ static int smallclueKillCommandOriginal(int argc, char **argv) {
             smallclueKillListSignals();
             return 0;
         }
-        if (!smallclueParseSignal(spec, &signo)) {
+        /* POSIX spells the signal as a separate argument: `kill -s TERM pid`.
+         * Without this the 's' was parsed as the signal name itself and the
+         * command failed with "invalid signal 's'". */
+        if (strcmp(spec, "s") == 0) {
+            if (idx + 1 >= argc || !smallclueParseSignal(argv[idx + 1], &signo)) {
+                fprintf(stderr, "kill: invalid signal '%s'\n",
+                        (idx + 1 < argc) ? argv[idx + 1] : "");
+                return 1;
+            }
+            idx += 2;
+        } else if (!smallclueParseSignal(spec, &signo)) {
             fprintf(stderr, "kill: invalid signal '%s'\n", spec);
             return 1;
+        } else {
+            idx++;
         }
-        idx++;
     }
     if (idx >= argc) {
         fprintf(stderr, "usage: kill [-SIGNAL] pid...\n");
@@ -13571,23 +13588,24 @@ static int smallclueTimeRunCommand(int argc, char **argv) {
     fprintf(stderr, "time: %s: command not found\n", argv[0]);
     return 127;
 #else
-    /* Not a built-in applet -- fork+execvp it like a real shell would,
+    /* Not a built-in applet -- spawn+execvp it like a real shell would,
      * instead of just reporting "command not found". The iOS build has
      * its own shebang-aware resolver above; on Linux/generic Unix,
      * execvp already handles PATH search and the kernel handles
-     * shebangs directly, so a plain fork+execvp is sufficient (same
-     * pattern already used by xargs's external-binary fallback and by
-     * timeout's child). */
-    pid_t pid = fork();
+     * shebangs directly, so a plain spawn is sufficient.
+     *
+     * smallclueSpawnSimple rather than a bare fork(): this is the same
+     * fork-and-exec idiom xargs and timeout use, and they were converted
+     * for the reason spawn.h gives -- a platform that runs smallclue as
+     * host code inside one process has no fork() to return twice. On
+     * iSH-AOK this path used to die with "time: fork: Function not
+     * implemented", so `time echo hi` (an applet) worked and
+     * `time /bin/true` (a real program) did not. */
+    pid_t pid = smallclueSpawnSimple(argv[0], argv, 1);
     if (pid < 0) {
-        fprintf(stderr, "time: fork: %s\n", strerror(errno));
-        return 126;
-    }
-    if (pid == 0) {
-        execvp(argv[0], argv);
         int err = errno;
         fprintf(stderr, "time: %s: %s\n", argv[0], strerror(err));
-        _exit((err == ENOENT) ? 127 : 126);
+        return (err == ENOENT) ? 127 : 126;
     }
     int wait_status = 0;
     while (waitpid(pid, &wait_status, 0) < 0) {
@@ -15084,7 +15102,14 @@ static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
     while ((sum >> 16) != 0) {
         sum = (sum & 0xffffu) + (sum >> 16);
     }
-    return (uint16_t)~sum;
+    /* htons, because the loop above reads each 16-bit word BIG-endian
+     * ((bytes[0] << 8) | bytes[1]) and so produces the sum in host order,
+     * while icmp_cksum is a network-order field. Without this the two bytes
+     * go out swapped on a little-endian host: the packet is well-formed and
+     * send() succeeds, the far end silently discards it as corrupt, and
+     * every reply times out -- which is exactly how `ping` presented on
+     * iSH-AOK (100% loss to a host that answers a system ping fine). */
+    return htons((uint16_t)~sum);
 }
 
 /* Note on the `ident` parameter: Linux's unprivileged ICMP "ping socket"
@@ -15512,10 +15537,25 @@ static int smallclueTelnetCommand(int argc, char **argv) {
         }
     }
     if (optind >= argc) {
-        fprintf(stderr, "usage: telnet [-p PORT] HOST\n");
+        fprintf(stderr, "usage: telnet [-p PORT] HOST [PORT]\n");
         return 1;
     }
     const char *host = argv[optind];
+    /* `telnet HOST PORT` -- the form every telnet since 4.2BSD has taken, and
+     * the one people actually type. Without it the port was silently ignored
+     * and `telnet example.com 80` went to port 23 and hung, which reads as a
+     * broken telnet rather than as an unsupported spelling. -p still works and
+     * wins if both are given, since it was here first. */
+    if (optind + 1 < argc && port == TELNET_DEFAULT_PORT) {
+        const char *spec = argv[optind + 1];
+        char *end = NULL;
+        long parsed = strtol(spec, &end, 10);
+        if (end == spec || *end != '\0' || parsed <= 0 || parsed > 65535) {
+            fprintf(stderr, "telnet: invalid port '%s'\n", spec);
+            return 1;
+        }
+        port = (int) parsed;
+    }
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
@@ -15713,7 +15753,7 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
             struct sockaddr_in reply_addr;
             socklen_t rlen = sizeof(reply_addr);
             ssize_t n = recvfrom(recv_sock, buf, sizeof(buf), 0, (struct sockaddr *)&reply_addr, &rlen);
-            if (n < (ssize_t)(sizeof(struct ip) + sizeof(struct icmp))) {
+            if (n < (ssize_t)ICMP_MINLEN) {
                 printf(" *");
                 fflush(stdout);
                 continue;
@@ -15722,9 +15762,31 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
             gettimeofday(&end, NULL);
             double rtt = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_usec - start.tv_usec) / 1000.0;
 
-            struct ip *ip_hdr = (struct ip *)buf;
-            int ip_hdr_len = ip_hdr->ip_hl << 2;
-            struct icmp *icmp_hdr = (struct icmp *)(buf + ip_hdr_len);
+            /* Whether the outer IP header comes with the datagram is a
+             * property of the stack, not of the protocol: a BSD raw socket
+             * delivers it, Linux's unprivileged ping socket strips it, and
+             * iSH-AOK strips it too (its kernel sets IP_STRIPHDR on every
+             * AF_INET SOCK_DGRAM socket). This used to assume the BSD form
+             * and require 48 bytes, so a stripped 36-byte ICMP
+             * time-exceeded was discarded and EVERY hop printed `*`.
+             *
+             * Detected per packet rather than by #ifdef, and the same way
+             * smallcluePingDecodeReply already does it: an IPv4 header
+             * begins with version 4 in the high nibble, and no ICMP type
+             * this reads (11 time-exceeded, 3 unreachable) can be mistaken
+             * for one. */
+            size_t icmp_off = 0;
+            if (n >= (ssize_t)(sizeof(struct ip) + ICMP_MINLEN)) {
+                const struct ip *ip_hdr = (const struct ip *)buf;
+                if (ip_hdr->ip_v == 4) {
+                    size_t ip_hdr_len = (size_t)ip_hdr->ip_hl << 2;
+                    if (ip_hdr_len >= sizeof(struct ip) &&
+                            n >= (ssize_t)(ip_hdr_len + ICMP_MINLEN)) {
+                        icmp_off = ip_hdr_len;
+                    }
+                }
+            }
+            struct icmp *icmp_hdr = (struct icmp *)(buf + icmp_off);
 
             printf(" %s  %.3f ms", inet_ntoa(reply_addr.sin_addr), rtt);
             got_reply = true;
@@ -20114,6 +20176,13 @@ typedef struct SmallclueGrepOptions {
     bool matchOnly;      /* -o */
     bool wordMatch;      /* -w */
     bool lineMatch;      /* -x */
+    bool quiet;          /* -q: no output, exit 0 on the first match */
+    bool filesWith;      /* -l: print the name of each matching file, once */
+    bool filesWithout;   /* -L: and the inverse */
+    bool noMessages;     /* -s: suppress unreadable-file complaints */
+    bool noFilename;     /* -h: never prefix with the file name */
+    bool withFilename;   /* -H: always prefix, even for one file */
+    bool fixedStrings;   /* -F: the pattern is literal text, not a regex */
 } SmallclueGrepOptions;
 
 static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
@@ -20145,6 +20214,11 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
         bool found = smallclueGrepMatchesEx(line, matchLen, re, opts->wordMatch, opts->lineMatch, NULL);
         if (opts->invertMatch ? !found : found) {
             status = 0;
+            /* -q is an early exit, not just silence: `grep -q pat huge-file`
+               must stop reading at the first match, which is most of why
+               scripts use it. -l likewise needs only the first. */
+            if (opts->quiet || opts->filesWith || opts->filesWithout)
+                break;
             if (opts->countOnly) {
                 matchCount++;
             } else if (opts->matchOnly && !opts->invertMatch) {
@@ -20165,10 +20239,19 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
             }
         }
     }
-    if (opts->countOnly) {
+    if (opts->quiet) {
+        /* Nothing at all on stdout; the exit status is the whole answer. */
+    } else if (opts->filesWith) {
+        if (status == 0) printf("%s\n", label);
+    } else if (opts->filesWithout) {
+        if (status != 0) printf("%s\n", label);
+    } else if (opts->countOnly) {
         if (opts->multiplePaths) printf("%s:", label);
         printf("%ld\n", matchCount);
     }
+    /* -L inverts what "success" means for the caller. */
+    if (opts->filesWithout)
+        status = (status == 0) ? 1 : 0;
     free(line);
     return status;
 }
@@ -20176,19 +20259,19 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
 static void smallclueGrepWalkPath(const char *path, const regex_t *re, const SmallclueGrepOptions *opts, int *status) {
     struct stat st;
     if (lstat(path, &st) != 0) {
-        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
         *status = *status == 0 ? 0 : 2;
         return;
     }
     if (S_ISDIR(st.st_mode)) {
         if (!opts->recursive) {
-            fprintf(stderr, "grep: %s: is a directory\n", path);
+            if (!opts->noMessages) fprintf(stderr, "grep: %s: is a directory\n", path);
             *status = *status == 0 ? 0 : 2;
             return;
         }
         DIR *dir = opendir(path);
         if (!dir) {
-            fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+            if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
             *status = *status == 0 ? 0 : 2;
             return;
         }
@@ -20210,7 +20293,7 @@ static void smallclueGrepWalkPath(const char *path, const regex_t *re, const Sma
     }
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
         *status = *status == 0 ? 0 : 2;
         return;
     }
@@ -20272,6 +20355,41 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 index++;
                 continue;
             }
+            if (strcmp(arg, "--quiet") == 0 || strcmp(arg, "--silent") == 0) {
+                opts.quiet = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--files-with-matches") == 0) {
+                opts.filesWith = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--files-without-match") == 0) {
+                opts.filesWithout = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--no-messages") == 0) {
+                opts.noMessages = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--fixed-strings") == 0) {
+                opts.fixedStrings = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--no-filename") == 0) {
+                opts.noFilename = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--with-filename") == 0) {
+                opts.withFilename = true;
+                index++;
+                continue;
+            }
             if (strcmp(arg, "--only-matching") == 0) {
                 opts.matchOnly = true;
                 index++;
@@ -20322,6 +20440,21 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 opts.wordMatch = true;
             } else if (*opt == 'x') {
                 opts.lineMatch = true;
+            } else if (*opt == 'q') {
+                opts.quiet = true;
+            } else if (*opt == 'l') {
+                opts.filesWith = true;
+            } else if (*opt == 'L') {
+                opts.filesWithout = true;
+            } else if (*opt == 's') {
+                opts.noMessages = true;
+            } else if (*opt == 'h') {
+                opts.noFilename = true;
+            } else if (*opt == 'H') {
+                opts.withFilename = true;
+            } else if (*opt == 'F') {
+                /* Fixed strings. Handled where the regex is compiled. */
+                opts.fixedStrings = true;
             } else {
                 fprintf(stderr, "grep: unsupported option -%c\n", *opt);
                 return 1;
@@ -20334,6 +20467,27 @@ static int smallclueGrepCommand(int argc, char **argv) {
         return 1;
     }
     const char *pattern = argv[index++];
+
+    /* -F means the pattern is literal. Rather than carry a second matcher
+       through every path above, quote the metacharacters and let the existing
+       regex engine do it: same result, and -w/-x/-o keep working unchanged. */
+    char *literal = NULL;
+    if (opts.fixedStrings) {
+        size_t n = strlen(pattern);
+        literal = (char *)malloc(n * 2 + 1);
+        if (!literal) {
+            fprintf(stderr, "grep: out of memory\n");
+            return 2;
+        }
+        char *w = literal;
+        for (const char *r = pattern; *r; ++r) {
+            if (strchr(".[]{}()*+?^$|\\", *r))
+                *w++ = '\\';
+            *w++ = *r;
+        }
+        *w = '\0';
+        pattern = literal;
+    }
 
     regex_t re;
     int reFlags = (extendedRegex ? REG_EXTENDED : 0) | (ignoreCase ? REG_ICASE : 0);
@@ -20356,6 +20510,10 @@ static int smallclueGrepCommand(int argc, char **argv) {
         status = smallclueGrepScanStream(stdin, "(standard input)", &re, &opts);
     } else {
         opts.multiplePaths = (paths > 1) || opts.recursive;
+        /* Explicit -h/-H beat the "more than one file" heuristic, which is why
+           scripts use them: `grep -h pat a b` must not prefix. */
+        if (opts.noFilename) opts.multiplePaths = false;
+        if (opts.withFilename) opts.multiplePaths = true;
         status = 1;
         for (int i = index; i < argc; ++i) {
             smallclueGrepWalkPath(argv[i], &re, &opts, &status);
@@ -25194,19 +25352,25 @@ static int smallclueInitCommand(int argc, char **argv) {
     char rcPath[PATH_MAX];
     if (smallclueResolveEtcEntry("rc", F_OK, rcPath, sizeof(rcPath))) {
         printf("smallclue init: running %s\n", rcPath);
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl(rcPath, rcPath, NULL);
-            int execErr = errno;
-            char exshPath[PATH_MAX];
-            if ((execErr == EACCES || execErr == ENOEXEC || execErr == ENOTSUP || execErr == EPERM) &&
-                smallclueResolveExshPath(exshPath, sizeof(exshPath))) {
-                execl(exshPath, exshPath, rcPath, NULL);
-                execErr = errno;
-            }
-            fprintf(stderr, "init: failed to exec '%s': %s\n", rcPath, strerror(execErr));
-            _exit(127);
-        } else if (pid > 0) {
+        /* The exec cascade -- rc itself, then rc under exsh if it turns out
+         * not to be directly executable -- expressed as spawn.h's attempt
+         * list rather than as fork()-and-try-each-in-the-child. That is what
+         * the list is for: a platform running smallclue as host code inside
+         * one process (iSH-AOK) has no fork() to return twice, and the raw
+         * fork() here failed with ENOSYS, so init on such a platform printed
+         * "fork failed for /etc/rc" and supervised nothing. */
+        char *rcArgv[] = { (char *)rcPath, NULL };
+        char exshPath[PATH_MAX];
+        char *exshArgv[] = { exshPath, (char *)rcPath, NULL };
+        SmallclueSpawnAttempt initAttempts[2];
+        size_t initAttemptCount = 0;
+        initAttempts[initAttemptCount++] = (SmallclueSpawnAttempt){ rcPath, rcArgv, 0 };
+        if (smallclueResolveExshPath(exshPath, sizeof(exshPath))) {
+            initAttempts[initAttemptCount++] = (SmallclueSpawnAttempt){ exshPath, exshArgv, 0 };
+        }
+        SmallclueSpawnRequest initRequest = { initAttempts, initAttemptCount, 0 };
+        pid_t pid = smallclueSpawn(&initRequest);
+        if (pid > 0) {
             /* A single waitpid(pid, ...) here only ever reaps rc itself --
              * for the entire time rc is running (which for an interactive
              * session can be the whole guest lifetime), any orphaned or
@@ -25251,7 +25415,7 @@ static int smallclueInitCommand(int argc, char **argv) {
                 }
             }
         } else {
-            fprintf(stderr, "init: fork failed for %s: %s\n", rcPath, strerror(errno));
+            fprintf(stderr, "init: failed to start %s: %s\n", rcPath, strerror(errno));
         }
     } else {
         const char *etcRoot = getenv("PSCALI_ETC_ROOT");
@@ -25349,11 +25513,14 @@ static int smallclueRunitCommand(int argc, char **argv) {
 
         if (access(path, X_OK) == 0) {
             printf("runit: starting %s\n", entry->d_name);
-            pid_t pid = fork();
-            if (pid == 0) {
-                execl(path, path, NULL);
+            /* smallclueSpawnSimple, not fork()+execl: see spawn.h. The
+             * fork() this replaces returned -1 on a platform without one,
+             * and nothing here inspected the result, so runit announced
+             * "starting NAME", started nothing, and then sat in the reap
+             * loop below forever with no children to reap. */
+            char *runArgv[] = { path, NULL };
+            if (smallclueSpawnSimple(path, runArgv, 0) < 0) {
                 fprintf(stderr, "runit: failed to exec %s: %s\n", path, strerror(errno));
-                exit(127);
             }
         }
     }
