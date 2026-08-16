@@ -2422,6 +2422,20 @@ int smallclueRunSshCopyId(int argc, char **argv) {
         goto smallclue_ssh_copy_id_cleanup;
     }
 
+    /* Say what is about to happen, as upstream's ssh-copy-id does. This is a
+       C reimplementation rather than the contrib shell script -- contrib/ is
+       not part of this build -- and it was silent, which reads as "did that
+       work?" to anyone who has used the real one. It was reported exactly that
+       way. The wording differs from upstream on purpose where the behaviour
+       does: upstream filters keys by attempting a login FIRST and can then say
+       how many it added, while this installs in one round trip and lets the
+       remote skip duplicates, so it can only honestly report what it offered. */
+    fprintf(stderr, "ssh-copy-id: INFO: Source of key(s) to be installed: \"%s\"\n",
+            pub_key_path);
+    fprintf(stderr, "ssh-copy-id: INFO: offering %d key(s) to %s:%s; "
+                    "keys already present there are left alone\n",
+            keys.count, target_host, target_path);
+
     int expanded_count = 0;
     char **expanded = smallclueExpandSshArgs(ssh_argv.count, ssh_argv.items, &expanded_count);
     status = smallclueRunOpensshEntry("ssh",
@@ -2430,6 +2444,13 @@ int smallclueRunSshCopyId(int argc, char **argv) {
                                       expanded ? expanded : ssh_argv.items);
     if (expanded) {
         smallclueFreeArgv(expanded, expanded_count);
+    }
+    if (status == 0) {
+        fprintf(stderr,
+                "\nNumber of key(s) offered: %d\n\n"
+                "Now try logging into the machine, with:   \"ssh '%s'\"\n"
+                "and check to make sure that only the key(s) you wanted were added.\n",
+                keys.count, target_host);
     }
     free(pub_key_path);
 
