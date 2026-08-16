@@ -1218,6 +1218,35 @@ static void smallclueResetGetopt(void) {
 #endif
 }
 
+/* An applet does not own its argv, so the usual "strip a global long option
+ * out of argv by shifting the rest down and decrementing argc" idiom is not
+ * safe: a caller may well own argv as a NULL-terminated array it later frees
+ * entry by entry. Under iSH-AOK it is the kernel's native-exec record, which
+ * allocates one slot more than the argument count and frees the array by
+ * walking to the first NULL -- at the ORIGINAL length. Compacting in place
+ * leaves the vacated tail slots holding stale copies of pointers that now
+ * live earlier in the array, and that walk frees each of them twice.
+ *
+ * So an applet with long options to pre-filter gathers the survivors into a
+ * vector of its own and leaves argv untouched. This allocates that vector --
+ * room for every argument plus a terminating NULL -- and seeds it with
+ * argv[0], which every caller keeps. It is zeroed, so the slot after the last
+ * survivor is already the terminator. The entries are borrowed pointers into
+ * argv: free() the vector itself and nothing else, and keep it alive as long
+ * as anything still reads an argument out of it. */
+static char **smallclueBorrowArgs(const char *applet, int argc, char **argv, int *count) {
+    char **args = (char **)calloc((size_t)(argc > 0 ? argc : 0) + 1, sizeof(*args));
+    if (!args) {
+        fprintf(stderr, "%s: out of memory\n", applet);
+        return NULL;
+    }
+    *count = 0;
+    if (argc > 0) {
+        args[(*count)++] = argv[0];
+    }
+    return args;
+}
+
 static void smallclueEnvClearAll(void) {
     extern char **environ;
     if (!environ) {
@@ -16278,10 +16307,15 @@ static int smallclueWgetCommand(int argc, char **argv) {
 
     /* Real wget has no short forms for these, only --header=/--post-data=/
      * --method=/--user=/--password=/--no-check-certificate (repeated GNU
-     * long options with no getopt()-friendly short equivalent) -- strip
-     * them out before calling getopt(), matching the convention used
-     * elsewhere in this file (e.g. stat's --format=). */
-    for (int i = 1; i < argc; ) {
+     * long options with no getopt()-friendly short equivalent) -- pull them
+     * out before calling getopt(), gathering the survivors into a vector of
+     * our own rather than compacting argv (see smallclueBorrowArgs). */
+    int nargs = 0;
+    char **args = smallclueBorrowArgs("wget", argc, argv, &nargs);
+    if (!args) {
+        return 1;
+    }
+    for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--header=", 9) == 0) {
             if (headerCount == headerCap) {
                 headerCap = headerCap ? headerCap * 2 : 8;
@@ -16290,47 +16324,36 @@ static int smallclueWgetCommand(int argc, char **argv) {
                     fprintf(stderr, "wget: out of memory\n");
                     free(headers);
                     free(postData);
+                    free(args);
                     return 1;
                 }
                 headers = resized;
             }
             headers[headerCount++] = argv[i] + 9;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strncmp(argv[i], "--post-data=", 12) == 0) {
             free(postData);
             postData = strdup(argv[i] + 12);
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strncmp(argv[i], "--method=", 9) == 0) {
             method = argv[i] + 9;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strncmp(argv[i], "--user=", 7) == 0) {
             wgetUser = argv[i] + 7;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strncmp(argv[i], "--password=", 11) == 0) {
             wgetPassword = argv[i] + 11;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strcmp(argv[i], "--no-check-certificate") == 0) {
             insecureTls = true;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
-        i++;
+        args[nargs++] = argv[i];
     }
     if (wgetUser) {
         snprintf(userpwdBuf, sizeof(userpwdBuf), "%s:%s", wgetUser, wgetPassword ? wgetPassword : "");
@@ -16339,7 +16362,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     smallclueResetGetopt();
     const char *output_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "O:")) != -1) {
+    while ((opt = getopt(nargs, args, "O:")) != -1) {
         switch (opt) {
             case 'O':
                 output_path = optarg;
@@ -16349,19 +16372,22 @@ static int smallclueWgetCommand(int argc, char **argv) {
                                 "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
                 free(headers);
                 free(postData);
+                free(args);
                 return 1;
         }
     }
-    if (optind >= argc) {
+    if (optind >= nargs) {
         fprintf(stderr, "wget: missing URL\n");
         free(headers);
         free(postData);
+        free(args);
         return 1;
     }
-    if (output_path && (argc - optind) != 1) {
+    if (output_path && (nargs - optind) != 1) {
         fprintf(stderr, "wget: -O is only supported with a single URL\n");
         free(headers);
         free(postData);
+        free(args);
         return 1;
     }
 
@@ -16375,8 +16401,8 @@ static int smallclueWgetCommand(int argc, char **argv) {
     reqOpts.insecureTls = insecureTls;
 
     int status = 0;
-    for (int i = optind; i < argc; ++i) {
-        const char *url = argv[i];
+    for (int i = optind; i < nargs; ++i) {
+        const char *url = args[i];
         const char *destination = output_path;
         char derived[PATH_MAX];
         if (!destination) {
@@ -16391,6 +16417,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     }
     free(headers);
     free(postData);
+    free(args);
     return status ? 1 : 0;
 }
 
@@ -20925,22 +20952,25 @@ static int smallclueDuCommand(int argc, char **argv) {
     opts.max_depth = -1;
 
     /* --max-depth=N is a GNU long option with no getopt()-friendly
-     * short form other than -d N (which getopt handles fine); strip the
-     * "=N" long form out first, matching the convention used elsewhere
-     * in this file (e.g. stat's --format=). */
-    for (int i = 1; i < argc; ) {
+     * short form other than -d N (which getopt handles fine); pull the
+     * "=N" long form out first, gathering the survivors into a vector of
+     * our own rather than compacting argv (see smallclueBorrowArgs). */
+    int nargs = 0;
+    char **args = smallclueBorrowArgs("du", argc, argv, &nargs);
+    if (!args) {
+        return 1;
+    }
+    for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--max-depth=", 12) == 0) {
             opts.max_depth = atoi(argv[i] + 12);
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
-        i++;
+        args[nargs++] = argv[i];
     }
 
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "skhcxd:")) != -1) {
+    while ((opt = getopt(nargs, args, "skhcxd:")) != -1) {
         switch (opt) {
             case 's':
                 opts.summarize_only = 1;
@@ -20961,15 +20991,16 @@ static int smallclueDuCommand(int argc, char **argv) {
                 opts.max_depth = atoi(optarg);
                 break;
             default:
+                free(args);
                 return 1;
         }
     }
 
     int status = 0;
     long long grandTotal = 0;
-    int pathCount = (optind < argc) ? (argc - optind) : 1;
+    int pathCount = (optind < nargs) ? (nargs - optind) : 1;
     for (int i = 0; i < pathCount; ++i) {
-        const char *path = (optind < argc) ? argv[optind + i] : ".";
+        const char *path = (optind < nargs) ? args[optind + i] : ".";
         if (opts.one_filesystem) {
             struct stat rootSt;
             if (lstat(path, &rootSt) == 0) {
@@ -20981,6 +21012,7 @@ static int smallclueDuCommand(int argc, char **argv) {
     if (opts.grand_total) {
         smallclueDuPrintSize(grandTotal, "total", &opts);
     }
+    free(args);
     return status ? 1 : 0;
 }
 
@@ -21921,27 +21953,29 @@ static int smallclueRmCommand(int argc, char **argv) {
 
     /* --preserve-root/--no-preserve-root are GNU long options with no
      * short-flag equivalent -- getopt() doesn't understand "--"-prefixed
-     * long options and hard-errors on them, so strip them out first
-     * (same convention used by stat's --format=). */
-    for (int i = 1; i < argc; ) {
+     * long options and hard-errors on them, so pull them out first,
+     * gathering the survivors into a vector of our own rather than
+     * compacting argv (see smallclueBorrowArgs). */
+    int nargs = 0;
+    char **args = smallclueBorrowArgs("rm", argc, argv, &nargs);
+    if (!args) {
+        return 1;
+    }
+    for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--preserve-root") == 0) {
             preserve_root = true;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
         if (strcmp(argv[i], "--no-preserve-root") == 0) {
             preserve_root = false;
-            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
-            argc--;
             continue;
         }
-        i++;
+        args[nargs++] = argv[i];
     }
 
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "rRfi")) != -1) {
+    while ((opt = getopt(nargs, args, "rRfi")) != -1) {
         switch (opt) {
             case 'r':
             case 'R':
@@ -21957,10 +21991,12 @@ static int smallclueRmCommand(int argc, char **argv) {
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
+                free(args);
                 return 1;
         }
     }
-    if (optind >= argc) {
+    if (optind >= nargs) {
+        free(args);
         if (!force) {
             fprintf(stderr, "rm: missing operand\n");
             return 1;
@@ -21968,8 +22004,8 @@ static int smallclueRmCommand(int argc, char **argv) {
         return 0;
     }
     int status = 0;
-    for (int i = optind; i < argc; ++i) {
-        const char *input = argv[i];
+    for (int i = optind; i < nargs; ++i) {
+        const char *input = args[i];
         const char *expanded = input;
 #if defined(PSCAL_TARGET_IOS)
         char pathbuf[PATH_MAX];
@@ -22016,6 +22052,7 @@ static int smallclueRmCommand(int argc, char **argv) {
             }
         }
     }
+    free(args);
     return status;
 }
 
@@ -23320,25 +23357,28 @@ static int smallclueStatCommand(int argc, char **argv) {
     int follow = 0;
     const char *format = NULL;
 
-    /* Strip out the GNU long form --format=FORMAT before getopt() ever
+    /* Pull out the GNU long form --format=FORMAT before getopt() ever
      * sees it -- getopt() doesn't understand "--"-prefixed long options
      * with an "=" value and hard-errors on it ("illegal option"), so this
-     * has to happen first, not as a post-getopt scan. */
-    for (int i = 1; i < argc; ) {
+     * has to happen first, not as a post-getopt scan. The survivors are
+     * gathered into a vector of our own rather than argv being compacted
+     * in place (see smallclueBorrowArgs). */
+    int nargs = 0;
+    char **args = smallclueBorrowArgs("stat", argc, argv, &nargs);
+    if (!args) {
+        return 1;
+    }
+    for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--format=", 9) == 0) {
             format = argv[i] + 9;
-            for (int j = i; j + 1 < argc; ++j) {
-                argv[j] = argv[j + 1];
-            }
-            argc--;
             continue;
         }
-        i++;
+        args[nargs++] = argv[i];
     }
 
     smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "Lc:")) != -1) {
+    while ((opt = getopt(nargs, args, "Lc:")) != -1) {
         switch (opt) {
             case 'L':
                 follow = 1;
@@ -23348,36 +23388,39 @@ static int smallclueStatCommand(int argc, char **argv) {
                 break;
             default:
                 fprintf(stderr, "stat: usage: stat [-L] [-c FORMAT] FILE...\n");
+                free(args);
                 return 1;
         }
     }
-    if (optind >= argc) {
+    if (optind >= nargs) {
         fprintf(stderr, "stat: missing operand\n");
+        free(args);
         return 1;
     }
     int status = 0;
-    for (int i = optind; i < argc; ++i) {
+    for (int i = optind; i < nargs; ++i) {
         char resolved[PATH_MAX];
-        const char *target = smallclueResolvePath(argv[i], resolved, sizeof(resolved));
+        const char *target = smallclueResolvePath(args[i], resolved, sizeof(resolved));
         if (!target || *target == '\0') {
-            target = argv[i];
+            target = args[i];
         }
         if (format) {
             struct stat st;
             if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
-                fprintf(stderr, "stat: %s: %s\n", argv[i], strerror(errno));
+                fprintf(stderr, "stat: %s: %s\n", args[i], strerror(errno));
                 status = 1;
                 continue;
             }
-            smallclueStatPrintFormatted(argv[i], &st, format);
+            smallclueStatPrintFormatted(args[i], &st, format);
             continue;
         }
-        if (smallclueStatPath(argv[i], follow) != 0) {
+        if (smallclueStatPath(args[i], follow) != 0) {
             status = 1;
-        } else if (i + 1 < argc) {
+        } else if (i + 1 < nargs) {
             putchar('\n');
         }
     }
+    free(args);
     return status;
 }
 
