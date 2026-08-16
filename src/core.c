@@ -182,7 +182,10 @@ int smallclueVprocTestCommand(int argc, char **argv);
 int smallclueGitCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
-static uint64_t gSmallclueProcessStartMonoNs = 0;
+/* Per invocation, despite the name: readers want how long THIS applet has run,
+   not the app. Shared, the second native program measures from the first's
+   start. */
+static __thread uint64_t gSmallclueProcessStartMonoNs = 0;
 
 static uint64_t smallclueNowMonoNs(void) {
     struct timespec ts;
@@ -5773,7 +5776,9 @@ typedef struct {
     char keySep;  /* 0 = split on runs of whitespace (GNU sort's default) */
 } SmallclueSortOptions;
 
-static SmallclueSortOptions gSmallclueSortOpts;
+/* Per invocation: this is one sort's parsed flags, and two concurrent sorts
+   would otherwise read each other's key and ordering. */
+static __thread SmallclueSortOptions gSmallclueSortOpts;
 
 /* Returns a pointer into `line` (no copy) at the start of the requested
  * sort key -- either the whole line, or from the Nth field onward. */
@@ -6302,7 +6307,13 @@ static size_t *pagerCollectVisibleMdLinkIndices(const PagerBuffer *buffer,
     return indices;
 }
 
-static volatile sig_atomic_t g_pager_sigwinch_received = 0;
+/* Per task. This was deferred pending "which thread does a native program's
+   signal arrive on?" -- the answer is the program's own: the shim records the
+   handler and calls it from native_checkpoint -> nlibc_deliver_signals on the
+   thread making the syscall (kernel/native.c, kernel/native_libc.c). So
+   thread-local is correct rather than merely harmless, and two pagers resizing
+   at once no longer share one flag. */
+static __thread volatile sig_atomic_t g_pager_sigwinch_received = 0;
 
 static void pagerSigwinchHandler(int signo) {
     if (signo == SIGWINCH) {
@@ -6530,7 +6541,9 @@ static const char *pager_command_name(const char *name) {
 }
 
 static bool pagerDebugEnabled(void) {
-    static int enabled = -1;
+    /* Per task: the cache is cheap to rebuild and the environment it reads is
+       the invoking program's, not the app's. */
+    static __thread int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("PSCALI_PAGER_DEBUG");
         enabled = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
@@ -6556,9 +6569,14 @@ static void pagerDebugLogf(const char *format, ...) {
     fprintf(stderr, "%s\n", buf);
 }
 
-static bool pager_test_input_initialized = false;
-static const char *pager_test_input_cursor = NULL;
-static size_t pager_test_input_remaining = 0;
+/* Per invocation. A native program is a C function on a guest task's thread,
+   not a process, so a cached "already initialised" flag would make the SECOND
+   pager in an app session skip its own setup and read the first one's cursor.
+   Not deferred like g_pager_sigwinch_received -- there is no signal-delivery
+   question here, this is ordinary per-run state. */
+static __thread bool pager_test_input_initialized = false;
+static __thread const char *pager_test_input_cursor = NULL;
+static __thread size_t pager_test_input_remaining = 0;
 
 static void pagerInitTestInput(void) {
     if (pager_test_input_initialized) {

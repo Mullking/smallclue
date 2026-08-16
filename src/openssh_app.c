@@ -187,7 +187,13 @@ int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenSshSession(int argc, char **argv) __attribute__((weak));
 #endif
 
-volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
+/* Per invocation. A stale 1 left by a ^C'd ssh would make the NEXT ssh in the
+   same app session exit before doing anything -- the same shape as
+   pscal_openssh_interrupted, which was converted for exactly that reason. Set
+   from a signal handler, and the shim delivers a native program's signals on
+   that program's own thread (kernel/native.c's native_checkpoint ->
+   nlibc_deliver_signals), so thread-local is correct here, not merely tidy. */
+__thread volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 #ifndef SMALLCLUE_THREAD_LOCAL
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && \
     !defined(__STDC_NO_THREADS__)

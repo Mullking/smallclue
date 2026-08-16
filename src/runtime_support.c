@@ -4,6 +4,7 @@
 #include "common/pscal_hosts.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -14,6 +15,14 @@
 #include <unistd.h>
 #include <netdb.h>
 
+/* SHARED ON PURPOSE, and locked because of it. A clipboard whose contents did
+   not cross between applets would not be a clipboard: `pbcopy` in one shell and
+   `pbpaste` in another is the entire point, and native applets are threads of
+   one app, so thread-local would give each its own empty one.
+   The lock is not optional now that several can run at once -- Set() frees the
+   buffer and reallocates while a concurrent Get() may be copying out of it,
+   which is a use-after-free rather than a stale read. */
+static pthread_mutex_t g_clipboard_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_clipboard_init = false;
 static char *g_clipboard_data = NULL;
 static size_t g_clipboard_len = 0;
@@ -75,35 +84,43 @@ __attribute__((weak)) void pscalRuntimeDebugLog(const char *message) {
 }
 
 __attribute__((weak)) int runtimeClipboardSet(const char *data, size_t len) {
+    pthread_mutex_lock(&g_clipboard_lock);
     free(g_clipboard_data);
     g_clipboard_data = NULL;
     g_clipboard_len = 0;
     if (!data || len == 0) {
         g_clipboard_init = true;
+        pthread_mutex_unlock(&g_clipboard_lock);
         return 0;
     }
     g_clipboard_data = (char *)malloc(len);
     if (!g_clipboard_data) {
+        pthread_mutex_unlock(&g_clipboard_lock);
         return ENOMEM;
     }
     memcpy(g_clipboard_data, data, len);
     g_clipboard_len = len;
     g_clipboard_init = true;
+    pthread_mutex_unlock(&g_clipboard_lock);
     return 0;
 }
 
 __attribute__((weak)) char *runtimeClipboardGet(size_t *len_out) {
+    pthread_mutex_lock(&g_clipboard_lock);
     if (!g_clipboard_init || !g_clipboard_data) {
+        pthread_mutex_unlock(&g_clipboard_lock);
         return NULL;
     }
     char *copy = (char *)malloc(g_clipboard_len);
     if (!copy) {
+        pthread_mutex_unlock(&g_clipboard_lock);
         return NULL;
     }
     memcpy(copy, g_clipboard_data, g_clipboard_len);
     if (len_out) {
         *len_out = g_clipboard_len;
     }
+    pthread_mutex_unlock(&g_clipboard_lock);
     return copy;
 }
 

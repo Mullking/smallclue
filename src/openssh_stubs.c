@@ -33,7 +33,7 @@ __attribute__((weak)) int pscal_openssh_ssh_keygen_main(int argc, char **argv) {
     return 127;
 }
 
-static pscal_openssh_exit_context *g_current_ctx = NULL;
+static __thread pscal_openssh_exit_context *g_current_ctx = NULL;
 
 void pscal_openssh_reset_progress_state(void) {
     /* No-op for the stub build. */

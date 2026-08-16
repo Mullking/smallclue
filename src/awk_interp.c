@@ -194,7 +194,11 @@ typedef struct {
     bool *rangeActiveByRule;
 } AwkInterp;
 
-static AwkInterp gInterp;
+/* Per invocation. This is the WHOLE awk interpreter -- variables, fields,
+   parsed program. Native applets are threads of one app, so two concurrent
+   awks shared it, and a second awk in a session started on the first's
+   leftovers. */
+static __thread AwkInterp gInterp;
 
 /* ---------------- Global variable access ---------------- */
 
@@ -279,7 +283,7 @@ static const char *awkGetVarStr(const char *name) {
     AwkVar *v = awkFindGlobal(name);
     if (!v) return "";
     if (v->scalar.kind == AWK_V_STR || v->scalar.kind == AWK_V_STRNUM) return v->scalar.str ? v->scalar.str : "";
-    static char buf[64];
+    static __thread char buf[64];  /* returned to the caller */
     char *s = awkToStrFmt(&v->scalar, "%.6g");
     snprintf(buf, sizeof(buf), "%s", s);
     free(s);
@@ -383,7 +387,7 @@ static void awkSplitLineWithFS(const char *line, const char *fs, char ***outFiel
     *outCount = cnt;
 }
 
-static bool gAwkParagraphMode = false;
+static __thread bool gAwkParagraphMode = false;  /* per invocation, see gInterp */
 
 static void awkResplitFields(void) {
     awkFreeFields();
@@ -698,7 +702,7 @@ static char *awkBuiltinSubstr(const char *s, double mArg, bool haveN, double nAr
     return r;
 }
 
-static int gAwkRstart = 0, gAwkRlength = -1;
+static __thread int gAwkRstart = 0, gAwkRlength = -1;  /* RSTART/RLENGTH */
 
 static int awkDoSub(const char *pattern, const char *repl, const char *target, bool global, char **outResult) {
     regex_t re;
@@ -942,7 +946,7 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         return awkValNum(r);
     }
     if (strcmp(name, "srand") == 0) {
-        static unsigned int prevSeed = 0;
+        static __thread unsigned int prevSeed = 0;  /* srand() history */
         unsigned int newSeed;
         if (argc >= 1) {
             AwkValue v = awkEval(args[0]);
@@ -1791,7 +1795,7 @@ static bool awkNextMainRecord(char **outLine) {
         gInterp.curFile = NULL;
         if (gInterp.argIndex >= gInterp.argc && gInterp.anyFileOpened) {
             /* if we already fell back to stdin-with-no-files, don't loop forever */
-            static bool stdinDone = false;
+            static __thread bool stdinDone = false;  /* else a 2nd awk reads no stdin */
             if (stdinDone) return false;
             stdinDone = true;
         }
