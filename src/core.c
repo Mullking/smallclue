@@ -182,10 +182,12 @@ int smallclueVprocTestCommand(int argc, char **argv);
 int smallclueGitCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
-/* Per invocation, despite the name: readers want how long THIS applet has run,
-   not the app. Shared, the second native program measures from the first's
-   start. */
-static __thread uint64_t gSmallclueProcessStartMonoNs = 0;
+/* PROCESS-wide, and the name is right. Captured once by a constructor, which
+   runs on whichever thread loads the image -- so making this __thread gave
+   every applet thread a zero, and `uptime` reported "up 00:00:00" against the
+   distro's "up 4:32". Written once before any applet runs and read-only after,
+   so sharing it needs no lock. */
+static uint64_t gSmallclueProcessStartMonoNs = 0;
 
 static uint64_t smallclueNowMonoNs(void) {
     struct timespec ts;
