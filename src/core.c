@@ -13541,22 +13541,62 @@ static int64_t smallclueAppUptimeSeconds(void) {
     return (int64_t)((now_ns - start_ns) / 1000000000ull);
 }
 
+/* The guest's /var/run/utmp is LINUX's layout, and a native program is Darwin
+   code -- <utmpx.h> here would parse it with the wrong struct and produce
+   nonsense. So the layout is spelled out: Linux's struct utmp is 384 bytes with
+   ut_type at 0, ut_user at 44, and USER_PROCESS == 7. Stable across glibc and
+   musl on every arch AOK emulates.
+   Returns -1 when there is no utmp to read, which is different from "nobody is
+   logged in" and is printed differently. */
+static int smallclueUtmpUserCount(void) {
+    static const char *paths[] = { "/var/run/utmp", "/run/utmp", NULL };
+    for (int i = 0; paths[i]; i++) {
+        FILE *fp = fopen(paths[i], "rb");
+        if (!fp) continue;
+        unsigned char rec[384];
+        int users = 0;
+        while (fread(rec, sizeof(rec), 1, fp) == 1) {
+            int32_t type;
+            memcpy(&type, rec, sizeof(type));
+            if (type == 7 && rec[44] != '\0')   /* USER_PROCESS with a name */
+                users++;
+        }
+        fclose(fp);
+        return users;
+    }
+    return -1;
+}
+
+/* Whatever the guest's kernel reports, which under AOK is the emulator's own
+   figures rather than the device's. Returns false when /proc is not mounted. */
+static bool smallclueReadLoadavg(double out[3]) {
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (!fp) return false;
+    int n = fscanf(fp, "%lf %lf %lf", &out[0], &out[1], &out[2]);
+    fclose(fp);
+    return n == 3;
+}
+
 static int smallclueUptimeCommand(int argc, char **argv) {
     bool show_system = false;
+    bool terse = false;
     int opt;
     optind = 1;
-    while ((opt = getopt(argc, argv, "s")) != -1) {
+    while ((opt = getopt(argc, argv, "sp")) != -1) {
         switch (opt) {
             case 's':
                 show_system = true;
                 break;
+            case 'p':
+                terse = true;
+                break;
             default:
-                fprintf(stderr, "usage: uptime [-s]\n");
+                fprintf(stderr, "usage: uptime [-s] [-p]\n");
                 return 1;
         }
     }
     if (optind < argc) {
-        fprintf(stderr, "usage: uptime [-s]\n");
+        fprintf(stderr, "usage: uptime [-s] [-p]\n");
         return 1;
     }
 
@@ -13566,16 +13606,42 @@ static int smallclueUptimeCommand(int argc, char **argv) {
         return 1;
     }
     int days = (int)(seconds / 86400);
-    seconds %= 86400;
-    int hours = (int)(seconds / 3600);
-    seconds %= 3600;
-    int minutes = (int)(seconds / 60);
-    int secs = (int)(seconds % 60);
-    if (days > 0) {
-        printf("up %d day%s, %02d:%02d:%02d\n", days, days == 1 ? "" : "s", hours, minutes, secs);
-    } else {
-        printf("up %02d:%02d:%02d\n", hours, minutes, secs);
+    int64_t rem = seconds % 86400;
+    int hours = (int)(rem / 3600);
+    int minutes = (int)((rem % 3600) / 60);
+
+    if (terse) {   /* -p: "up 4 hours, 32 minutes", as procps prints it */
+        printf("up");
+        if (days)    printf(" %d day%s,", days, days == 1 ? "" : "s");
+        if (hours)   printf(" %d hour%s,", hours, hours == 1 ? "" : "s");
+        printf(" %d minute%s\n", minutes, minutes == 1 ? "" : "s");
+        return 0;
     }
+
+    /* procps' one-line form, field for field:
+         01:38:50 up  4:32,  2 users,  load average: 4.48, 3.29, 1.64
+       Under an hour it says "up 5 min" rather than "0:05". */
+    char now[16] = "";
+    time_t t = time(NULL);
+    struct tm tmv;
+    if (localtime_r(&t, &tmv))
+        strftime(now, sizeof(now), "%H:%M:%S", &tmv);
+    printf(" %s up ", now);
+    if (days)
+        printf("%d day%s, %2d:%02d", days, days == 1 ? "" : "s", hours, minutes);
+    else if (hours)
+        printf(" %2d:%02d", hours, minutes);
+    else
+        printf(" %d min", minutes);
+
+    int users = smallclueUtmpUserCount();
+    if (users >= 0)
+        printf(",  %d user%s", users, users == 1 ? "" : "s");
+
+    double load[3];
+    if (smallclueReadLoadavg(load))
+        printf(",  load average: %.2f, %.2f, %.2f", load[0], load[1], load[2]);
+    printf("\n");
     return 0;
 }
 
