@@ -20012,41 +20012,177 @@ static int smallclueTrCommand(int argc, char **argv) {
     return 0;
 }
 
+/* Print one group, as a number or a name depending on -n. */
+static void smallclueIdPrintGid(gid_t g, bool names) {
+    struct group *gr = names ? getgrgid(g) : NULL;
+    if (names && gr && gr->gr_name)
+        printf("%s", gr->gr_name);
+    else
+        printf("%u", (unsigned)g);
+}
+
+/* The supplementary groups for a named user come from the guest's /etc/group
+   via getgrouplist, which the shim routes. For the CURRENT user we ask the
+   kernel with getgroups() instead: that reflects what the process actually
+   holds, which is not always what /etc/group says it should. */
+static int smallclueIdGroups(const struct passwd *pw, bool self,
+                             gid_t primary, gid_t **out) {
+    if (self) {
+        int n = getgroups(0, NULL);
+        if (n <= 0) {
+            gid_t *one = (gid_t *)malloc(sizeof(gid_t));
+            if (!one) return -1;
+            one[0] = primary; *out = one; return 1;
+        }
+        gid_t *g = (gid_t *)malloc((size_t)n * sizeof(gid_t));
+        if (!g) return -1;
+        if (getgroups(n, g) < 0) { free(g); return -1; }
+        *out = g;
+        return n;
+    }
+    if (!pw || !pw->pw_name) return -1;
+    int n = 32;
+    for (;;) {
+        int *tmp = (int *)malloc((size_t)n * sizeof(int));
+        if (!tmp) return -1;
+        int want = n;
+        if (getgrouplist(pw->pw_name, (int)primary, tmp, &want) >= 0) {
+            gid_t *g = (gid_t *)malloc((size_t)want * sizeof(gid_t));
+            if (!g) { free(tmp); return -1; }
+            for (int i = 0; i < want; ++i) g[i] = (gid_t)tmp[i];
+            free(tmp);
+            *out = g;
+            return want;
+        }
+        free(tmp);
+        if (want <= n) {          /* not a size problem; give up with the primary */
+            gid_t *one = (gid_t *)malloc(sizeof(gid_t));
+            if (!one) return -1;
+            one[0] = primary; *out = one; return 1;
+        }
+        n = want;
+    }
+}
+
 static int smallclueIdCommand(int argc, char **argv) {
-    (void)argv;
-    if (argc > 1) {
-        fprintf(stderr, "id: no user lookup support in smallclue\n");
+    smallclueResetGetopt();
+    bool want_u = false, want_g = false, want_G = false;
+    bool names = false, real = false;
+    int opt;
+    while ((opt = getopt(argc, argv, "ugGnr")) != -1) {
+        switch (opt) {
+            case 'u': want_u = true; break;
+            case 'g': want_g = true; break;
+            case 'G': want_G = true; break;
+            case 'n': names = true; break;
+            case 'r': real = true; break;
+            default:
+                fprintf(stderr, "usage: id [-u|-g|-G] [-nr] [user]\n");
+                return 1;
+        }
     }
-    uid_t uid = getuid();
-    uid_t euid = geteuid();
-    gid_t gid = getgid();
-    gid_t egid = getegid();
-    struct passwd *pw = getpwuid(uid);
-    struct passwd *epw = getpwuid(euid);
-    struct group *gr = getgrgid(gid);
-    struct group *egr = getgrgid(egid);
-    printf("uid=%u(%s) gid=%u(%s)", (unsigned)uid, pw ? pw->pw_name : "?", (unsigned)gid, gr ? gr->gr_name : "?");
-    if (euid != uid) {
-        printf(" euid=%u(%s)", (unsigned)euid, epw ? epw->pw_name : "?");
+    if ((int)want_u + (int)want_g + (int)want_G > 1) {
+        fprintf(stderr, "id: cannot print only one of -u, -g, -G at a time\n");
+        return 1;
     }
-    if (egid != gid) {
-        printf(" egid=%u(%s)", (unsigned)egid, egr ? egr->gr_name : "?");
+    if ((names || real) && !(want_u || want_g || want_G)) {
+        fprintf(stderr, "id: -n and -r require one of -u, -g or -G\n");
+        return 1;
     }
-    int ngroups = getgroups(0, NULL);
-    if (ngroups > 0) {
-        gid_t *groups = (gid_t *)malloc((size_t)ngroups * sizeof(gid_t));
-        if (groups && getgroups(ngroups, groups) >= 0) {
-            printf(" groups=");
-            for (int i = 0; i < ngroups; ++i) {
-                struct group *gg = getgrgid(groups[i]);
-                if (i > 0) {
-                    putchar(',');
-                }
-                printf("%u(%s)", (unsigned)groups[i], gg ? gg->gr_name : "?");
-            }
+    if (argc - optind > 1) {
+        fprintf(stderr, "usage: id [-u|-g|-G] [-nr] [user]\n");
+        return 1;
+    }
+
+    const char *who = (optind < argc) ? argv[optind] : NULL;
+    struct passwd *pw;
+    bool self = (who == NULL);
+
+    if (self) {
+        /* -r asks for the real ids, otherwise the effective ones -- which is
+           what a caller checking "who am I really" versus "what am I running
+           as" needs, and the two differ under su and setuid. */
+        pw = getpwuid(real ? getuid() : geteuid());
+    } else {
+        pw = getpwnam(who);
+        if (!pw) {
+            /* A bare number is a uid, as coreutils accepts. */
+            char *endp = NULL;
+            unsigned long n = strtoul(who, &endp, 10);
+            if (endp && *endp == '\0' && who[0] != '\0')
+                pw = getpwuid((uid_t)n);
+        }
+        if (!pw) {
+            fprintf(stderr, "id: '%s': no such user\n", who);
+            return 1;
+        }
+    }
+
+    uid_t uid = self ? (real ? getuid()  : geteuid()) : pw->pw_uid;
+    gid_t gid = self ? (real ? getgid()  : getegid()) : pw->pw_gid;
+
+    if (want_u) {
+        if (names) {
+            struct passwd *p = self ? getpwuid(uid) : pw;
+            printf("%s\n", (p && p->pw_name) ? p->pw_name : "");
+        } else {
+            printf("%u\n", (unsigned)uid);
+        }
+        return 0;
+    }
+    if (want_g) {
+        smallclueIdPrintGid(gid, names);
+        putchar('\n');
+        return 0;
+    }
+    if (want_G) {
+        gid_t *groups = NULL;
+        int n = smallclueIdGroups(pw, self, gid, &groups);
+        if (n < 0) { fprintf(stderr, "id: cannot determine groups\n"); return 1; }
+        for (int i = 0; i < n; ++i) {
+            if (i) putchar(' ');
+            smallclueIdPrintGid(groups[i], names);
         }
         free(groups);
+        putchar('\n');
+        return 0;
     }
+
+    /* The default line, in coreutils' order and shape. */
+    uid_t ruid = self ? getuid()  : pw->pw_uid;
+    uid_t euid = self ? geteuid() : pw->pw_uid;
+    gid_t rgid = self ? getgid()  : pw->pw_gid;
+    gid_t egid = self ? getegid() : pw->pw_gid;
+    struct passwd *rpw = self ? getpwuid(ruid) : pw;
+    struct group  *rgr = getgrgid(rgid);
+
+    printf("uid=%u", (unsigned)ruid);
+    if (rpw && rpw->pw_name) printf("(%s)", rpw->pw_name);
+    printf(" gid=%u", (unsigned)rgid);
+    if (rgr && rgr->gr_name) printf("(%s)", rgr->gr_name);
+    if (euid != ruid) {
+        struct passwd *ep = getpwuid(euid);
+        printf(" euid=%u", (unsigned)euid);
+        if (ep && ep->pw_name) printf("(%s)", ep->pw_name);
+    }
+    if (egid != rgid) {
+        struct group *eg = getgrgid(egid);
+        printf(" egid=%u", (unsigned)egid);
+        if (eg && eg->gr_name) printf("(%s)", eg->gr_name);
+    }
+
+    gid_t *groups = NULL;
+    int n = smallclueIdGroups(pw, self, rgid, &groups);
+    if (n > 0) {
+        printf(" groups=");
+        for (int i = 0; i < n; ++i) {
+            struct group *gg = getgrgid(groups[i]);
+            if (i) putchar(',');
+            printf("%u", (unsigned)groups[i]);
+            if (gg && gg->gr_name) printf("(%s)", gg->gr_name);
+        }
+    }
+    free(groups);
     putchar('\n');
     return 0;
 }
