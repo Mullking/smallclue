@@ -16062,7 +16062,13 @@ static int smallclueDmesgCommand(int argc, char **argv) {
     }
     fprintf(stderr, "dmesg: session log unavailable\n");
     return 1;
-#elif defined(__linux__) || defined(linux) || defined(__linux)
+/* SMALLCLUE_HAVE_KLOGCTL: the host is not Linux but klogctl reaches a Linux
+   kernel anyway. iSH-AOK compiles SmallCLUE as host (Darwin) code that runs
+   against its own Linux guest, and routes klogctl to that guest's syslog(2) --
+   so the question this branch asks is "can klogctl reach a ring buffer", not
+   "was this compiled for Linux". Without it the #else below claimed dmesg was
+   unsupported on a system whose own /usr/bin/dmesg worked. */
+#elif defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_KLOGCTL)
     int len = klogctl(10, NULL, 0); // SYSLOG_ACTION_SIZE_BUFFER
     if (len < 0) {
         perror("dmesg: klogctl size");
