@@ -8234,6 +8234,198 @@ static bool markdownInlineHasCloser(const char *text, size_t from, char ch, size
     return false;
 }
 
+/* The entity references that turn up in prose, decoded to UTF-8.
+ *
+ * There is an HTML decoder further down, but it hands back a single char and
+ * answers &copy; with the letter 'c', which is worse than leaving the entity
+ * alone. This one writes the real character and is used from the markdown
+ * inline pass, where CommonMark says entities are decoded too -- so a README
+ * saying "AT&amp;T" reads as "AT&T" rather than showing its markup.
+ *
+ * Deliberately short. An unknown entity is left exactly as written, which is
+ * the honest outcome: "&foo;" on screen says the document contains "&foo;". */
+static bool markdownDecodeTextEntity(const char *text, size_t *index,
+                                     char *out, size_t out_size) {
+    static const struct { const char *name; const char *utf8; } table[] = {
+        {"amp",    "&"}, {"lt",     "<"}, {"gt",     ">"},
+        {"quot",   "\""}, {"apos",   "'"}, {"nbsp",   " "},
+        {"copy",   "\u00a9"}, {"reg",    "\u00ae"}, {"trade",  "\u2122"},
+        {"mdash",  "\u2014"}, {"ndash",  "\u2013"}, {"hellip", "\u2026"},
+        {"laquo",  "\u00ab"}, {"raquo",  "\u00bb"}, {"deg",    "\u00b0"},
+        {"lsquo",  "\u2018"}, {"rsquo",  "\u2019"},
+        {"ldquo",  "\u201c"}, {"rdquo",  "\u201d"},
+        {"middot", "\u00b7"}, {"bull",   "\u2022"}, {"times",  "\u00d7"},
+    };
+    size_t i = *index;
+    if (text[i] != '&') {
+        return false;
+    }
+    const char *semi = strchr(text + i + 1, ';');
+    if (!semi) {
+        return false;
+    }
+    size_t name_len = (size_t)(semi - (text + i + 1));
+    if (name_len == 0 || name_len > 10) {
+        return false;
+    }
+    const char *name = text + i + 1;
+
+    if (name[0] == '#') {
+        unsigned long cp = 0;
+        if (name_len > 1 && (name[1] == 'x' || name[1] == 'X')) {
+            for (size_t k = 2; k < name_len; ++k) {
+                if (!isxdigit((unsigned char)name[k])) return false;
+                cp = cp * 16 + (unsigned long)(isdigit((unsigned char)name[k])
+                        ? name[k] - '0' : (tolower((unsigned char)name[k]) - 'a' + 10));
+            }
+        } else {
+            for (size_t k = 1; k < name_len; ++k) {
+                if (!isdigit((unsigned char)name[k])) return false;
+                cp = cp * 10 + (unsigned long)(name[k] - '0');
+            }
+        }
+        if (cp == 0 || cp > 0x10FFFF || out_size < 5) {
+            return false;
+        }
+        size_t n = 0;
+        if (cp < 0x80) {
+            out[n++] = (char)cp;
+        } else if (cp < 0x800) {
+            out[n++] = (char)(0xC0 | (cp >> 6));
+            out[n++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[n++] = (char)(0xE0 | (cp >> 12));
+            out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[n++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[n++] = (char)(0xF0 | (cp >> 18));
+            out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[n++] = (char)(0x80 | (cp & 0x3F));
+        }
+        out[n] = '\0';
+        *index = (size_t)(semi - text) + 1;
+        return true;
+    }
+
+    for (size_t t = 0; t < sizeof(table) / sizeof(table[0]); ++t) {
+        if (strlen(table[t].name) == name_len &&
+            strncmp(name, table[t].name, name_len) == 0) {
+            snprintf(out, out_size, "%s", table[t].utf8);
+            *index = (size_t)(semi - text) + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* <https://example.com> and <me@example.com>: a link written as itself. */
+static bool markdownIsAutolink(const char *text, size_t at, size_t close) {
+    if (close <= at + 1) {
+        return false;
+    }
+    size_t len = close - at - 1;
+    const char *body = text + at + 1;
+    if (memchr(body, ' ', len) || memchr(body, '<', len)) {
+        return false;
+    }
+    if (len > 8 && strncasecmp(body, "https://", 8) == 0) return true;
+    if (len > 7 && strncasecmp(body, "http://", 7) == 0) return true;
+    if (len > 7 && strncasecmp(body, "mailto:", 7) == 0) return true;
+    if (len > 6 && strncasecmp(body, "ftp://", 6) == 0) return true;
+    const char *at_sign = memchr(body, '@', len);
+    return at_sign != NULL && at_sign != body && memchr(body, '.', len) != NULL;
+}
+
+/* Reference-style links: [text][label] and [label], defined elsewhere by a
+ * line reading "[label]: target".
+ *
+ * Without these the syntax showed through -- "[link][ref]" on screen -- and
+ * every definition line was rendered as a paragraph of its own, so a README
+ * that keeps its URLs at the bottom ended with a block of them. Collected in a
+ * pass over the source before rendering, which the input allows because it is
+ * always a seekable temp file by the time it reaches the renderer.
+ *
+ * Freed and reset per render: a native program's globals outlive the call. */
+typedef struct {
+    char *label;
+    char *target;
+} MarkdownRefDef;
+
+static MarkdownRefDef *gMarkdownRefs = NULL;
+static size_t gMarkdownRefCount = 0;
+
+static void markdownRefsClear(void) {
+    for (size_t i = 0; i < gMarkdownRefCount; ++i) {
+        free(gMarkdownRefs[i].label);
+        free(gMarkdownRefs[i].target);
+    }
+    free(gMarkdownRefs);
+    gMarkdownRefs = NULL;
+    gMarkdownRefCount = 0;
+}
+
+/* "[label]: target" with up to three spaces of indent, and an optional title
+ * after the target that is parsed only so it does not end up in the URL. */
+static bool markdownParseRefDefinition(const char *line, char **label_out, char **target_out) {
+    const char *p = line;
+    int indent = 0;
+    while (*p == ' ' && indent < 4) { p++; indent++; }
+    if (*p != '[') {
+        return false;
+    }
+    const char *close = strchr(p + 1, ']');
+    if (!close || close == p + 1 || close[1] != ':') {
+        return false;
+    }
+    const char *t = close + 2;
+    while (*t == ' ' || *t == '\t') t++;
+    if (*t == '\0') {
+        return false;
+    }
+    const char *end = t;
+    while (*end && *end != ' ' && *end != '\t') end++;
+    size_t label_len = (size_t)(close - (p + 1));
+    size_t target_len = (size_t)(end - t);
+    char *label = (char *)malloc(label_len + 1);
+    char *target = (char *)malloc(target_len + 1);
+    if (!label || !target) {
+        free(label);
+        free(target);
+        return false;
+    }
+    memcpy(label, p + 1, label_len); label[label_len] = '\0';
+    memcpy(target, t, target_len);   target[target_len] = '\0';
+    *label_out = label;
+    *target_out = target;
+    return true;
+}
+
+static void markdownRefsAdd(char *label, char *target) {
+    MarkdownRefDef *grown = (MarkdownRefDef *)realloc(
+        gMarkdownRefs, (gMarkdownRefCount + 1) * sizeof(*gMarkdownRefs));
+    if (!grown) {
+        free(label);
+        free(target);
+        return;
+    }
+    gMarkdownRefs = grown;
+    gMarkdownRefs[gMarkdownRefCount].label = label;
+    gMarkdownRefs[gMarkdownRefCount].target = target;
+    gMarkdownRefCount++;
+}
+
+/* Labels match case-insensitively, as CommonMark specifies. */
+static const char *markdownRefsLookup(const char *label, size_t len) {
+    for (size_t i = 0; i < gMarkdownRefCount; ++i) {
+        if (strlen(gMarkdownRefs[i].label) == len &&
+            strncasecmp(gMarkdownRefs[i].label, label, len) == 0) {
+            return gMarkdownRefs[i].target;
+        }
+    }
+    return NULL;
+}
+
 static char *markdownSimplifyInline(const char *text) {
     if (!text) {
         return strdup("");
@@ -8254,10 +8446,80 @@ static char *markdownSimplifyInline(const char *text) {
 
     for (size_t i = 0; text[i]; ) {
         char ch = text[i];
+        /* A backslash escape is the author saying "this punctuation is text".
+         * It has to be handled before emphasis or the '*' in "\*" is taken as
+         * a delimiter and deleted, which is what used to happen -- the
+         * backslash survived and the asterisk did not, exactly backwards. */
+        if (ch == '\\' && text[i + 1] && ispunct((unsigned char)text[i + 1])) {
+            if (!markdownInlineAppendChar(&buffer, &dst, &cap, text[i + 1])) {
+                free(buffer);
+                return strdup(text);
+            }
+            i += 2;
+            continue;
+        }
+        if (ch == '&') {
+            char decoded[8];
+            size_t next = i;
+            if (markdownDecodeTextEntity(text, &next, decoded, sizeof(decoded))) {
+                if (!markdownInlineAppendSpan(&buffer, &dst, &cap, decoded, strlen(decoded))) {
+                    free(buffer);
+                    return strdup(text);
+                }
+                i = next;
+                continue;
+            }
+        }
+        /* An image is a link whose target is not worth following. Rendering
+         * the alt text alone beats "!alt [3]", which is what a stray '!' in
+         * front of the link syntax used to produce. */
+        if (ch == '!' && text[i + 1] == '[') {
+            size_t close = i + 2;
+            while (text[close] && text[close] != ']') {
+                close++;
+            }
+            if (text[close] == ']' && text[close + 1] == '(') {
+                size_t url_end = close + 2;
+                while (text[url_end] && text[url_end] != ')') {
+                    url_end++;
+                }
+                if (text[url_end] == ')') {
+                    for (size_t j = i + 2; j < close; ++j) {
+                        if (!markdownInlineAppendChar(&buffer, &dst, &cap, text[j])) {
+                            free(buffer);
+                            return strdup(text);
+                        }
+                    }
+                    i = url_end + 1;
+                    continue;
+                }
+            }
+        }
         if (ch == '<') {
             size_t close = i + 1;
             while (text[close] && text[close] != '>') {
                 close++;
+            }
+            if (text[close] == '>' && markdownIsAutolink(text, i, close)) {
+                size_t body_len = close - (i + 1);
+                char target[1024];
+                size_t copy = body_len < sizeof(target) - 1 ? body_len : sizeof(target) - 1;
+                memcpy(target, text + i + 1, copy);
+                target[copy] = '\0';
+                int number = gMarkdownActiveLinks
+                    ? markdownRegisterLinkAndGetDisplayNumber(gMarkdownActiveLinks, target, target)
+                    : -1;
+                if (!markdownInlineAppendSpan(&buffer, &dst, &cap, target, strlen(target))) {
+                    free(buffer);
+                    return strdup(text);
+                }
+                if (number > 0 &&
+                    !markdownInlineAppendLinkMarker(&buffer, &dst, &cap, number)) {
+                    free(buffer);
+                    return strdup(text);
+                }
+                i = close + 1;
+                continue;
             }
             if (text[close] == '>') {
                 char tag[1024];
@@ -8504,6 +8766,48 @@ static char *markdownSimplifyInline(const char *text) {
             while (text[close] && text[close] != ']') {
                 close++;
             }
+            if (text[close] == ']' && text[close + 1] != '(' && gMarkdownRefCount > 0) {
+                /* [text][label], or [label] on its own. */
+                const char *ref = text + i + 1;
+                size_t ref_len = close - (i + 1);
+                size_t after = close + 1;
+                size_t label_start = i + 1;
+                size_t label_len = ref_len;
+                if (text[after] == '[') {
+                    size_t ref_close = after + 1;
+                    while (text[ref_close] && text[ref_close] != ']') {
+                        ref_close++;
+                    }
+                    if (text[ref_close] == ']') {
+                        if (ref_close > after + 1) {
+                            ref = text + after + 1;
+                            ref_len = ref_close - (after + 1);
+                        }
+                        after = ref_close + 1;
+                    }
+                }
+                const char *target = markdownRefsLookup(ref, ref_len);
+                if (target) {
+                    char label_buf[512];
+                    size_t copy = label_len < sizeof(label_buf) - 1 ? label_len : sizeof(label_buf) - 1;
+                    memcpy(label_buf, text + label_start, copy);
+                    label_buf[copy] = '\0';
+                    int number = gMarkdownActiveLinks
+                        ? markdownRegisterLinkAndGetDisplayNumber(gMarkdownActiveLinks, label_buf, target)
+                        : -1;
+                    if (!markdownInlineAppendSpan(&buffer, &dst, &cap, label_buf, strlen(label_buf))) {
+                        free(buffer);
+                        return strdup(text);
+                    }
+                    if (number > 0 &&
+                        !markdownInlineAppendLinkMarker(&buffer, &dst, &cap, number)) {
+                        free(buffer);
+                        return strdup(text);
+                    }
+                    i = after;
+                    continue;
+                }
+            }
             if (text[close] == ']' && text[close + 1] == '(') {
                 size_t url_start = close + 2;
                 size_t url_end = url_start;
@@ -8572,9 +8876,16 @@ static char *markdownSimplifyInline(const char *text) {
 static size_t markdownVisibleWidth(const char *text) {
     size_t width = 0;
     for (size_t i = 0; text[i]; ++i) {
-        if ((unsigned char)text[i] == MD_MARK && text[i + 1] &&
-            markdownSgrForMark(text[i + 1])) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == MD_MARK && text[i + 1] && markdownSgrForMark(text[i + 1])) {
             i++;
+            continue;
+        }
+        /* A UTF-8 continuation byte is part of the character before it, not a
+         * column of its own. Counting bytes made the bullet "• " four wide,
+         * which the list prefixes then compensated for by indenting
+         * continuation lines two spaces too far. */
+        if ((c & 0xC0) == 0x80) {
             continue;
         }
         width++;
@@ -8595,8 +8906,8 @@ static void markdownWrapAndWrite(FILE *out, const char *text, const char *firstP
     }
     const char *prefix_first = firstPrefix ? firstPrefix : "";
     const char *prefix_sub = subPrefix ? subPrefix : prefix_first;
-    size_t prefix_first_len = strlen(prefix_first);
-    size_t prefix_sub_len = strlen(prefix_sub);
+    size_t prefix_first_len = markdownVisibleWidth(prefix_first);
+    size_t prefix_sub_len = markdownVisibleWidth(prefix_sub);
     int wrap_width = width > 20 ? width : MARKDOWN_WRAP_WIDTH;
 
     char *copy = strdup(text);
@@ -8993,12 +9304,12 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
             while (*p == ' ' || *p == '\t') p++;
             *content = p;
             markdownBuildPrefix(firstPrefix, firstSize, indent, checkbox);
-            markdownBuildPrefix(subPrefix, subSize, indent + 6, "      ");
+            markdownBuildPrefix(subPrefix, subSize, indent, "      ");
             return true;
         }
         *content = p;
         markdownBuildPrefix(firstPrefix, firstSize, indent, "• ");
-        markdownBuildPrefix(subPrefix, subSize, indent + 2, "  ");
+        markdownBuildPrefix(subPrefix, subSize, indent, "  ");
         return true;
     }
     if (isdigit((unsigned char)*p)) {
@@ -9015,12 +9326,27 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
             snprintf(suffix, sizeof(suffix), "%d. ", value);
             markdownBuildPrefix(firstPrefix, firstSize, indent, suffix);
             size_t suffix_len = strlen(suffix);
-            markdownBuildPrefix(subPrefix, subSize, indent + (int)suffix_len, "  ");
+            markdownBuildPrefix(subPrefix, subSize, indent + (int)suffix_len, "");
             return true;
         }
     }
     return false;
 }
+
+/* Prefix for the paragraph currently being accumulated. Non-empty only for a
+ * continuation paragraph inside a list item, so it lines up under the bullet
+ * instead of jumping back to the margin. Cleared by the flush that spends it. */
+static char gMarkdownParagraphPrefix[32] = "";
+static char gMarkdownParagraphPrefixSub[32] = "";
+/* The paragraph being accumulated is a list item, so it must not end with a
+ * blank line of its own. A markdown list is tight or loose according to
+ * whether ITS SOURCE has blank lines between the items, and the only way to
+ * preserve that is to let the blank lines in the source produce the blank
+ * lines in the output. Emitting one after every item made every list loose. */
+static bool gMarkdownParagraphIsListItem = false;
+/* A line ended with two spaces: markdown's hard break. The paragraph is
+ * flushed early to honour it, so this flush must not also close the block. */
+static bool gMarkdownParagraphHardBreak = false;
 
 static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, int wrap_width) {
     if (!paragraph || !*paragraph || !length || *length == 0) {
@@ -9041,11 +9367,17 @@ static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, 
     } else {
         char *formatted = markdownSimplifyInline(text);
         if (formatted) {
-            markdownWrapAndWrite(out, formatted, "", "", wrap_width);
+            markdownWrapAndWrite(out, formatted, gMarkdownParagraphPrefix,
+                                 gMarkdownParagraphPrefixSub, wrap_width);
             free(formatted);
         }
-        fputc('\n', out);
+        if (!gMarkdownParagraphIsListItem && !gMarkdownParagraphHardBreak) {
+            fputc('\n', out);
+        }
     }
+    gMarkdownParagraphIsListItem = false;
+    gMarkdownParagraphPrefix[0] = '\0';
+    gMarkdownParagraphPrefixSub[0] = '\0';
     *length = 0;
     **paragraph = '\0';
 }
@@ -10174,7 +10506,47 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     char *line = NULL;
     size_t line_cap = 0;
     ssize_t line_len;
+    /* Definitions first, because a reference may be used before it is defined
+     * -- keeping them at the bottom is the whole point of the syntax. The
+     * input is a temp file by the time it gets here, so a rewind is free. */
+    markdownRefsClear();
+    {
+        char *scan = NULL;
+        size_t scan_cap = 0;
+        char scan_fence = '\0';
+        ssize_t scan_len;
+        int scan_err = 0;
+        while ((scan_len = smallclueGetlineStream(&scan, &scan_cap, input, &scan_err)) >= 0) {
+            while (scan_len > 0 && (scan[scan_len - 1] == '\n' || scan[scan_len - 1] == '\r')) {
+                scan[--scan_len] = '\0';
+            }
+            const char *probe = scan;
+            while (*probe == ' ') probe++;
+            char fence = markdownFenceMarker(probe);
+            if (fence != '\0') {
+                scan_fence = (scan_fence == fence) ? '\0' : (scan_fence ? scan_fence : fence);
+                continue;
+            }
+            if (scan_fence != '\0') {
+                continue;
+            }
+            char *label = NULL;
+            char *target = NULL;
+            if (markdownParseRefDefinition(scan, &label, &target)) {
+                markdownRefsAdd(label, target);
+            }
+        }
+        free(scan);
+        rewind(input);
+    }
+
     char code_fence = '\0';
+    bool in_indented_code = false;
+    int indented_code_blanks = 0;
+    bool in_list_block = false;
+    gMarkdownParagraphPrefix[0] = '\0';
+    gMarkdownParagraphPrefixSub[0] = '\0';
+    gMarkdownParagraphIsListItem = false;
     bool in_table = false;
     char *paragraph = NULL;
     size_t paragraph_len = 0;
@@ -10229,6 +10601,8 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 *p = ' ';
             }
         }
+        bool hard_break = (line_len >= 2 && line[line_len - 1] == ' ' &&
+                           line[line_len - 2] == ' ');
         char *trimmed = line;
         while (*trimmed && isspace((unsigned char)*trimmed)) {
             trimmed++;
@@ -10489,7 +10863,68 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
 
         if (code_fence != '\0') {
             /* Preserve leading whitespace/tabs inside fenced code blocks. */
-            fprintf(output, "    %s\n", line);
+            if (gMarkdownMarks) fputs(MD_MARK_CODE, output);
+            fprintf(output, "    %s", line);
+            if (gMarkdownMarks) fputs(MD_MARK_RESET, output);
+            fputc('\n', output);
+            has_blank_separator = false;
+            continue;
+        }
+
+        /* Indentation is measured on the raw line: `trimmed` has lost it, and
+         * every decision below is about how far in the line starts. */
+        size_t line_indent = 0;
+        while (line[line_indent] == ' ') {
+            line_indent++;
+        }
+        if (*trimmed != '\0' && line_indent == 0) {
+            /* Back at the margin, so any list we were inside has ended. A list
+             * item is itself at the margin and sets this again in its own
+             * branch below, which is why clearing here is safe. */
+            in_list_block = false;
+        }
+
+        /* Indented code block -- four spaces at a block boundary.
+         *
+         * Two conditions keep this from eating things that are not code.
+         * paragraph_len == 0 means no paragraph is open: an indented chunk
+         * cannot interrupt one, which is what stops a wrapped continuation
+         * line from being read as code. And !in_list_block, because four
+         * spaces under a bullet is that item's continuation paragraph -- far
+         * commoner in real documents than an indented code block, and the
+         * reason this was worth being careful about.
+         *
+         * Interior blank lines are held rather than emitted, so a block that
+         * ends with one does not gain a trailing gap inside its own colour. */
+        if (in_indented_code) {
+            if (*trimmed == '\0') {
+                indented_code_blanks++;
+                continue;
+            }
+            if (line_indent >= 4) {
+                while (indented_code_blanks > 0) {
+                    fputc('\n', output);
+                    indented_code_blanks--;
+                }
+                if (gMarkdownMarks) fputs(MD_MARK_CODE, output);
+                fputs(line, output);
+                if (gMarkdownMarks) fputs(MD_MARK_RESET, output);
+                fputc('\n', output);
+                has_blank_separator = false;
+                continue;
+            }
+            in_indented_code = false;
+            indented_code_blanks = 0;
+            fputc('\n', output);
+            has_blank_separator = true;
+        } else if (*trimmed != '\0' && line_indent >= 4 && paragraph_len == 0 &&
+                   !in_list_block && !in_table) {
+            in_indented_code = true;
+            indented_code_blanks = 0;
+            if (gMarkdownMarks) fputs(MD_MARK_CODE, output);
+            fputs(line, output);
+            if (gMarkdownMarks) fputs(MD_MARK_RESET, output);
+            fputc('\n', output);
             has_blank_separator = false;
             continue;
         }
@@ -10503,7 +10938,11 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
+                bool was_item = gMarkdownParagraphIsListItem;
                 markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                if (was_item) {
+                    fputc('\n', output);
+                }
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             } else if (!has_blank_separator) {
@@ -10527,6 +10966,9 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             char *heading_text = markdownTrimInline(paragraph);
             if (heading_text && *heading_text) {
                 markdownWriteHeading(output, heading_text, setext_heading, render_width);
+                /* See the ATX site: has_blank_separator claims the output ends
+                 * with a blank line, so emit the one it claims. */
+                fputc('\n', output);
                 has_blank_separator = true;
             }
             paragraph_len = 0;
@@ -10571,6 +11013,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
             markdownWriteHeading(output, heading_text, heading, render_width);
+            fputc('\n', output);
             has_blank_separator = true;
             continue;
         }
@@ -10634,6 +11077,19 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             paragraph_link_only_chain = false;
         }
 
+        if (gMarkdownRefCount > 0) {
+            char *ref_label = NULL;
+            char *ref_target = NULL;
+            if (markdownParseRefDefinition(line, &ref_label, &ref_target)) {
+                /* Already collected in the pre-pass; it is a definition, not
+                 * a paragraph, and rendering it put a block of bare URLs at
+                 * the end of every document that keeps its links there. */
+                free(ref_label);
+                free(ref_target);
+                continue;
+            }
+        }
+
         char *list_text = NULL;
         char prefix_first[32];
         char prefix_sub[32];
@@ -10644,14 +11100,30 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
-            char *formatted = markdownSimplifyInline(list_text);
-            if (formatted) {
-                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, render_width);
-                free(formatted);
-            }
+            /* Buffered, not written. A list item's text usually continues on
+             * the following source lines -- indented under the marker, with no
+             * blank line between -- and those are part of the item, not a new
+             * block. Rendering the first line immediately wrapped it to the
+             * margin and then started the rest again underneath, which is
+             * where stray one-word lines like "    but" came from. Seeding the
+             * paragraph with the item and letting the existing flush points
+             * spend it means the whole item wraps once, under its own
+             * prefix. */
+            snprintf(gMarkdownParagraphPrefix, sizeof(gMarkdownParagraphPrefix), "%s", prefix_first);
+            snprintf(gMarkdownParagraphPrefixSub, sizeof(gMarkdownParagraphPrefixSub), "%s", prefix_sub);
+            gMarkdownParagraphIsListItem = true;
+            markdownParagraphAppendWithSeparator(&paragraph, &paragraph_len,
+                                                 &paragraph_cap, list_text, " ");
+            /* Not freed: markdownExtractListItem points into `line`. */
             has_blank_separator = false;
             paragraph_link_only_chain = false;
+            in_list_block = true;
             continue;
+        }
+        if (in_list_block && paragraph_len == 0 && line_indent >= 2) {
+            snprintf(gMarkdownParagraphPrefix, sizeof(gMarkdownParagraphPrefix), "  ");
+            snprintf(gMarkdownParagraphPrefixSub, sizeof(gMarkdownParagraphPrefixSub), "  ");
+            gMarkdownParagraphIsListItem = false;
         }
         bool link_only_line = markdownLineLooksLikeLinkOnly(trimmed);
         const char *separator = " ";
@@ -10659,6 +11131,17 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             separator = " · ";
         }
         markdownParagraphAppendWithSeparator(&paragraph, &paragraph_len, &paragraph_cap, trimmed, separator);
+        if (hard_break && paragraph_len > 0) {
+            /* Flush what we have and carry the prefix on, so the next line
+             * starts where a wrapped one would have. */
+            char carry[32];
+            snprintf(carry, sizeof(carry), "%s", gMarkdownParagraphPrefixSub);
+            gMarkdownParagraphHardBreak = true;
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            gMarkdownParagraphHardBreak = false;
+            snprintf(gMarkdownParagraphPrefix, sizeof(gMarkdownParagraphPrefix), "%s", carry);
+            snprintf(gMarkdownParagraphPrefixSub, sizeof(gMarkdownParagraphPrefixSub), "%s", carry);
+        }
         paragraph_link_only_chain = link_only_line;
         has_blank_separator = false;
     }
@@ -10673,6 +11156,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         markdownRenderTable(output, table_rows, table_row_count);
         has_blank_separator = true;
     }
+    markdownRefsClear();
     free(paragraph);
     free(line);
     return 0;
