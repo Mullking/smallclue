@@ -21,10 +21,20 @@ extern "C" {
 
 typedef int (*SmallclueAppletEntry)(int argc, char **argv);
 
+typedef bool (*SmallclueAppletAvailable)(void);
+
 typedef struct SmallclueApplet {
     const char *name;
     SmallclueAppletEntry entry;
     const char *description;
+    /* NULL means "always". Otherwise the applet is left out of the listing
+     * when this returns false. Some applets are fronts for a host runtime
+     * that not every build has, and one that can only answer "not available
+     * on this platform" is worse in the list than absent from it: it reads
+     * as a capability the build has, and the only way to find out otherwise
+     * is to run it. Still dispatchable by name, so invoking one directly
+     * gives the real explanation rather than "unknown applet". */
+    SmallclueAppletAvailable available;
 } SmallclueApplet;
 
 int smallclueMain(int argc, char **argv);

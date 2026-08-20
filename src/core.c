@@ -2814,6 +2814,44 @@ static int smallclueHistoryCommand(int argc, char **argv) {
     return 0;
 }
 
+// Whether an applet's backing runtime is actually in this build. See the
+// `available` field in smallclue.h.
+//
+// Both of these are fronts for the PSCAL app runtime, and a build without it
+// links the no-op stubs near the top of this file rather than failing to
+// link -- so the failure is not a missing symbol, it is an applet that
+// appears to work and does nothing. iSH-AOK is such a build: `script`
+// reported success and captured no output, and `vproc-test` could only say
+// it was for iOS builds, while both sat in the applet list looking real.
+static bool smallclueScriptAvailable(void) {
+#if defined(PSCAL_TARGET_IOS)
+    return &PSCALRuntimeBeginScriptCapture != NULL;
+#else
+    return false;
+#endif
+}
+
+// passwd is a third case: not a runtime that may be absent, but a body
+// compiled only under __linux__ -- and native programs are host code, so on
+// the app builds that is never true no matter that the GUEST is Linux. It
+// needs lckpwdf/ulckpwdf and a crypt(3) that speaks $6$, none of which Darwin
+// has; until one of those is supplied it can only decline.
+static bool smallcluePasswdAvailable(void) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool smallclueVprocTestAvailable(void) {
+#if defined(PSCAL_TARGET_IOS)
+    return true;
+#else
+    return false;
+#endif
+}
+
 static const SmallclueApplet kSmallclueApplets[] = {
     {"[", smallclueBracketCommand, "Evaluate expressions"},
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
@@ -2892,7 +2930,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
-    {"passwd", smallcluePasswdCommand, "Change user password"},
+    {"passwd", smallcluePasswdCommand, "Change user password", smallcluePasswdAvailable},
     {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
     {"printf", smallcluePrintfCommand, "Format and print data"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
@@ -2922,7 +2960,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
     {"sftp", smallclueSftpCommand, "Interactive SFTP client"},
-    {"script", smallclueScriptCommand, "Record terminal output to a file"},
+    {"script", smallclueScriptCommand, "Record terminal output to a file", smallclueScriptAvailable},
     {"ssh", smallclueSshCommand, "OpenSSH client"},
     {"ssh-keygen", smallclueSshKeygenCommand, "Generate SSH key pairs"},
     {"ssh-copy-id", smallclueSshCopyIdCommand, "Install SSH public keys on a remote host"},
@@ -2947,7 +2985,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
     {"uptime", smallclueUptimeCommand, "Show app uptime (use -s for system uptime)"},
     {"version", smallclueVersionCommand, "Show app version"},
-    {"vproc-test", smallclueVprocTestCommand, "Run vproc/terminal diagnostics"},
+    {"vproc-test", smallclueVprocTestCommand, "Run vproc/terminal diagnostics", smallclueVprocTestAvailable},
     {"watch", smallclueWatchCommand, "Periodically run a command"},
     {"vi", smallclueEditorCommand, "Alias for Nextvi text editor"},
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
@@ -12978,6 +13016,9 @@ static void smallcluePrintAppletList(FILE *out, const char *heading, bool color)
     }
     for (size_t i = 0; i < kSmallclueAppletCount; ++i) {
         const SmallclueApplet *applet = &kSmallclueApplets[i];
+        if (applet->available && !applet->available()) {
+            continue;
+        }
         if (color) {
             fprintf(out, "  \033[36m%-16s\033[0m %s\n", applet->name, applet->description ? applet->description : "");
         } else {
@@ -13912,6 +13953,15 @@ static int smallclueVersionCommand(int argc, char **argv) {
 #endif
     if (!version && fallback) {
         version = strdup(fallback);
+    }
+    // iSH-AOK compiles this in and has no PROGRAM_VERSION, so `version` had
+    // nothing to report and said "unknown". Its own build string is the right
+    // answer -- the same one /AOK/VERSION and `uname -v` give, so the three
+    // agree -- and it is already malloc'd, which is what the free() below
+    // wants. Weak, so a standalone smallclue still links without it.
+    extern char *copyBuildVersion(void) __attribute__((weak));
+    if (!version && &copyBuildVersion) {
+        version = copyBuildVersion();
     }
     if (!version) {
         printf("version: unknown\n");
