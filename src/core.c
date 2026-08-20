@@ -7596,6 +7596,28 @@ static void markdownParagraphAppendWithSeparator(char **buffer,
 static const char *markdownSkipSoftWhitespace(const char *text);
 static bool markdownLooksLikeNewsMetaLine(const char *line);
 
+/* True only while rendering text that came out of markdownConvertHtmlToMarkdownish.
+ *
+ * Every heuristic guarded by this one exists to clean up a scraped web page:
+ * CSS and script fragments on their own lines, links split across lines by the
+ * HTML converter, navigation furniture, and words run together because the
+ * markup that separated them is gone. On a real .md file each of them is not
+ * merely unnecessary but actively wrong, because the file already has the
+ * structure they are trying to reconstruct.
+ *
+ * That was not theoretical. Rendering /AOK/docs, "iSH-AOK" came out as
+ * "i SH-AOK" and "macOS" as "mac OS" -- camelCase splitting meant for
+ * run-together scraped text -- and any ordinary sentence with two commas and a
+ * filename in it ("small, synthetic, read-only filesystem (`aokfs`, see
+ * `fs/aok.c`) that") was DELETED as a CSS selector list, because a '.' not
+ * followed by a space looked like a class selector.
+ *
+ * A native program's globals outlive the call (kernel/native.h), so this is
+ * saved and restored around each render rather than initialised once --
+ * the same treatment gMarkdownActiveLinks gets, and for the same reason.
+ */
+static bool gMarkdownFromHtml = false;
+
 static bool markdownLineLooksLikeLinkOnly(const char *line) {
     if (!line || !*line) {
         return false;
@@ -7697,6 +7719,11 @@ static void markdownNormalizeDisplaySpacing(const char *input, char *output, siz
     }
     output[0] = '\0';
     if (!input || !*input) {
+        return;
+    }
+    if (!gMarkdownFromHtml) {
+        /* A markdown file's words are already separated by the author. */
+        snprintf(output, output_size, "%s", input);
         return;
     }
     if (strstr(input, "://")) {
@@ -7825,6 +7852,9 @@ static bool markdownExtractFragmentLinkLabel(const char *line,
 }
 
 static bool markdownIsFragmentedBulletLinkOpen(const char *line, const char **prefix_out) {
+    if (!gMarkdownFromHtml) {
+        return false;
+    }
     if (prefix_out) {
         *prefix_out = NULL;
     }
@@ -7852,6 +7882,9 @@ static bool markdownIsFragmentedBulletLinkOpen(const char *line, const char **pr
 }
 
 static bool markdownIsFragmentedLinkOpen(const char *line, const char **prefix_out) {
+    if (!gMarkdownFromHtml) {
+        return false;
+    }
     if (prefix_out) {
         *prefix_out = NULL;
     }
@@ -8044,6 +8077,56 @@ static bool markdownHtmlTagSupported(const char *name) {
            strcmp(name, "blockquote") == 0;
 }
 
+/* Emphasis, enough of it.
+ *
+ * The renderer used to answer "every '*' and '_' is a delimiter" and delete
+ * them all, which quietly rewrote the technical vocabulary these documents are
+ * made of: TZ_NAME became TZNAME, kernel/native_libc.c became
+ * kernel/nativelibc.c, and "5 * 3" became "5  3". This is not a CommonMark
+ * parser and does not try to be one, but it borrows the two rules that matter
+ * for prose about software:
+ *
+ *  - A delimiter run has to be matched. An opener is not followed by
+ *    whitespace, a closer is not preceded by it, and an opener only counts if
+ *    a closer of the same length actually turns up later. A lone asterisk is a
+ *    multiplication sign.
+ *  - '_' between two alphanumerics is literal -- CommonMark's own rule, and
+ *    the one that lets snake_case through.
+ *
+ * State is needed rather than a lookahead: the closer of a span that was
+ * already opened has no closer of its own ahead of it, so judging each run on
+ * its own would strip "_open" and keep "close_".
+ */
+#define MARKDOWN_EMPHASIS_MAX_DEPTH 8
+
+typedef struct {
+    char ch;
+    size_t run;
+} MarkdownEmphasisFrame;
+
+static size_t markdownInlineRunLength(const char *text, size_t at) {
+    char ch = text[at];
+    size_t run = 0;
+    while (text[at + run] == ch) {
+        run++;
+    }
+    return run;
+}
+
+static bool markdownInlineHasCloser(const char *text, size_t from, char ch, size_t run) {
+    for (size_t j = from; text[j]; ++j) {
+        if (text[j] != ch) {
+            continue;
+        }
+        size_t here = markdownInlineRunLength(text, j);
+        if (here == run && j > from && !isspace((unsigned char)text[j - 1])) {
+            return true;
+        }
+        j += here - 1;
+    }
+    return false;
+}
+
 static char *markdownSimplifyInline(const char *text) {
     if (!text) {
         return strdup("");
@@ -8055,6 +8138,8 @@ static char *markdownSimplifyInline(const char *text) {
         return strdup(text);
     }
     size_t dst = 0;
+    MarkdownEmphasisFrame emphasis_stack[MARKDOWN_EMPHASIS_MAX_DEPTH];
+    size_t emphasis_depth = 0;
     bool anchor_active = false;
     size_t anchor_start = 0;
     char anchor_href[1024];
@@ -8209,15 +8294,80 @@ static char *markdownSimplifyInline(const char *text) {
             }
         }
         if (ch == '`') {
-            i++;
+            /* A code span is verbatim. Nothing inside it is markup -- that is
+             * the entire point of writing `a*b*c` or `TZ_NAME` -- and skipping
+             * the backtick without tracking the span is what let emphasis and
+             * link syntax run loose inside code. An unterminated backtick is
+             * left as a literal, which is what every other renderer does. */
+            size_t run = 1;
+            while (text[i + run] == '`') {
+                run++;
+            }
+            size_t scan = i + run;
+            size_t close = 0;
+            while (text[scan]) {
+                if (text[scan] == '`') {
+                    size_t close_run = 1;
+                    while (text[scan + close_run] == '`') {
+                        close_run++;
+                    }
+                    if (close_run == run) {
+                        close = scan;
+                        break;
+                    }
+                    scan += close_run;
+                    continue;
+                }
+                scan++;
+            }
+            if (close == 0) {
+                if (!markdownInlineAppendChar(&buffer, &dst, &cap, ch)) {
+                    free(buffer);
+                    return strdup(text);
+                }
+                i++;
+                continue;
+            }
+            for (size_t j = i + run; j < close; ++j) {
+                if (!markdownInlineAppendChar(&buffer, &dst, &cap, text[j])) {
+                    free(buffer);
+                    return strdup(text);
+                }
+            }
+            i = close + run;
             continue;
         }
         if ((ch == '*' || ch == '_')) {
-            size_t advance = 1;
-            if (text[i + 1] == ch) {
-                advance = 2;
+            size_t run = markdownInlineRunLength(text, i);
+            bool prev_space = (i == 0) || isspace((unsigned char)text[i - 1]);
+            bool next_space = (text[i + run] == '\0') || isspace((unsigned char)text[i + run]);
+            bool prev_alnum = (i > 0) && isalnum((unsigned char)text[i - 1]);
+            bool next_alnum = isalnum((unsigned char)text[i + run]);
+
+            if (emphasis_depth > 0 &&
+                emphasis_stack[emphasis_depth - 1].ch == ch &&
+                emphasis_stack[emphasis_depth - 1].run == run &&
+                !prev_space && !(ch == '_' && next_alnum)) {
+                emphasis_depth--;
+                i += run;
+                continue;
             }
-            i += advance;
+            if (!next_space && !(ch == '_' && prev_alnum) &&
+                emphasis_depth < MARKDOWN_EMPHASIS_MAX_DEPTH &&
+                markdownInlineHasCloser(text, i + run, ch, run)) {
+                emphasis_stack[emphasis_depth].ch = ch;
+                emphasis_stack[emphasis_depth].run = run;
+                emphasis_depth++;
+                i += run;
+                continue;
+            }
+            for (size_t j = 0; j < run; ++j) {
+                if (!markdownInlineAppendChar(&buffer, &dst, &cap, ch)) {
+                    free(buffer);
+                    return strdup(text);
+                }
+            }
+            i += run;
             continue;
         }
         if (ch == '[') {
@@ -9443,6 +9593,9 @@ static bool markdownContainsIgnoreCase(const char *text, const char *needle) {
 }
 
 static bool markdownLooksLikeNewsMetaLine(const char *line) {
+    if (!gMarkdownFromHtml) {
+        return false;
+    }
     if (!line || !*line) {
         return false;
     }
@@ -9480,6 +9633,9 @@ static bool markdownLooksLikeNewsMetaLine(const char *line) {
 }
 
 static bool markdownLooksLikeCssSelectorLine(const char *line) {
+    if (!gMarkdownFromHtml) {
+        return false;
+    }
     if (!line || !*line) {
         return false;
     }
@@ -9559,6 +9715,9 @@ static const char *markdownSkipSoftWhitespace(const char *text) {
 }
 
 static bool markdownLooksLikeWebNoiseLine(const char *line) {
+    if (!gMarkdownFromHtml) {
+        return false;
+    }
     if (!line || !*line) {
         return false;
     }
@@ -10454,8 +10613,11 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     }
 
     MarkdownLinkList *previous_links = gMarkdownActiveLinks;
+    bool previous_from_html = gMarkdownFromHtml;
     gMarkdownActiveLinks = links_out;
+    gMarkdownFromHtml = (converted_html != NULL);
     int render_status = markdownRenderStream(label, source, buffer);
+    gMarkdownFromHtml = previous_from_html;
     gMarkdownActiveLinks = previous_links;
     fclose(source);
     free(converted_html);
