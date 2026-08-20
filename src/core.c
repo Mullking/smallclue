@@ -7770,124 +7770,6 @@ static void markdownAppendTokenFixed(char *buffer, size_t *length, size_t capaci
     }
 }
 
-static bool markdownIsEmailTokenChar(char ch) {
-    unsigned char u = (unsigned char)ch;
-    return isalnum(u) || ch == '.' || ch == '_' || ch == '%' || ch == '+' || ch == '-';
-}
-
-static bool markdownCanInsertSpace(char *buffer, size_t *length, size_t capacity, size_t at) {
-    if (!buffer || !length || *length + 1 >= capacity || at > *length) {
-        return false;
-    }
-    memmove(buffer + at + 1, buffer + at, *length - at + 1);
-    buffer[at] = ' ';
-    (*length)++;
-    return true;
-}
-
-static void markdownReplaceAllInPlace(char *buffer,
-                                      size_t *length,
-                                      size_t capacity,
-                                      const char *from,
-                                      const char *to) {
-    if (!buffer || !length || !from || !to) {
-        return;
-    }
-    size_t from_len = strlen(from);
-    size_t to_len = strlen(to);
-    if (from_len == 0 || from_len >= capacity) {
-        return;
-    }
-    char *pos = strstr(buffer, from);
-    while (pos) {
-        size_t at = (size_t)(pos - buffer);
-        if (to_len > from_len) {
-            size_t grow = to_len - from_len;
-            if (*length + grow + 1 > capacity) {
-                break;
-            }
-            memmove(buffer + at + to_len, buffer + at + from_len, *length - at - from_len + 1);
-            *length += grow;
-        } else if (to_len < from_len) {
-            size_t shrink = from_len - to_len;
-            memmove(buffer + at + to_len, buffer + at + from_len, *length - at - from_len + 1);
-            *length -= shrink;
-        }
-        if (to_len > 0) {
-            memcpy(buffer + at, to, to_len);
-        }
-        pos = strstr(buffer + at + to_len, from);
-    }
-}
-
-static void markdownNormalizeDisplaySpacing(const char *input, char *output, size_t output_size) {
-    if (!output || output_size == 0) {
-        return;
-    }
-    output[0] = '\0';
-    if (!input || !*input) {
-        return;
-    }
-    if (!gMarkdownFromHtml) {
-        /* A markdown file's words are already separated by the author. */
-        snprintf(output, output_size, "%s", input);
-        return;
-    }
-    if (strstr(input, "://")) {
-        snprintf(output, output_size, "%s", input);
-        return;
-    }
-    size_t out_len = 0;
-    for (size_t i = 0; input[i]; ++i) {
-        char ch = input[i];
-        if (out_len > 0) {
-            char prev = output[out_len - 1];
-            char next = input[i + 1];
-            bool insert_space = false;
-            if (islower((unsigned char)prev) && isupper((unsigned char)ch)) {
-                insert_space = true;
-            } else if (isdigit((unsigned char)prev) && isalpha((unsigned char)ch)) {
-                insert_space = true;
-            } else if (isalnum((unsigned char)prev) && ch == '[') {
-                insert_space = true;
-            } else if (isalnum((unsigned char)prev) && ch == '#') {
-                insert_space = true;
-            } else if (isupper((unsigned char)prev) && isupper((unsigned char)ch) &&
-                       islower((unsigned char)next)) {
-                insert_space = true;
-            }
-            if (insert_space && !isspace((unsigned char)prev)) {
-                if (!markdownCanInsertSpace(output, &out_len, output_size, out_len)) {
-                    break;
-                }
-            }
-        }
-        if (out_len + 1 >= output_size) {
-            break;
-        }
-        output[out_len++] = ch;
-        output[out_len] = '\0';
-        if (ch == '@' && out_len >= 2) {
-            size_t local_start = out_len - 1;
-            while (local_start > 0 && markdownIsEmailTokenChar(output[local_start - 1])) {
-                local_start--;
-            }
-            if (local_start > 0 &&
-                isalnum((unsigned char)output[local_start - 1]) &&
-                !isspace((unsigned char)output[local_start - 1])) {
-                if (!markdownCanInsertSpace(output, &out_len, output_size, local_start)) {
-                    break;
-                }
-            }
-        }
-    }
-    markdownReplaceAllInPlace(output, &out_len, output_size, "inquirespress@", "inquires press@");
-    markdownReplaceAllInPlace(output, &out_len, output_size, "inquiriessupport@", "inquiries support@");
-    markdownReplaceAllInPlace(output, &out_len, output_size, "inquiressupport@", "inquires support@");
-    markdownReplaceAllInPlace(output, &out_len, output_size, "assetsDownload", "assets Download");
-    output[out_len] = '\0';
-}
-
 static char *markdownTrimAsciiInPlace(char *text) {
     if (!text) {
         return text;
@@ -7914,8 +7796,12 @@ static bool markdownExtractFragmentLinkLabel(const char *line,
     if (meta_out && meta_out_size > 0) {
         meta_out[0] = '\0';
     }
+    /* A working copy, because markdownTrimAsciiInPlace and the ####-splitting
+     * below both write into it. It used to be filled by the display-spacing
+     * pass, which is gone -- the boundary now comes from the HTML element (see
+     * markdownHtmlTagKind), so the line arrives already spaced. */
     char normalized[4096];
-    markdownNormalizeDisplaySpacing(line, normalized, sizeof(normalized));
+    snprintf(normalized, sizeof(normalized), "%s", line);
     char *probe = markdownTrimAsciiInPlace(normalized);
     if (!*probe || strcmp(probe, "[") == 0 || strcmp(probe, "]") == 0) {
         return false;
@@ -9697,6 +9583,58 @@ static const char *markdownFindIgnoreCaseBounded(const char *text, const char *l
     return NULL;
 }
 
+/* Does dropping this tag leave a word boundary behind?
+ *
+ * This is the honest version of a problem that used to be solved by guessing.
+ * An HTML converter that removes tags without putting anything in their place
+ * runs words together -- "<td>Some</td><td>Text</td>" becomes "SomeText" --
+ * and the old answer was to look for a lowercase letter followed by an
+ * uppercase one and insert a space there. That reconstructed the boundary in
+ * scraped navigation bars and destroyed it everywhere else: macOS became "mac
+ * OS", GitHub became "Git Hub", NSURLSession became "NSURL Session".
+ *
+ * A browser does not guess. It knows that <span> is inline and <td> is not,
+ * and so does this: the boundary comes from the element, which is the only
+ * place the information actually exists.
+ *
+ * The limit of that, stated so it is not mistaken for an oversight: CSS can
+ * make an inline element a block one, and this does not read CSS. GitHub's
+ * navigation is two <span>s inside one <a>, laid out as separate lines by a
+ * stylesheet, and comes through as "GitHub CopilotWrite better code with AI".
+ * That is wrong and it is not fixable from the element name -- and the cure of
+ * guessing from letter case is worse, because it is wrong about macOS, GitHub
+ * and NSURLSession in every document rather than about navigation furniture in
+ * some of them. The article text on the same page is correct throughout.
+ *
+ * Only tags that reach the default case need classifying -- headings, links,
+ * images, li, br, hr and the paragraph-level set are handled above. */
+typedef enum {
+    MD_HTML_TAG_INLINE = 0,   /* no boundary: <b>mac</b>OS really is "macOS" */
+    MD_HTML_TAG_SPACED,       /* side by side on screen: cells, buttons */
+    MD_HTML_TAG_LINE,         /* its own line */
+    MD_HTML_TAG_BLOCK         /* its own paragraph */
+} MarkdownHtmlTagKind;
+
+static MarkdownHtmlTagKind markdownHtmlTagKind(const char *name) {
+    static const char *spaced[] = {
+        "td", "th", "button", "label", "option", "figcaption", "output",
+        "meter", "progress", NULL
+    };
+    static const char *line[] = {
+        "dt", "dd", "summary", "legend", "caption", "optgroup", "colgroup",
+        "thead", "tbody", "tfoot", "col", NULL
+    };
+    static const char *block[] = {
+        "main", "aside", "nav", "figure", "form", "fieldset", "dl", "pre",
+        "address", "details", "dialog", "menu", "video", "audio", "picture",
+        "map", "noframes", "frameset", "center", "marquee", NULL
+    };
+    for (const char **t = spaced; *t; ++t) if (strcmp(name, *t) == 0) return MD_HTML_TAG_SPACED;
+    for (const char **t = line; *t; ++t) if (strcmp(name, *t) == 0) return MD_HTML_TAG_LINE;
+    for (const char **t = block; *t; ++t) if (strcmp(name, *t) == 0) return MD_HTML_TAG_BLOCK;
+    return MD_HTML_TAG_INLINE;
+}
+
 static char *markdownConvertHtmlToMarkdownish(const char *html) {
     if (!html) {
         return strdup("");
@@ -9982,6 +9920,28 @@ static char *markdownConvertHtmlToMarkdownish(const char *html) {
                 continue;
             }
 
+            switch (markdownHtmlTagKind(tag_name)) {
+                case MD_HTML_TAG_SPACED:
+                    if (!markdownTextAppendChar(&out, &dst, &cap, ' ')) {
+                        free(out);
+                        return strdup("");
+                    }
+                    break;
+                case MD_HTML_TAG_LINE:
+                    if (!markdownTextAppendNewlines(&out, &dst, &cap, 1)) {
+                        free(out);
+                        return strdup("");
+                    }
+                    break;
+                case MD_HTML_TAG_BLOCK:
+                    if (!markdownTextAppendNewlines(&out, &dst, &cap, 2)) {
+                        free(out);
+                        return strdup("");
+                    }
+                    break;
+                case MD_HTML_TAG_INLINE:
+                    break;
+            }
             i = close + 1;
             continue;
         }
@@ -10613,8 +10573,6 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         }
         char reconstructed_line[8192];
         reconstructed_line[0] = '\0';
-        char normalized_line[8192];
-        normalized_line[0] = '\0';
         const char *fragment_prefix = NULL;
         if (fragmented_link_active) {
             if (*trimmed == '\0') {
@@ -10735,11 +10693,6 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 fragmented_link_meta[0] = '\0';
                 continue;
             }
-        }
-
-        markdownNormalizeDisplaySpacing(trimmed, normalized_line, sizeof(normalized_line));
-        if (normalized_line[0]) {
-            trimmed = normalized_line;
         }
 
         if (code_fence == '\0') {
