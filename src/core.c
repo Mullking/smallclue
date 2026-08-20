@@ -7457,20 +7457,43 @@ static bool markdownInlineAppendLinkMarker(char **buffer,
     return markdownInlineAppendSpan(buffer, length, capacity, " [link]", 7);
 }
 
+// Where `md` looks for the documents it lists, and for a bare name like
+// `md native-programs`.
+//
+// SMALLCLUE_MARKDOWN_DOCS_DIR lets a build point that at documentation it
+// ships. iSH-AOK sets it to /AOK/docs, which is compiled into the app and so is
+// always present; without it the answer is $HOME/Docs exactly as before, and
+// that stays the fallback when the configured directory is not there. So a
+// build that defines nothing is unchanged, and one that defines a directory it
+// then loses degrades to the old behaviour rather than to an error.
+static int markdownDocsDir(char *out, size_t out_len) {
+#ifdef SMALLCLUE_MARKDOWN_DOCS_DIR
+    {
+        struct stat st;
+        if (stat(SMALLCLUE_MARKDOWN_DOCS_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int n = snprintf(out, out_len, "%s", SMALLCLUE_MARKDOWN_DOCS_DIR);
+            if (n > 0 && (size_t) n < out_len) {
+                return 0;
+            }
+        }
+    }
+#endif
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        return -1;
+    }
+    return smallclueBuildPath(out, out_len, home, "Docs") == 0 ? 0 : -1;
+}
+
 static int markdownEnumerateDocuments(MarkdownDocEntry **entries_out,
                                       size_t *count_out,
                                       char *docs_dir_out,
                                       size_t docs_dir_len) {
     if (entries_out) *entries_out = NULL;
     if (count_out) *count_out = 0;
-    const char *home = getenv("HOME");
-    if (!home || !*home) {
-        fprintf(stderr, "md: HOME is not set\n");
-        return 1;
-    }
     char docs_dir[PATH_MAX];
-    if (smallclueBuildPath(docs_dir, sizeof(docs_dir), home, "Docs") != 0) {
-        fprintf(stderr, "md: unable to resolve Docs directory\n");
+    if (markdownDocsDir(docs_dir, sizeof(docs_dir)) != 0) {
+        fprintf(stderr, "md: unable to resolve the documents directory\n");
         return 1;
     }
     if (docs_dir_out && docs_dir_len > 0) {
@@ -10333,12 +10356,8 @@ static int markdownResolvePath(const char *input, char *resolved, size_t resolve
     if (strchr(input, '/')) {
         return -1;
     }
-    const char *home = getenv("HOME");
-    if (!home || !*home) {
-        return -1;
-    }
     char docs_directory[PATH_MAX];
-    if (smallclueBuildPath(docs_directory, sizeof(docs_directory), home, "Docs") != 0) {
+    if (markdownDocsDir(docs_directory, sizeof(docs_directory)) != 0) {
         return -1;
     }
     char candidate[PATH_MAX];
