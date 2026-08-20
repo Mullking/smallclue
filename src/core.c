@@ -1300,6 +1300,71 @@ enum {
     PAGER_KEY_RESIZE
 };
 
+/* Colour, without letting a document paint the terminal.
+ *
+ * md renders text that may have come off the network, and the pager runs every
+ * line through smallclueSanitizeAndPrint precisely so that a hostile page
+ * cannot emit escape sequences -- an ESC arrives as "^[" and stays inert. That
+ * protection is the reason md had no colour: anything the renderer emitted was
+ * neutralised alongside everything else.
+ *
+ * So the renderer does not emit escapes. It emits a two-byte private marker,
+ * and the pager expands markers into SGR sequences only for buffers it was
+ * told are markdown renders. Content keeps no way to produce an escape: the
+ * worst a document can do by carrying a stray marker byte is change a colour,
+ * because that is the only thing the expansion can express -- no cursor
+ * movement, no screen clear, no title change, no mode switch.
+ */
+#define MD_MARK 0x01
+
+/* Written as two adjacent literals on purpose. "\x01c" is NOT 0x01 followed by
+ * 'c' -- a hex escape consumes every hex digit after it, so that spells 0x1C,
+ * and "\x01b" spells ESC, which is the one byte this whole design exists to
+ * keep out of the stream. Splitting the literal stops the escape at the quote. */
+#define MD_MARK_RESET   "\x01" "r"
+#define MD_MARK_HEADING "\x01" "h"
+#define MD_MARK_CODE    "\x01" "c"
+#define MD_MARK_BOLD    "\x01" "b"
+#define MD_MARK_EM      "\x01" "e"
+#define MD_MARK_LINK    "\x01" "l"
+#define MD_MARK_RULE    "\x01" "u"
+
+/* Every marker is this wide, which is what keeps the wrapper's arithmetic
+ * honest -- see markdownVisibleWidth. */
+#define MD_MARK_LEN 2
+
+/* Colour is for a terminal that asked for it: NO_COLOR is honoured (no-color.org),
+ * a dumb or unset TERM is taken at its word, and a redirect gets plain text. */
+static bool markdownColourWanted(void) {
+    const char *no_colour = getenv("NO_COLOR");
+    if (no_colour && *no_colour) {
+        return false;
+    }
+    const char *term = getenv("TERM");
+    if (!term || !*term || strcmp(term, "dumb") == 0) {
+        return false;
+    }
+    return isatty(STDOUT_FILENO) != 0;
+}
+
+/* True while rendering markdown for the screen. Saved and restored around the
+ * render like gMarkdownFromHtml, and false everywhere else -- markdownExtractTitle
+ * runs outside a render and must hand the document list plain text. */
+static bool gMarkdownMarks = false;
+
+static const char *markdownSgrForMark(char code) {
+    switch (code) {
+        case 'r': return "\x1b[0m";
+        case 'h': return "\x1b[1;36m";   /* headings: bold cyan */
+        case 'c': return "\x1b[33m";     /* code spans and blocks: yellow */
+        case 'b': return "\x1b[1m";      /* strong */
+        case 'e': return "\x1b[4m";      /* emphasis, underlined -- italics are not universal */
+        case 'l': return "\x1b[36m";     /* link markers */
+        case 'u': return "\x1b[2m";      /* rules, table borders, bullets */
+        default: return NULL;
+    }
+}
+
 typedef struct {
     FILE *file;
     size_t *offsets;
@@ -1307,6 +1372,7 @@ typedef struct {
     size_t line_count;
     size_t length;
     bool raw_mode;
+    bool sgr_marks;
 } PagerBuffer;
 
 typedef struct {
@@ -6035,11 +6101,24 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
     return 0;
 }
 
-static void smallclueSanitizeAndPrint(const char *data, size_t len, FILE *out) {
+/* colour == false strips markers instead of expanding them, which is what a
+ * redirected or NO_COLOR run wants: the text, with nothing added. */
+static void smallclueSanitizeAndPrintEx(const char *data, size_t len, FILE *out,
+                                        bool marks, bool colour) {
     if (!data) return;
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)data[i];
         if (c == '\0') break;
+        if (marks && c == MD_MARK && i + 1 < len) {
+            const char *sgr = markdownSgrForMark(data[i + 1]);
+            if (sgr) {
+                if (colour) {
+                    fputs(sgr, out);
+                }
+                i++;
+                continue;
+            }
+        }
         if (c == 0x7F) {
             fputc('^', out);
             fputc('?', out);
@@ -6052,6 +6131,10 @@ static void smallclueSanitizeAndPrint(const char *data, size_t len, FILE *out) {
     }
 }
 
+static void smallclueSanitizeAndPrint(const char *data, size_t len, FILE *out) {
+    smallclueSanitizeAndPrintEx(data, len, out, false, false);
+}
+
 static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_rows, const char *highlight_target) {
     if (!buffer || !buffer->file || !buffer->offsets) {
         return;
@@ -6059,6 +6142,8 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     if (page_rows < 1) {
         page_rows = 1;
     }
+    /* The same test the screen-clear above already trusts. */
+    bool colour = buffer->sgr_marks && markdownColourWanted();
     if (isatty(STDOUT_FILENO)) {
         fputs("\x1b[2J\x1b[H", stdout);
     } else {
@@ -6081,32 +6166,32 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
                 if (buffer->raw_mode) {
                     fwrite(line, 1, prefix_len, stdout);
                 } else {
-                    smallclueSanitizeAndPrint(line, prefix_len, stdout);
+                    smallclueSanitizeAndPrintEx(line, prefix_len, stdout, buffer->sgr_marks, colour);
                 }
                 fputs("\x1b[7m", stdout);
                 if (buffer->raw_mode) {
                     fwrite(hit, 1, strlen(highlight_target), stdout);
                 } else {
-                    smallclueSanitizeAndPrint(hit, strlen(highlight_target), stdout);
+                    smallclueSanitizeAndPrintEx(hit, strlen(highlight_target), stdout, buffer->sgr_marks, colour);
                 }
                 fputs("\x1b[0m", stdout);
                 if (buffer->raw_mode) {
                     fputs(hit + strlen(highlight_target), stdout);
                 } else {
-                    smallclueSanitizeAndPrint(hit + strlen(highlight_target), SIZE_MAX, stdout);
+                    smallclueSanitizeAndPrintEx(hit + strlen(highlight_target), SIZE_MAX, stdout, buffer->sgr_marks, colour);
                 }
             } else {
                 if (buffer->raw_mode) {
                     fputs(line, stdout);
                 } else {
-                    smallclueSanitizeAndPrint(line, SIZE_MAX, stdout);
+                    smallclueSanitizeAndPrintEx(line, SIZE_MAX, stdout, buffer->sgr_marks, colour);
                 }
             }
         } else {
             if (buffer->raw_mode) {
                 fputs(line, stdout);
             } else {
-                smallclueSanitizeAndPrint(line, SIZE_MAX, stdout);
+                smallclueSanitizeAndPrintEx(line, SIZE_MAX, stdout, buffer->sgr_marks, colour);
             }
         }
         fputc('\n', stdout);
@@ -6162,6 +6247,15 @@ static int pagerLastExitKey(void) {
 
 static int pagerLastMdLinkIndex(void) {
     return pager_last_md_link_index;
+}
+
+/* Armed immediately before the one pager_file call that renders markdown, and
+ * cleared by it. Sticky would mean a later `less` of an arbitrary file
+ * inherited the permission to expand markers. */
+static bool pager_sgr_marks = false;
+
+static void pagerSetSgrMarks(bool on) {
+    pager_sgr_marks = on;
 }
 
 static void pagerSetActiveMarkdownLinks(const MarkdownLinkList *links) {
@@ -7218,10 +7312,17 @@ static int pager_file(const char *cmd_name,
     }
 #endif
     PagerBuffer buffer = {0};
-    buffer.raw_mode = raw_mode;
+    bool marks = pager_sgr_marks;
+    pager_sgr_marks = false;   /* one buffer only; never sticky */
     if (pagerCollectLines(cmd_name, path, stream, &buffer) != 0) {
         return 1;
     }
+    /* AFTER the collect, not before: pagerCollectLines memsets the struct, so
+     * anything set here first is erased. raw_mode was assigned above that call
+     * and had therefore never once reached pagerRenderPage -- `less -r` has
+     * been sanitising its output for as long as the flag has existed. */
+    buffer.raw_mode = raw_mode;
+    buffer.sgr_marks = marks;
 
     int ctrl_fd = pager_control_fd();
     bool have_ctrl = (ctrl_fd >= 0) && pscalRuntimeFdIsInteractive(ctrl_fd);
@@ -7422,6 +7523,7 @@ static bool markdownLinkListAppend(MarkdownLinkList *links, const char *text, co
 }
 
 static bool markdownInlineAppendSpan(char **buffer, size_t *length, size_t *capacity, const char *text, size_t text_len);
+static char *markdownSimplifyInlinePlain(const char *text);
 
 static int markdownRegisterLinkAndGetDisplayNumber(MarkdownLinkList *links, const char *text, const char *target) {
     if (!links || !target || !*target) {
@@ -7449,12 +7551,17 @@ static bool markdownInlineAppendLinkMarker(char **buffer,
     if (!buffer || !length || !capacity) {
         return false;
     }
+    char marker[48];
     if (link_display_number > 0) {
-        char marker[32];
-        snprintf(marker, sizeof(marker), " [%d]", link_display_number);
-        return markdownInlineAppendSpan(buffer, length, capacity, marker, strlen(marker));
+        snprintf(marker, sizeof(marker), " %s[%d]%s",
+                 gMarkdownMarks ? MD_MARK_LINK : "", link_display_number,
+                 gMarkdownMarks ? MD_MARK_RESET : "");
+    } else {
+        snprintf(marker, sizeof(marker), " %s[link]%s",
+                 gMarkdownMarks ? MD_MARK_LINK : "",
+                 gMarkdownMarks ? MD_MARK_RESET : "");
     }
-    return markdownInlineAppendSpan(buffer, length, capacity, " [link]", 7);
+    return markdownInlineAppendSpan(buffer, length, capacity, marker, strlen(marker));
 }
 
 // Where `md` looks for the documents it lists, and for a bare name like
@@ -8328,11 +8435,21 @@ static char *markdownSimplifyInline(const char *text) {
                 i++;
                 continue;
             }
+            if (gMarkdownMarks &&
+                !markdownInlineAppendSpan(&buffer, &dst, &cap, MD_MARK_CODE, MD_MARK_LEN)) {
+                free(buffer);
+                return strdup(text);
+            }
             for (size_t j = i + run; j < close; ++j) {
                 if (!markdownInlineAppendChar(&buffer, &dst, &cap, text[j])) {
                     free(buffer);
                     return strdup(text);
                 }
+            }
+            if (gMarkdownMarks &&
+                !markdownInlineAppendSpan(&buffer, &dst, &cap, MD_MARK_RESET, MD_MARK_LEN)) {
+                free(buffer);
+                return strdup(text);
             }
             i = close + run;
             continue;
@@ -8349,6 +8466,11 @@ static char *markdownSimplifyInline(const char *text) {
                 emphasis_stack[emphasis_depth - 1].run == run &&
                 !prev_space && !(ch == '_' && next_alnum)) {
                 emphasis_depth--;
+                if (gMarkdownMarks &&
+                    !markdownInlineAppendSpan(&buffer, &dst, &cap, MD_MARK_RESET, MD_MARK_LEN)) {
+                    free(buffer);
+                    return strdup(text);
+                }
                 i += run;
                 continue;
             }
@@ -8358,6 +8480,13 @@ static char *markdownSimplifyInline(const char *text) {
                 emphasis_stack[emphasis_depth].ch = ch;
                 emphasis_stack[emphasis_depth].run = run;
                 emphasis_depth++;
+                if (gMarkdownMarks &&
+                    !markdownInlineAppendSpan(&buffer, &dst, &cap,
+                                              run >= 2 ? MD_MARK_BOLD : MD_MARK_EM,
+                                              MD_MARK_LEN)) {
+                    free(buffer);
+                    return strdup(text);
+                }
                 i += run;
                 continue;
             }
@@ -8437,6 +8566,22 @@ static char *markdownSimplifyInline(const char *text) {
     return buffer;
 }
 
+/* Bytes a marker costs the buffer but not the screen. Wrapping to a column
+ * count has to measure what the reader sees, or a coloured line wraps early by
+ * exactly two characters per marker. */
+static size_t markdownVisibleWidth(const char *text) {
+    size_t width = 0;
+    for (size_t i = 0; text[i]; ++i) {
+        if ((unsigned char)text[i] == MD_MARK && text[i + 1] &&
+            markdownSgrForMark(text[i + 1])) {
+            i++;
+            continue;
+        }
+        width++;
+    }
+    return width;
+}
+
 static void markdownWrapAndWrite(FILE *out, const char *text, const char *firstPrefix, const char *subPrefix, int width) {
     if (!out) {
         return;
@@ -8464,7 +8609,7 @@ static void markdownWrapAndWrite(FILE *out, const char *text, const char *firstP
     fputs(prefix_first, out);
     bool first_word = true;
     while (token) {
-        size_t tok_len = strlen(token);
+        size_t tok_len = markdownVisibleWidth(token);
         size_t extra = first_word ? tok_len : tok_len + 1;
         if (!first_word && (int)(current + extra) > wrap_width) {
             fputc('\n', out);
@@ -8540,7 +8685,7 @@ static void markdownParseTableRow(char *line, MarkdownTableRow *row) {
         if (delim) {
             *delim = '\0';
             if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
-                row->cells[row->col_count++] = strdup(markdownTrimInline(start));
+                row->cells[row->col_count++] = markdownSimplifyInlinePlain(markdownTrimInline(start));
             }
             start = delim + 1;
             if (*start == '\0') {
@@ -8549,7 +8694,7 @@ static void markdownParseTableRow(char *line, MarkdownTableRow *row) {
             continue;
         }
         if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
-            row->cells[row->col_count++] = strdup(markdownTrimInline(start));
+            row->cells[row->col_count++] = markdownSimplifyInlinePlain(markdownTrimInline(start));
         }
         break;
     }
@@ -8577,6 +8722,21 @@ static int markdownIsSeparatorRow(const MarkdownTableRow *row) {
     return 1;
 }
 
+/* Inline markup resolved, but with no colour markers in the result.
+ *
+ * Table cells are sliced by byte offset and padded with "%-*.*s", so a marker
+ * could be cut in half at a wrap boundary and would count against the column
+ * width either way. Cells therefore get the text and not the colour -- which
+ * still fixes the visible half of the problem, since cells used to print their
+ * backticks while the same code span in a paragraph did not. */
+static char *markdownSimplifyInlinePlain(const char *text) {
+    bool previous = gMarkdownMarks;
+    gMarkdownMarks = false;
+    char *out = markdownSimplifyInline(text);
+    gMarkdownMarks = previous;
+    return out;
+}
+
 static int markdownTableWrapLen(const char *text, int max_width, int offset) {
     int len = (int)strlen(text);
     int remaining = len - offset;
@@ -8592,6 +8752,7 @@ static int markdownTableWrapLen(const char *text, int max_width, int offset) {
 }
 
 static void markdownPrintSeparator(FILE *out, const int *col_widths, int cols) {
+    if (gMarkdownMarks) fputs(MD_MARK_RULE, out);
     fputs("  +", out);
     for (int j = 0; j < cols; ++j) {
         for (int k = 0; k < col_widths[j] + 2; ++k) {
@@ -8599,6 +8760,7 @@ static void markdownPrintSeparator(FILE *out, const int *col_widths, int cols) {
         }
         fputc('+', out);
     }
+    if (gMarkdownMarks) fputs(MD_MARK_RESET, out);
     fputc('\n', out);
 }
 
@@ -8655,7 +8817,9 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
             if (!has_remaining) {
                 break;
             }
+            if (gMarkdownMarks) fputs(MD_MARK_RULE, out);
             fputs("  |", out);
+            if (gMarkdownMarks) fputs(MD_MARK_RESET, out);
             for (int j = 0; j < max_cols; ++j) {
                 const char *text = (j < rows[i].col_count && rows[i].cells[j]) ? rows[i].cells[j] : "";
                 int width = col_widths[j];
@@ -8671,7 +8835,9 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
                 } else {
                     fprintf(out, " %-*s", width, "");
                 }
+                if (gMarkdownMarks) fputs(MD_MARK_RULE, out);
                 fputs(" |", out);
+                if (gMarkdownMarks) fputs(MD_MARK_RESET, out);
             }
             fputc('\n', out);
         }
@@ -8761,12 +8927,22 @@ static void markdownWriteHeading(FILE *out, const char *text, int level, int wra
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
     if (!formatted) return;
-    fprintf(out, "%s\n", formatted);
+    if (gMarkdownMarks) {
+        fprintf(out, "%s%s%s\n", MD_MARK_HEADING, formatted, MD_MARK_RESET);
+    } else {
+        fprintf(out, "%s\n", formatted);
+    }
     char underline = (level == 1) ? '=' : '-';
-    size_t len = strlen(formatted);
+    size_t len = markdownVisibleWidth(formatted);
     size_t underline_len = len > (size_t)wrap_width ? (size_t)wrap_width : len;
+    if (gMarkdownMarks) {
+        fputs(MD_MARK_RULE, out);
+    }
     for (size_t i = 0; i < underline_len; ++i) {
         fputc(underline, out);
+    }
+    if (gMarkdownMarks) {
+        fputs(MD_MARK_RESET, out);
     }
     fputc('\n', out);
 
@@ -10020,14 +10196,20 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     int render_width = markdownPreferredWrapWidth();
 
     if (label && *label) {
-        fprintf(output, "%s\n", label);
+        if (gMarkdownMarks) {
+            fprintf(output, "%s%s%s\n", MD_MARK_HEADING, label, MD_MARK_RESET);
+        } else {
+            fprintf(output, "%s\n", label);
+        }
         size_t underline_len = strlen(label);
         if (underline_len > (size_t)render_width) {
             underline_len = (size_t)render_width;
         }
+        if (gMarkdownMarks) fputs(MD_MARK_RULE, output);
         for (size_t i = 0; i < underline_len; ++i) {
             fputc('=', output);
         }
+        if (gMarkdownMarks) fputs(MD_MARK_RESET, output);
         fputc('\n', output);
         fputc('\n', output);
         has_blank_separator = true;
@@ -10360,9 +10542,11 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
+            if (gMarkdownMarks) fputs(MD_MARK_RULE, output);
             for (int i = 0; i < render_width; ++i) {
                 fputc('-', output);
             }
+            if (gMarkdownMarks) fputs(MD_MARK_RESET, output);
             fputc('\n', output);
             fputc('\n', output);
             has_blank_separator = true;
@@ -10614,10 +10798,16 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
 
     MarkdownLinkList *previous_links = gMarkdownActiveLinks;
     bool previous_from_html = gMarkdownFromHtml;
+    bool previous_marks = gMarkdownMarks;
     gMarkdownActiveLinks = links_out;
     gMarkdownFromHtml = (converted_html != NULL);
+    /* Emitted only when something will expand them. A redirected run must not
+     * see "^Ac" where a colour would have been, and the pager's strip-when-off
+     * branch is then a second line of defence rather than the only one. */
+    gMarkdownMarks = !direct && markdownColourWanted();
     int render_status = markdownRenderStream(label, source, buffer);
     gMarkdownFromHtml = previous_from_html;
+    gMarkdownMarks = previous_marks;
     gMarkdownActiveLinks = previous_links;
     fclose(source);
     free(converted_html);
@@ -10639,6 +10829,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     rewind(buffer);
     const MarkdownLinkList *prev_active_links = pager_active_md_links;
     pagerSetActiveMarkdownLinks(links_out);
+    pagerSetSgrMarks(true);
     int status = pager_file("md", label ? label : "(stdin)", NULL, buffer, false);
     pagerSetActiveMarkdownLinks(prev_active_links);
     if (exit_key_out) {
