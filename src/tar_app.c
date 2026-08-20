@@ -7,10 +7,16 @@
  *
  * Scope: regular files, directories, and symlinks (the overwhelming
  * majority of real-world tarballs). Hardlinks/devices/fifos are skipped on
- * create and ignored (with a warning) on extract. Long names (>100 bytes)
- * use the standard ustar prefix field (up to ~255 bytes total); GNU
- * @LongLink / PAX extended headers are not implemented, matching ustar's
- * own limits rather than GNU tar's extensions.
+ * create and ignored (with a warning) on extract.
+ *
+ * WRITING stays plain ustar: long names use the prefix field, for up to ~255
+ * bytes total. READING also understands GNU @LongLink ('L'/'K') and PAX
+ * extended headers ('x'/'g'), because refusing them was not a limitation but
+ * a corruption -- an unhandled metadata entry was listed as a file called
+ * "@LongLink", its data was then read as the next header, and everything
+ * after it in the archive was lost with one "not a ustar archive" line. Both
+ * are what busybox tar EMITS for a path over 100 bytes, so the archives this
+ * could not read were the ones the same system had just written.
  */
 
 #include "tar_app.h"
@@ -65,6 +71,14 @@ struct UstarHeader {
 #define TAR_TYPE_REGULAR_ALT '\0'
 #define TAR_TYPE_SYMLINK '2'
 #define TAR_TYPE_DIRECTORY '5'
+/* Metadata entries: they carry the NEXT entry's name rather than a file. */
+#define TAR_TYPE_GNU_LONGLINK 'K'
+#define TAR_TYPE_GNU_LONGNAME 'L'
+#define TAR_TYPE_PAX_GLOBAL 'g'
+#define TAR_TYPE_PAX_EXTENDED 'x'
+
+/* A path, not a payload. Anything past this is not a name we are missing. */
+#define TAR_MAX_META (1024 * 1024)
 
 typedef struct TarStream {
     FILE *plain;
@@ -185,6 +199,88 @@ static unsigned tarComputeChecksumReal(const struct UstarHeader *hdr) {
 
 static void tarSetOctal(char *field, size_t fieldLen, unsigned long long value) {
     snprintf(field, fieldLen, "%0*llo", (int)(fieldLen - 1), value);
+}
+
+/* Consumes an entry's data and its record padding, returning it NUL-terminated.
+ * Metadata only -- the cap is what keeps a corrupt size field from asking for
+ * the archive's worth of memory. NULL means the caller should stop: the data
+ * either ran out or was never a name. */
+static char *tarReadMetaEntry(TarStream *ts, unsigned long long size) {
+    if (size > TAR_MAX_META) {
+        return NULL;
+    }
+    char *buf = (char *) malloc((size_t) size + 1);
+    if (!buf) {
+        return NULL;
+    }
+    unsigned long long got = 0;
+    while (got < size) {
+        size_t n = tarStreamRead(ts, buf + got, (size_t) (size - got));
+        if (n == 0) {
+            free(buf);
+            return NULL;
+        }
+        got += n;
+    }
+    buf[size] = '\0';
+    tarSkipPadding(ts, (size_t) size);
+    return buf;
+}
+
+/* PAX records are "<len> <key>=<value>\n", where <len> counts its own digits
+ * too. Only path and linkpath matter here; everything else (mtime, uid, the
+ * SCHILY.* and LIBARCHIVE.* namespaces) is metadata this tar does not carry
+ * anyway, and is skipped by advancing over the record rather than by parsing
+ * it. A malformed length stops the walk rather than guessing where the next
+ * record begins. */
+static void tarParsePaxRecords(const char *data, size_t len,
+                               char **name, char **link) {
+    size_t pos = 0;
+    while (pos < len) {
+        size_t start = pos;
+        unsigned long long reclen = 0;
+        while (pos < len && data[pos] >= '0' && data[pos] <= '9') {
+            reclen = reclen * 10 + (unsigned long long) (data[pos] - '0');
+            pos++;
+            if (reclen > len) {
+                return;
+            }
+        }
+        if (pos == start || pos >= len || data[pos] != ' ') {
+            return;
+        }
+        if (reclen <= (pos - start) || start + reclen > len) {
+            return;
+        }
+        pos++; /* the space after the length */
+        size_t recEnd = start + (size_t) reclen;
+        size_t valueEnd = recEnd;
+        if (valueEnd > pos && data[valueEnd - 1] == '\n') {
+            valueEnd--;
+        }
+        const char *eq = (const char *) memchr(data + pos, '=', valueEnd - pos);
+        if (eq) {
+            size_t klen = (size_t) (eq - (data + pos));
+            const char *value = eq + 1;
+            size_t vlen = (size_t) ((data + valueEnd) - value);
+            char **slot = NULL;
+            if (klen == 4 && memcmp(data + pos, "path", 4) == 0) {
+                slot = name;
+            } else if (klen == 8 && memcmp(data + pos, "linkpath", 8) == 0) {
+                slot = link;
+            }
+            if (slot) {
+                char *copy = (char *) malloc(vlen + 1);
+                if (copy) {
+                    memcpy(copy, value, vlen);
+                    copy[vlen] = '\0';
+                    free(*slot);
+                    *slot = copy;
+                }
+            }
+        }
+        pos = recEnd;
+    }
 }
 
 static unsigned long long tarParseOctal(const char *field, size_t fieldLen) {
@@ -426,6 +522,9 @@ static int tarExtractOrList(const char *archivePath, bool doExtract, bool verbos
     }
 
     int status = 0;
+    /* Set by an 'L'/'K'/'x' entry, consumed by the entry after it. */
+    char *pendingName = NULL;
+    char *pendingLink = NULL;
     for (;;) {
         struct UstarHeader hdr;
         size_t n = tarStreamRead(&ts, &hdr, sizeof(hdr));
@@ -444,10 +543,60 @@ static int tarExtractOrList(const char *archivePath, bool doExtract, bool verbos
             break;
         }
 
-        char entryPath[4096];
-        tarJoinPathFromHeader(&hdr, entryPath, sizeof(entryPath));
         unsigned long long size = tarParseOctal(hdr.size, sizeof(hdr.size));
         unsigned long long mode = tarParseOctal(hdr.mode, sizeof(hdr.mode));
+
+        if (hdr.typeflag == TAR_TYPE_GNU_LONGNAME ||
+            hdr.typeflag == TAR_TYPE_GNU_LONGLINK ||
+            hdr.typeflag == TAR_TYPE_PAX_EXTENDED ||
+            hdr.typeflag == TAR_TYPE_PAX_GLOBAL) {
+            char *data = tarReadMetaEntry(&ts, size);
+            if (!data) {
+                /* Reading it is what keeps the stream aligned, so failing to
+                 * is not something to warn about and continue past: the next
+                 * read would land mid-data and every later entry would be
+                 * lost. */
+                fprintf(stderr, "tar: unreadable %s header, stopping\n",
+                        hdr.typeflag == TAR_TYPE_PAX_EXTENDED ||
+                        hdr.typeflag == TAR_TYPE_PAX_GLOBAL ? "extended" : "long-name");
+                status = 1;
+                break;
+            }
+            if (hdr.typeflag == TAR_TYPE_GNU_LONGNAME) {
+                free(pendingName);
+                pendingName = data;
+            } else if (hdr.typeflag == TAR_TYPE_GNU_LONGLINK) {
+                free(pendingLink);
+                pendingLink = data;
+            } else {
+                /* A global header applies to the rest of the archive rather
+                 * than the next entry, but the only keys read here are
+                 * per-entry ones, so treating both alike costs nothing. */
+                if (hdr.typeflag == TAR_TYPE_PAX_EXTENDED) {
+                    tarParsePaxRecords(data, (size_t) size, &pendingName, &pendingLink);
+                }
+                free(data);
+            }
+            continue;
+        }
+
+        char entryPath[4096];
+        char linkTarget[4096];
+        if (pendingName) {
+            snprintf(entryPath, sizeof(entryPath), "%s", pendingName);
+            free(pendingName);
+            pendingName = NULL;
+        } else {
+            tarJoinPathFromHeader(&hdr, entryPath, sizeof(entryPath));
+        }
+        if (pendingLink) {
+            snprintf(linkTarget, sizeof(linkTarget), "%s", pendingLink);
+            free(pendingLink);
+            pendingLink = NULL;
+        } else {
+            memcpy(linkTarget, hdr.linkname, sizeof(hdr.linkname));
+            linkTarget[sizeof(hdr.linkname)] = '\0';
+        }
 
         bool matches = (filterc == 0);
         for (int i = 0; i < filterc; ++i) {
@@ -513,11 +662,8 @@ static int tarExtractOrList(const char *archivePath, bool doExtract, bool verbos
                 break;
             case TAR_TYPE_SYMLINK: {
                 tarEnsureParentDir(destPath);
-                char linkname[101];
-                memcpy(linkname, hdr.linkname, 100);
-                linkname[100] = '\0';
                 unlink(destPath);
-                if (symlink(linkname, destPath) != 0) {
+                if (symlink(linkTarget, destPath) != 0) {
                     fprintf(stderr, "tar: %s: %s\n", destPath, strerror(errno));
                     status = 1;
                 }
@@ -572,6 +718,9 @@ static int tarExtractOrList(const char *archivePath, bool doExtract, bool verbos
         }
     }
 
+    /* An archive that ends on a long-name header names nothing. */
+    free(pendingName);
+    free(pendingLink);
     tarStreamClose(&ts);
     return status;
 }
