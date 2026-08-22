@@ -1369,10 +1369,29 @@ typedef struct {
     FILE *file;
     size_t *offsets;
     size_t offset_count;
+    size_t offset_cap;
     size_t line_count;
     size_t length;
     bool raw_mode;
     bool sgr_marks;
+    /* The stream still being spooled, or NULL once it has ended. This pager
+     * used to read the WHOLE input before drawing anything, which is the one
+     * thing a pager must not do: a producer that writes into a pipe and waits
+     * on its pager waits forever, and even a well-behaved one leaves the
+     * screen blank for as long as its output takes. Real less paints the first
+     * screen as soon as it has one, and so does this now -- the rest arrives
+     * as the reader asks for it. Not owned: the caller opened it and closes
+     * it, and for stdin nobody may. */
+    FILE *source;
+    /* A regular file always has its bytes ready, so a full-size read only ends
+     * early at EOF. Anything else -- a pipe, a socket, a terminal -- can make
+     * one wait on a producer that is waiting on us, so those are read a byte
+     * at a time and stop at the screenful asked for. */
+    bool source_bulk;
+    bool source_done;
+    bool source_failed;
+    const char *cmd_name;
+    const char *path;
 } PagerBuffer;
 
 typedef struct {
@@ -3618,6 +3637,7 @@ const char *smallclueLookupAppletUsage(const char *name) {
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
+static int pagerBufferFill(PagerBuffer *buffer, size_t want);
 static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame);
 
 static void pagerBell(void) {
@@ -3658,8 +3678,14 @@ static void pagerBufferFree(PagerBuffer *buffer) {
     buffer->file = NULL;
     buffer->offsets = NULL;
     buffer->offset_count = 0;
+    buffer->offset_cap = 0;
     buffer->line_count = 0;
     buffer->length = 0;
+    /* Dropped, never closed: pager_file's caller owns the stream, and for
+     * stdin closing it would take the descriptor out from under whatever runs
+     * next. */
+    buffer->source = NULL;
+    buffer->source_done = true;
 }
 
 static bool smallclueLineVectorAppend(SmallclueLineVector *vec, const char *data, size_t len) {
@@ -6016,12 +6042,51 @@ static FILE *smallclueOpenTempFile(const char *tag) {
 #endif
 }
 
-static int pagerCollectLines(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
+/* Whether a full-size read on this stream is safe to make.
+ *
+ * A regular file always has its bytes ready, so an 8KiB read only comes back
+ * short at EOF. A pipe, socket or terminal is the opposite: the read waits for
+ * a producer, and the producer may be waiting for this pager to draw something
+ * first. Those are read a byte at a time instead, which costs nothing that
+ * matters -- the pager only ever reads as far as the reader has scrolled. */
+static bool pagerStreamIsBulkReadable(FILE *stream) {
+    if (!stream) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (stream == stdin) {
+        return false;
+    }
+#endif
+    int fd = fileno(stream);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return false;
+    }
+    return S_ISREG(st.st_mode) != 0;
+}
+
+/* Opens the spool and takes the stream, reading NOTHING.
+ *
+ * This used to be pagerCollectLines, which read the whole input before its
+ * caller drew a single line. Two things were wrong with that. The visible one
+ * is that `less` on a big file showed nothing until the last byte was in.
+ * The other is a deadlock: a producer that writes into a pipe and waits on its
+ * pager before closing its end waits forever on a pager that will not draw
+ * until the pipe closes. Reading is now driven by what the reader asks to see
+ * -- pagerBufferFill below. */
+static int pagerBufferOpen(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
     if (!stream || !buffer) {
         return 1;
     }
 
     memset(buffer, 0, sizeof(*buffer));
+    buffer->cmd_name = cmd_name;
+    buffer->path = path;
+
     const char *tmp_root = getenv("TMPDIR");
     if (!tmp_root || !*tmp_root) {
         tmp_root = "/tmp";
@@ -6056,85 +6121,146 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
     }
     unlink(tmpl);
 
-    size_t *offsets = NULL;
-    size_t offset_cap = 0;
-    size_t offset_count = 0;
-    if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, 1)) {
+    if (!pagerBufferEnsureOffsetCapacity(&buffer->offsets, &buffer->offset_cap, 1)) {
         fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
         fclose(fp);
         return 1;
     }
-    offsets[offset_count++] = 0;
+    buffer->offsets[buffer->offset_count++] = 0;
+    buffer->file = fp;
+    buffer->source = stream;
+    buffer->source_bulk = pagerStreamIsBulkReadable(stream);
+    return 0;
+}
 
-    char buf[8192];
-    size_t total = 0;
-    while (true) {
-        int read_err = 0;
-        ssize_t read_bytes = smallclueReadStream(stream, buf, sizeof(buf), &read_err);
-        if (read_bytes < 0) {
-            fprintf(stderr, "%s: %s: %s\n",
-                    pager_command_name(cmd_name),
-                    path ? path : "(stdin)",
-                    strerror(read_err ? read_err : errno));
-            free(offsets);
-            fclose(fp);
+/* Adds `len` bytes to the spool and records where each line inside them
+ * begins. offsets[] always ends with the start of the line currently being
+ * read, so line_count -- one less than offset_count -- counts only the lines
+ * that are complete. */
+static int pagerBufferAppend(PagerBuffer *buffer, const char *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    int write_err = 0;
+    if (!smallclueWriteFullyStream(buffer->file, data, len, &write_err)) {
+        fprintf(stderr, "%s: failed to buffer pager input: %s\n",
+                pager_command_name(buffer->cmd_name),
+                strerror(write_err ? write_err : EIO));
+        return 1;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] != '\n') {
+            continue;
+        }
+        if (!pagerBufferEnsureOffsetCapacity(&buffer->offsets, &buffer->offset_cap,
+                                             buffer->offset_count + 1)) {
+            fprintf(stderr, "%s: out of memory\n", pager_command_name(buffer->cmd_name));
             return 1;
         }
-        if (read_bytes > 0) {
-            int write_err = 0;
-            if (!smallclueWriteFullyStream(fp, buf, (size_t)read_bytes, &write_err)) {
-                fprintf(stderr, "%s: failed to buffer pager input: %s\n",
-                        pager_command_name(cmd_name),
-                        strerror(write_err ? write_err : EIO));
-                free(offsets);
-                fclose(fp);
+        buffer->offsets[buffer->offset_count++] = buffer->length + i + 1;
+    }
+    buffer->length += len;
+    buffer->line_count = buffer->offset_count - 1;
+    return 0;
+}
+
+/* The stream is over. A trailing line with no newline on it is a line too, and
+ * it only becomes countable once nothing more can arrive to finish it. */
+static void pagerBufferEndSource(PagerBuffer *buffer) {
+    buffer->source = NULL;
+    buffer->source_done = true;
+    if (buffer->offset_count > 0 &&
+        buffer->offsets[buffer->offset_count - 1] != buffer->length &&
+        pagerBufferEnsureOffsetCapacity(&buffer->offsets, &buffer->offset_cap,
+                                        buffer->offset_count + 1)) {
+        buffer->offsets[buffer->offset_count++] = buffer->length;
+    }
+    buffer->line_count = (buffer->offset_count > 0) ? (buffer->offset_count - 1) : 0;
+}
+
+/* Reads until the buffer holds `want` complete lines, or until the stream
+ * ends. Returns 0, or 1 once the failure has been reported -- and after a
+ * failure the lines already read stay readable, which is more than the
+ * read-it-all version offered. */
+static int pagerBufferFill(PagerBuffer *buffer, size_t want) {
+    if (!buffer || !buffer->file) {
+        return 1;
+    }
+    if (buffer->source == NULL) {
+        return buffer->source_failed ? 1 : 0;
+    }
+    if (buffer->line_count >= want) {
+        return 0;
+    }
+    /* A stream opened for update needs a positioning call between a read and
+     * the write after it, and pagerReadLogicalLine has very likely just read. */
+    if (fseeko(buffer->file, 0, SEEK_END) != 0) {
+        fprintf(stderr, "%s: pager storage: %s\n",
+                pager_command_name(buffer->cmd_name), strerror(errno));
+        buffer->source_failed = true;
+        pagerBufferEndSource(buffer);
+        return 1;
+    }
+
+    char chunk[8192];
+    while (buffer->source != NULL && buffer->line_count < want) {
+        size_t got = 0;
+        bool at_end = false;
+        if (buffer->source_bulk) {
+            int read_err = 0;
+            ssize_t n = smallclueReadStream(buffer->source, chunk, sizeof(chunk), &read_err);
+            if (n < 0 || (read_err != 0 && read_err != EINTR)) {
+                fprintf(stderr, "%s: %s: %s\n",
+                        pager_command_name(buffer->cmd_name),
+                        buffer->path ? buffer->path : "(stdin)",
+                        strerror(read_err ? read_err : (errno ? errno : EIO)));
+                buffer->source_failed = true;
+                pagerBufferEndSource(buffer);
                 return 1;
             }
-            for (size_t i = 0; i < (size_t)read_bytes; ++i) {
-                if (buf[i] == '\n') {
-                    if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, offset_count + 1)) {
-                        fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
-                        free(offsets);
-                        fclose(fp);
-                        return 1;
+            got = (size_t) n;
+            /* SIGWINCH arrives during a fill now that filling happens inside
+             * the session, and the handler is deliberately not SA_RESTART. */
+            if (read_err == EINTR) {
+                clearerr(buffer->source);
+            } else {
+                at_end = (n == 0);
+            }
+        } else {
+            size_t staged_lines = 0;
+            while (got < sizeof(chunk)) {
+                int c = fgetc(buffer->source);
+                if (c == EOF) {
+                    if (ferror(buffer->source)) {
+                        if (errno == EINTR) {
+                            clearerr(buffer->source);
+                            continue;
+                        }
+                        fprintf(stderr, "%s: %s: %s\n",
+                                pager_command_name(buffer->cmd_name),
+                                buffer->path ? buffer->path : "(stdin)",
+                                strerror(errno ? errno : EIO));
+                        buffer->source_failed = true;
                     }
-                    offsets[offset_count++] = total + i + 1;
+                    at_end = true;
+                    break;
+                }
+                chunk[got++] = (char) c;
+                if (c == '\n' && ++staged_lines + buffer->line_count >= want) {
+                    break;
                 }
             }
-            total += (size_t)read_bytes;
         }
-        if (read_err) {
-            fprintf(stderr, "%s: %s: %s\n",
-                    pager_command_name(cmd_name),
-                    path ? path : "(stdin)",
-                    strerror(read_err));
-            free(offsets);
-            fclose(fp);
+        if (got > 0 && pagerBufferAppend(buffer, chunk, got) != 0) {
+            buffer->source_failed = true;
+            pagerBufferEndSource(buffer);
             return 1;
         }
-        if (read_bytes == 0) {
-            break;
+        if (at_end) {
+            bool failed = buffer->source_failed;
+            pagerBufferEndSource(buffer);
+            return failed ? 1 : 0;
         }
-    }
-
-    if (offset_count == 0 || offsets[offset_count - 1] != total) {
-        if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, offset_count + 1)) {
-            fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
-            free(offsets);
-            fclose(fp);
-            return 1;
-        }
-        offsets[offset_count++] = total;
-    }
-
-    buffer->file = fp;
-    buffer->offsets = offsets;
-    buffer->offset_count = offset_count;
-    buffer->line_count = (offset_count > 0) ? (offset_count - 1) : 0;
-    buffer->length = total;
-    if (fseeko(fp, 0, SEEK_SET) != 0) {
-        pagerBufferFree(buffer);
-        return 1;
     }
     return 0;
 }
@@ -6462,13 +6588,17 @@ static int pagerInteractiveSession(const char *cmd_name,
                                    const char *detail,
                                    PagerBuffer *buffer,
                                    int page_rows) {
+    if (page_rows < 1) {
+        page_rows = 1;
+    }
+    /* The first screenful, and only the first: this is the whole point of the
+     * change -- draw as soon as there is something to draw, and let the reader
+     * pull the rest. */
+    int ret = pagerBufferFill(buffer, (size_t) page_rows);
     if (!buffer || buffer->line_count == 0) {
         pager_last_exit_key = 'q';
         pager_last_md_link_index = -1;
-        return 0;
-    }
-    if (page_rows < 1) {
-        page_rows = 1;
+        return ret;
     }
 
     struct sigaction sa, old_sa;
@@ -6484,10 +6614,14 @@ static int pagerInteractiveSession(const char *cmd_name,
     size_t top = 0;
     bool redraw = true;
     size_t selected_md_link_index = SIZE_MAX;
-    int ret = 0;
 
     while (1) {
         if (redraw) {
+            /* Whatever moved the view, the lines it now shows have to exist
+             * before they can be drawn. */
+            if (pagerBufferFill(buffer, top + (size_t) page_rows) != 0) {
+                ret = 1;
+            }
             char *highlight = NULL;
             if (md_links && selected_md_link_index != SIZE_MAX &&
                 selected_md_link_index < md_links->count) {
@@ -6528,6 +6662,14 @@ static int pagerInteractiveSession(const char *cmd_name,
                 goto done;
             case ' ':
             case PAGER_KEY_PAGE_DOWN: {
+                /* Two screenfuls, so that "is there a next page, and how far
+                 * down does it start?" is answered from lines that exist. A
+                 * fill stops early only at end of stream, so falling short
+                 * here means there IS no more -- which is exactly what
+                 * pagerMaxTop then reports. */
+                if (pagerBufferFill(buffer, top + 2 * (size_t) page_rows) != 0) {
+                    ret = 1;
+                }
                 size_t max_top = pagerMaxTop(buffer, page_rows);
                 if (top < max_top) {
                     size_t new_top = top + (size_t)page_rows;
@@ -6601,6 +6743,9 @@ static int pagerInteractiveSession(const char *cmd_name,
                 /* fall through */
             case PAGER_KEY_ARROW_DOWN: {
                 size_t page = (size_t)page_rows;
+                if (pagerBufferFill(buffer, top + page + 1) != 0) {
+                    ret = 1;
+                }
                 if (top + page < buffer->line_count) {
                     top++;
                     redraw = true;
@@ -7349,18 +7494,8 @@ static int pager_file(const char *cmd_name,
         return status;
     }
 #endif
-    PagerBuffer buffer = {0};
     bool marks = pager_sgr_marks;
     pager_sgr_marks = false;   /* one buffer only; never sticky */
-    if (pagerCollectLines(cmd_name, path, stream, &buffer) != 0) {
-        return 1;
-    }
-    /* AFTER the collect, not before: pagerCollectLines memsets the struct, so
-     * anything set here first is erased. raw_mode was assigned above that call
-     * and had therefore never once reached pagerRenderPage -- `less -r` has
-     * been sanitising its output for as long as the flag has existed. */
-    buffer.raw_mode = raw_mode;
-    buffer.sgr_marks = marks;
 
     int ctrl_fd = pager_control_fd();
     bool have_ctrl = (ctrl_fd >= 0) && pscalRuntimeFdIsInteractive(ctrl_fd);
@@ -7388,32 +7523,43 @@ static int pager_file(const char *cmd_name,
             !pscalRuntimeStderrIsInteractive()) {
             interactive = false;
         }
+        /* And the rule real less states outright: "If the output is not a tty,
+         * less acts like cat." Stdout was consulted only when there was no
+         * control terminal at all, so inside a session `less file | head` drew
+         * a page down a pipe nobody was watching and then waited for a
+         * keystroke nobody was going to type. Every such pipeline hung. */
+        if (!pscalRuntimeStdoutIsInteractive()) {
+            interactive = false;
+        }
     }
     if (!interactive) {
-        /* No interactive input available; dump what we collected. */
-        if (buffer.file) {
-            if (fseeko(buffer.file, 0, SEEK_SET) == 0) {
-                char chunk[8192];
-                while (true) {
-                    size_t n = fread(chunk, 1, sizeof(chunk), buffer.file);
-                    if (n == 0) {
-                        break;
-                    }
-                    if (fwrite(chunk, 1, n, stdout) != n) {
-                        perror("pager: write error");
-                        pagerBufferFree(&buffer);
-                        return 1;
-                    }
-                    if (n < sizeof(chunk)) {
-                        break;
-                    }
-                }
-            }
+        /* Nothing will be paged, so nothing needs spooling: copy the stream
+         * through. This used to read the whole input into a temp file and then
+         * read the temp file back out, which is the same bytes and two extra
+         * copies of them -- and it made `cmd | less > file` wait for the whole
+         * of cmd before writing anything. */
+        int status = pagerPassthroughStream(stream);
+        if (status != 0) {
+            fprintf(stderr, "%s: %s: %s\n",
+                    pager_command_name(cmd_name),
+                    path ? path : "(stdin)",
+                    strerror(errno ? errno : EIO));
         }
-        pagerBufferFree(&buffer);
         pager_control_fd_reset();
-        return 0;
+        return status;
     }
+
+    PagerBuffer buffer = {0};
+    if (pagerBufferOpen(cmd_name, path, stream, &buffer) != 0) {
+        pager_control_fd_reset();
+        return 1;
+    }
+    /* AFTER the open, not before: pagerBufferOpen memsets the struct, so
+     * anything set here first is erased. raw_mode was assigned above that call
+     * and had therefore never once reached pagerRenderPage -- `less -r` has
+     * been sanitising its output for as long as the flag has existed. */
+    buffer.raw_mode = raw_mode;
+    buffer.sgr_marks = marks;
 
     int rows = pager_terminal_rows();
     int page_rows = rows > 1 ? rows - 1 : rows;
