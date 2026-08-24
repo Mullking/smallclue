@@ -1336,16 +1336,26 @@ enum {
 /* Colour is for a terminal that asked for it: NO_COLOR is honoured (no-color.org),
  * a dumb or unset TERM is taken at its word, and a redirect gets plain text.
  *
- * This is the colour policy for everything the pager and md draw, not just for
- * the renderer's markers. It did not use to be: md's document list and its two
+ * This is the colour policy for every applet that paints, not just for the
+ * renderer's markers. It did not use to be: md's document list and its two
  * menus asked isatty() and nothing else, so a NO_COLOR=1 TERM=dumb run got a
  * plain document wrapped in a painted list and a reverse-video menu bar. A
  * policy that only half the code consults is not a policy.
  *
+ * The fd matters, because "is this a terminal" is a question about one stream.
+ * ps, top, ls, df, cal, grep and watch paint stdout; the usage listing and rm's
+ * confirmation prompt paint stderr, and `smallclue ls >file` must not silence a
+ * prompt that is still going to a terminal. Everything shares the environment
+ * half of the answer and asks isatty() about its own stream.
+ *
  * Escapes that make the UI WORK -- clearing the screen, homing the cursor,
- * erasing the prompt line -- are not colour and are not gated here. A terminal
- * that wants no colour still has a cursor. */
-static bool smallclueColourWanted(void) {
+ * erasing the prompt line, the terminal-sane reset -- are not colour and are
+ * not gated here. A terminal that wants no colour still has a cursor.
+ *
+ * ls and grep sit one level above this: they have --color=auto|always|never,
+ * and only `auto` asks. See smallclueLsCommand for why an explicit --color
+ * outranks NO_COLOR. */
+static bool smallclueColourWantedOn(int fd) {
     const char *no_colour = getenv("NO_COLOR");
     if (no_colour && *no_colour) {
         return false;
@@ -1354,7 +1364,11 @@ static bool smallclueColourWanted(void) {
     if (!term || !*term || strcmp(term, "dumb") == 0) {
         return false;
     }
-    return isatty(STDOUT_FILENO) != 0;
+    return isatty(fd) != 0;
+}
+
+static bool smallclueColourWanted(void) {
+    return smallclueColourWantedOn(STDOUT_FILENO);
 }
 
 /* True while rendering markdown for the screen. Saved and restored around the
@@ -3162,7 +3176,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  -c stdout  -k keep original  -f force overwrite"},
     {"zcat", "zcat FILE...\n"
              "  Decompress to standard output"},
-    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] [-c] [-o] [-w] [-x] PATTERN [FILE...]\n"
+    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] [-c] [-o] [-w] [-x]\n"
+             "       [--color[=auto|always|never]] PATTERN [FILE...]\n"
              "  -i ignore case\n"
              "  -n line numbers\n"
              "  -v invert match\n"
@@ -3171,7 +3186,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -c print only a count of matching lines per file\n"
              "  -o print only the matched portion, one match per line\n"
              "  -w match whole words only\n"
-             "  -x match whole lines only"},
+             "  -x match whole lines only\n"
+             "  --color=auto (the default) highlights only when stdout is a\n"
+             "     terminal that wants colour; NO_COLOR or TERM=dumb turn it off\n"
+             "  --color=always highlights regardless, outranking NO_COLOR and TERM\n"
+             "  --color=never never highlights"},
     {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
             "  Supported in this build:\n"
             "  init,\n"
@@ -3258,7 +3277,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -r reverse sort order  -R recurse into subdirectories\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents\n"
-           "  -i show each entry's inode number as a leading column"},
+           "  -i show each entry's inode number as a leading column\n"
+           "  --color=auto (the default) paints only when stdout is a terminal\n"
+           "     that wants colour; NO_COLOR or TERM=dumb turn it off\n"
+           "  --color=always paints regardless, outranking NO_COLOR and TERM\n"
+           "  --color=never never paints"},
     {"md", "md [-i] [-c] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
            "  -i interactive mode.  Makes ~/Docs browsable\n"
@@ -4251,7 +4274,7 @@ static int smallcluePsCommand(int argc, char **argv) {
     size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
     if (!snaps || count == 0) {
         free(snaps);
-        if (isatty(STDOUT_FILENO)) {
+        if (smallclueColourWanted()) {
             printf("\033[1m  PID   PPID   PGID    SID STATE      COMMAND\033[0m\n");
         } else {
             puts("  PID   PPID   PGID    SID STATE      COMMAND");
@@ -4260,7 +4283,7 @@ static int smallcluePsCommand(int argc, char **argv) {
         return 0;
     }
 
-    if (isatty(STDOUT_FILENO)) {
+    if (smallclueColourWanted()) {
         printf("\033[1m  PID   PPID   PGID    SID STATE      COMMAND\033[0m\n");
     } else {
         puts("  PID   PPID   PGID    SID STATE      COMMAND");
@@ -4475,7 +4498,7 @@ static int smallcluePsCommand(int argc, char **argv) {
         }
 
         const char *header = fullFormat ? "  PID   PPID USER     S COMMAND" : "  PID   PPID USER     COMMAND";
-        if (isatty(STDOUT_FILENO)) {
+        if (smallclueColourWanted()) {
             printf("\033[1m%s\033[0m\n", header);
         } else {
             printf("%s\n", header);
@@ -4502,7 +4525,7 @@ static int smallcluePsCommand(int argc, char **argv) {
         pid_t ppid = getppid();
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
-        if (isatty(STDOUT_FILENO)) {
+        if (smallclueColourWanted()) {
             printf("\033[1m  PID   PPID USER     COMMAND\033[0m\n");
         } else {
             printf("  PID   PPID USER     COMMAND\n");
@@ -4706,7 +4729,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
             int mn;
-            if (isatty(STDOUT_FILENO)) {
+            if (smallclueColourWanted()) {
                 mn = snprintf(mem_line, sizeof(mem_line),
                               "\033[7mMem: %zuK used, %zuK free\033[0m\n",
                               mem_used_kb, mem_free_kb);
@@ -4723,7 +4746,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
             int cn;
-            if (isatty(STDOUT_FILENO)) {
+            if (smallclueColourWanted()) {
                 cn = snprintf(cpu_line, sizeof(cpu_line),
                               "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
@@ -4740,7 +4763,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         char header[160];
         int hn;
-        if (isatty(STDOUT_FILENO)) {
+        if (smallclueColourWanted()) {
             hn = snprintf(header, sizeof(header),
                           "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
@@ -13254,7 +13277,7 @@ static void print_usage(void) {
     fprintf(stderr, "This is smallclue. Usage:\n");
     fprintf(stderr, "  smallclue <applet> [arguments...]\n\n");
     fprintf(stderr, "Available applets:\n");
-    smallcluePrintAppletList(stderr, NULL, isatty(STDERR_FILENO));
+    smallcluePrintAppletList(stderr, NULL, smallclueColourWantedOn(STDERR_FILENO));
     fprintf(stderr, "\nYou can symlink applets to 'smallclue' or invoke them directly.\n");
 }
 
@@ -13550,10 +13573,28 @@ static int smallclueLsCommand(int argc, char **argv) {
         idx++;
     }
 
+    /* Only `auto` asks the colour policy. An explicit --color=always outranks
+     * NO_COLOR and TERM: those are standing settings for the session, and
+     * no-color.org asks that colour not be added BY DEFAULT -- a flag typed
+     * into this invocation is not a default. --color=never wins over
+     * everything, always.
+     *
+     * `auto` is where this ls differs from GNU's, and deliberately. This one
+     * paints by default, so `auto` IS the default and NO_COLOR is exactly the
+     * case no-color.org is describing. GNU ls does not paint unless you ask
+     * (measured on coreutils 9.7: no --color flag means no colour at all, so
+     * its NO_COLOR has nothing to suppress, and any explicit --color, bare or
+     * =auto, keeps its colour through NO_COLOR=1 and TERM=dumb alike). It is
+     * not a precedent for a tool whose default is colour. GNU grep is, and it
+     * draws the line exactly here -- measured on grep 3.11, --color=auto goes
+     * quiet under NO_COLOR=1 and under TERM=dumb, and --color=always paints
+     * through both. */
     if (color_mode == 0) {
-        color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
+        color_mode = smallclueColourWanted() ? 1 : -1;
     }
 
+    /* Not a colour question. Columns are a layout, and GNU ls uses them on a
+     * terminal that refuses colour too, so this still asks only about the tty. */
     if (format == LS_FORMAT_AUTO) {
         if (pscalRuntimeStdoutIsInteractive()) {
             format = LS_FORMAT_COLUMNS;
@@ -14341,6 +14382,11 @@ static int smallclueHelpCommand(int argc, char **argv) {
     char *buffer = NULL;
     size_t buflen = 0;
     bool interactive_out = pscalRuntimeStdoutIsInteractive();
+    /* Two questions, and only one of them is about colour. interactive_out
+     * decides whether to page; colour decides whether to paint. NO_COLOR must
+     * not cost the reader the pager. Both are answered about stdout before the
+     * memstream exists, because open_memstream has no fd for isatty to ask. */
+    bool colour_out = smallclueColourWanted();
 
     FILE *mem = open_memstream(&buffer, &buflen);
     if (!mem) {
@@ -14349,7 +14395,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
     }
 
     if (argc <= 1) {
-        smallcluePrintAppletList(mem, "Available smallclue applets:", interactive_out);
+        smallcluePrintAppletList(mem, "Available smallclue applets:", colour_out);
     } else {
         for (int i = 1; i < argc; ++i) {
             const char *target = argv[i];
@@ -15050,12 +15096,20 @@ static int smallclueWatchCommand(int argc, char **argv) {
             break;
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
-         * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+         * scrollback, home cursor, then clear the visible viewport. Clearing is
+         * how watch works, not decoration, so it still asks only about the tty
+         * -- and the leading newline belongs to that question, standing in for
+         * the clear when there was none. The banner's reverse video is the only
+         * decoration here, and it is the only thing gated on colour. */
+        const bool cleared = isatty(STDOUT_FILENO) != 0;
+        if (cleared) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        }
+        if (smallclueColourWanted()) {
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {
-            printf("\nEvery %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+            printf("%sEvery %.2fs: %s\n\n", cleared ? "" : "\n", interval,
+                   cmdline ? cmdline : argv[idx]);
         }
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
@@ -16190,7 +16244,7 @@ static void smallclueDfFormatSize(char *buf, size_t bufsize,
 }
 
 static void smallclueDfPrintHeader(bool human) {
-    if (isatty(STDOUT_FILENO)) {
+    if (smallclueColourWanted()) {
         printf("\033[1m%-24s %12s %12s %12s %6s %s\033[0m\n",
                "Filesystem",
                human ? "Size" : "1K-blocks",
@@ -17817,7 +17871,23 @@ static void smallclueCalRenderMonth(int month, int year, int highlight_day, Smal
         if (w > 0 && (size_t)w < rem) { ptr += w; rem -= w; }
     }
 
-    int use_color = (highlight_day > 0 && isatty(STDOUT_FILENO));
+    /* Reverse video is the only thing that says "today", and when colour is
+     * refused it goes away with nothing in its place. That is deliberate.
+     *
+     * A marker has nowhere to go. The block is exactly 20 columns wide and
+     * smallclueCalPrintYear stacks three of them side by side, so a bracket or
+     * a cursor character has to come out of a day's two columns or out of the
+     * single separating space, and either one shifts a grid that readers and
+     * parsers both expect. BSD cal's answer -- backspace overstrike, "_\b2_\b4"
+     * -- would not survive that either: smallclueVisibleLength only skips CSI
+     * sequences, so the extra bytes would count as visible and pull the year
+     * layout apart.
+     *
+     * Dropping it also keeps a promise this applet has always kept. `cal | cat`
+     * printed no marker before this change and prints none after, and macOS's
+     * BSD cal drops its own marker off a terminal in the same way (both
+     * measured). A reader who wants today's date has `date`. */
+    int use_color = (highlight_day > 0 && smallclueColourWanted());
     for (int day = 1; day <= days; ++day) {
         char day_str[32];
         if (use_color && day == highlight_day) {
@@ -21835,8 +21905,16 @@ static int smallclueGrepCommand(int argc, char **argv) {
         return 2;
     }
 
+    /* Same precedence as smallclueLsCommand, and here it matches GNU grep
+     * exactly (measured on 3.11): --color=auto goes quiet under NO_COLOR=1 and
+     * TERM=dumb, --color=always paints through both.
+     *
+     * When colour is off the match highlight simply goes away, with no marker
+     * standing in for it. grep's output IS the matching line -- every consumer
+     * downstream of a pipe parses it as such, and inserting a marker would
+     * corrupt the one thing callers rely on. GNU grep drops it the same way. */
     if (color_mode == 0) {
-        color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
+        color_mode = smallclueColourWanted() ? 1 : -1;
     }
     opts.useColor = (color_mode == 1);
 
@@ -22958,7 +23036,10 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    if (isatty(STDERR_FILENO)) {
+    /* The prompt goes to stderr, so it asks about stderr: `rm -i * >list`
+     * still has a terminal to warn at. The path is the message either way --
+     * only the red is gated. */
+    if (smallclueColourWantedOn(STDERR_FILENO)) {
         fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
     } else {
         fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
