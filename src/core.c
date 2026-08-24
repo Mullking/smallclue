@@ -1334,8 +1334,18 @@ enum {
 #define MD_MARK_LEN 2
 
 /* Colour is for a terminal that asked for it: NO_COLOR is honoured (no-color.org),
- * a dumb or unset TERM is taken at its word, and a redirect gets plain text. */
-static bool markdownColourWanted(void) {
+ * a dumb or unset TERM is taken at its word, and a redirect gets plain text.
+ *
+ * This is the colour policy for everything the pager and md draw, not just for
+ * the renderer's markers. It did not use to be: md's document list and its two
+ * menus asked isatty() and nothing else, so a NO_COLOR=1 TERM=dumb run got a
+ * plain document wrapped in a painted list and a reverse-video menu bar. A
+ * policy that only half the code consults is not a policy.
+ *
+ * Escapes that make the UI WORK -- clearing the screen, homing the cursor,
+ * erasing the prompt line -- are not colour and are not gated here. A terminal
+ * that wants no colour still has a cursor. */
+static bool smallclueColourWanted(void) {
     const char *no_colour = getenv("NO_COLOR");
     if (no_colour && *no_colour) {
         return false;
@@ -6306,8 +6316,14 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     if (page_rows < 1) {
         page_rows = 1;
     }
-    /* The same test the screen-clear above already trusts. */
-    bool colour = buffer->sgr_marks && markdownColourWanted();
+    /* Two questions, and they are not the same one. colour_ok is whether this
+     * terminal takes SGR at all, and it gates the reverse video that marks the
+     * picked link below. colour is that AND "this buffer is a markdown render",
+     * because only those carry markers worth expanding. The two agree for every
+     * md view today -- the md pager always arms sgr_marks -- but the picker's
+     * highlight is not a marker expansion and must not borrow that reason. */
+    bool colour_ok = smallclueColourWanted();
+    bool colour = buffer->sgr_marks && colour_ok;
     if (isatty(STDOUT_FILENO)) {
         fputs("\x1b[2J\x1b[H", stdout);
     } else {
@@ -6332,13 +6348,17 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
                 } else {
                     smallclueSanitizeAndPrintEx(line, prefix_len, stdout, buffer->sgr_marks, colour);
                 }
-                fputs("\x1b[7m", stdout);
+                if (colour_ok) {
+                    fputs("\x1b[7m", stdout);
+                }
                 if (buffer->raw_mode) {
                     fwrite(hit, 1, strlen(highlight_target), stdout);
                 } else {
                     smallclueSanitizeAndPrintEx(hit, strlen(highlight_target), stdout, buffer->sgr_marks, colour);
                 }
-                fputs("\x1b[0m", stdout);
+                if (colour_ok) {
+                    fputs("\x1b[0m", stdout);
+                }
                 if (buffer->raw_mode) {
                     fputs(hit + strlen(highlight_target), stdout);
                 } else {
@@ -6378,7 +6398,7 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
 static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
-    bool color = isatty(STDOUT_FILENO);
+    bool color = smallclueColourWanted();
     const char *inv = color ? "\033[7m" : "";
     const char *rst = color ? "\033[0m" : "";
     if (detail && *detail) {
@@ -6637,7 +6657,21 @@ static int pagerInteractiveSession(const char *cmd_name,
             free(highlight);
             redraw = false;
         }
-        int key = pagerPromptAndRead(cmd_name, detail);
+        /* Which link [ ] has landed on is normally said in reverse video by
+         * pagerRenderPage. A terminal that refuses SGR gets told in words
+         * instead -- without it Enter opens something the reader cannot see
+         * they have selected, which is a worse answer than a little colour. */
+        char detail_buf[160];
+        const char *detail_shown = detail;
+        if (md_links && selected_md_link_index != SIZE_MAX &&
+            selected_md_link_index < md_links->count && !smallclueColourWanted()) {
+            snprintf(detail_buf, sizeof(detail_buf), "%s%slink %zu/%zu",
+                     detail ? detail : "",
+                     (detail && *detail) ? " " : "",
+                     selected_md_link_index + 1, md_links->count);
+            detail_shown = detail_buf;
+        }
+        int key = pagerPromptAndRead(cmd_name, detail_shown);
         switch (key) {
             case PAGER_KEY_RESIZE:
                 g_pager_sigwinch_received = 0;
@@ -11425,7 +11459,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     /* Emitted only when something will expand them. A redirected run must not
      * see "^Ac" where a colour would have been, and the pager's strip-when-off
      * branch is then a second line of defence rather than the only one. */
-    gMarkdownMarks = !direct && markdownColourWanted();
+    gMarkdownMarks = !direct && smallclueColourWanted();
     int render_status = markdownRenderStream(label, source, buffer);
     gMarkdownFromHtml = previous_from_html;
     gMarkdownMarks = previous_marks;
@@ -11647,6 +11681,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
     size_t top = 0;
     bool running = true;
     bool first_frame = true;
+    const bool colour = smallclueColourWanted();
 #if defined(PSCAL_TARGET_IOS)
     bool prev_session_queue = pager_session_queue_enabled;
     pager_session_queue_enabled = true;
@@ -11681,14 +11716,19 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             snprintf(header, sizeof(header), "Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
                    cursor + 1, links->count);
         }
-        fputs("\x1b[7m", out);
+        if (colour) {
+            fputs("\x1b[7m", out);
+        }
         if (cols > 0 && (int)strlen(header) > cols) {
             if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
             else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
         } else {
             fprintf(out, "%s", header);
         }
-        fputs("\x1b[0m\n", out);
+        if (colour) {
+            fputs("\x1b[0m", out);
+        }
+        fputc('\n', out);
 
         size_t end = top + window;
         if (end > links->count) end = links->count;
@@ -11697,8 +11737,13 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             const char *text = links->items[i].text ? links->items[i].text : "(link)";
             const char *target = links->items[i].target ? links->items[i].target : "";
             char line[PATH_MAX * 3];
-            snprintf(line, sizeof(line), "%3zu. %s (%s)", i + 1, text, target);
-            if (active) fputs("\x1b[7m", out);
+            /* Reverse video is what says "this one" when the terminal will draw
+             * it. When it will not, something has to, or the menu is a list with
+             * no cursor in it -- so the marker goes inside the line, before the
+             * width arithmetic below measures it. */
+            const char *marker = colour ? "" : (active ? "> " : "  ");
+            snprintf(line, sizeof(line), "%s%3zu. %s (%s)", marker, i + 1, text, target);
+            if (active && colour) fputs("\x1b[7m", out);
             if (cols > 0 && (int)strlen(line) > cols) {
                 if (cols > 3) {
                     fwrite(line, 1, (size_t)(cols - 3), out);
@@ -11710,7 +11755,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             } else {
                 fprintf(out, "%s\n", line);
             }
-            if (active) fputs("\x1b[0m", out);
+            if (active && colour) fputs("\x1b[0m", out);
         }
         if (out != stdout) {
             fflush(out);
@@ -12008,7 +12053,7 @@ static int smallclueMarkdownListDocuments(void) {
     }
     qsort(entries, count, sizeof(MarkdownDocEntry), markdownDocEntryCompare);
 
-    bool use_color = isatty(STDOUT_FILENO);
+    bool use_color = smallclueColourWanted();
     if (use_color) {
         printf("Markdown documents in \033[1;34m%s\033[0m:\n\n", visible_docs_dir);
     } else {
@@ -12054,6 +12099,7 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           int term_cols,
                                           bool show_docs_dir,
                                           bool *first_frame) {
+    const bool colour = smallclueColourWanted();
     char *frame = NULL;
     size_t frame_len = 0;
     FILE *out = open_memstream(&frame, &frame_len);
@@ -12065,7 +12111,9 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
     snprintf(header, sizeof(header),
              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
              cursor + 1, count);
-    fputs("\x1b[7m", out);
+    if (colour) {
+        fputs("\x1b[7m", out);
+    }
     if (term_cols > 0 && (int)strlen(header) > term_cols) {
         if (term_cols <= 3) {
             fwrite(header, 1, (size_t)term_cols, out);
@@ -12076,7 +12124,10 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
     } else {
         fprintf(out, "%s", header);
     }
-    fputs("\x1b[0m\n", out);
+    if (colour) {
+        fputs("\x1b[0m", out);
+    }
+    fputc('\n', out);
     size_t end = top + window;
     if (end > count) {
         end = count;
@@ -12086,8 +12137,11 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         bool highlight = (idx == cursor);
         const char *name = entries[idx].name ? entries[idx].name : "(unknown)";
         const char *title = entries[idx].title ? entries[idx].title : "";
-        snprintf(line, sizeof(line), " %-24.24s %s", name, title);
-        if (highlight) {
+        /* The leading column is already in the format string, so without colour
+         * it carries the cursor instead of a space and nothing shifts. */
+        snprintf(line, sizeof(line), "%s%-24.24s %s",
+                 (highlight && !colour) ? ">" : " ", name, title);
+        if (highlight && colour) {
             fputs("\x1b[7m", out);
         }
         if (term_cols > 0 && (int)strlen(line) > term_cols) {
@@ -12101,7 +12155,7 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         } else {
             fprintf(out, "%s\n", line);
         }
-        if (highlight) {
+        if (highlight && colour) {
             fputs("\x1b[0m", out);
         }
     }
