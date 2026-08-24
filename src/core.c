@@ -3649,6 +3649,7 @@ static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
 static int pagerBufferFill(PagerBuffer *buffer, size_t want);
 static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame);
+static void smallclueMenuEndFrameTo(FILE *out, char **frame, size_t *frame_len);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -11757,15 +11758,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             }
             if (active && colour) fputs("\x1b[0m", out);
         }
-        if (out != stdout) {
-            fflush(out);
-            fclose(out);
-            if (frame && frame_len > 0) {
-                fwrite(frame, 1, frame_len, stdout);
-            }
-            free(frame);
-        }
-        fflush(stdout);
+        smallclueMenuEndFrameTo(out, &frame, &frame_len);
 
         int key = pager_read_key();
         switch (key) {
@@ -12078,16 +12071,53 @@ static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
     if (!out) {
         out = stdout;
     }
+    /* Ask stdout, not `out`.  Two of the three callers build the frame in an
+       open_memstream() FILE and fwrite() it to stdout once it is complete, and
+       fileno() on a memstream is -1, so isatty(fileno(out)) was always false
+       for them and those menus never cleared -- they just scrolled.  stdout is
+       where the frame lands either way, which makes it the destination to
+       test, and it is the test every other screen clear here already uses. */
+    bool clear = isatty(STDOUT_FILENO);
     if (first_frame && *first_frame) {
-        if (isatty(fileno(out))) {
+        if (clear) {
             fputs("\x1b[2J\x1b[H", out);
         }
         *first_frame = false;
         return;
     }
-    if (isatty(fileno(out))) {
+    if (clear) {
         fputs("\x1b[H\x1b[J", out);
     }
+}
+
+/* Close a frame built in an open_memstream() FILE and put it on the screen.
+   Drops one trailing newline when we are addressing the screen: these frames
+   are sized to exactly fill the terminal (header + window + footer == rows),
+   and a newline written on the bottom row scrolls everything up by one, which
+   costs the header on the next \x1b[H.  When stdout is not a terminal there is
+   no cursor to protect and the newline is the only thing separating frames, so
+   it stays. */
+static void smallclueMenuEndFrameTo(FILE *out, char **frame, size_t *frame_len) {
+    if (!out || out == stdout) {
+        fflush(stdout);
+        return;
+    }
+    fflush(out);
+    fclose(out);
+    if (frame && *frame && frame_len && *frame_len > 0) {
+        size_t len = *frame_len;
+        if (isatty(STDOUT_FILENO) && (*frame)[len - 1] == '\n') {
+            len--;
+        }
+        if (len > 0) {
+            fwrite(*frame, 1, len, stdout);
+        }
+    }
+    if (frame) {
+        free(*frame);
+        *frame = NULL;
+    }
+    fflush(stdout);
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -12176,15 +12206,7 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
             fprintf(out, "%s\n", footer);
         }
     }
-    if (out != stdout) {
-        fflush(out);
-        fclose(out);
-        if (frame && frame_len > 0) {
-            fwrite(frame, 1, frame_len, stdout);
-        }
-        free(frame);
-    }
-    fflush(stdout);
+    smallclueMenuEndFrameTo(out, &frame, &frame_len);
 }
 
 static int markdownInteractiveSelectDocument(void) {
