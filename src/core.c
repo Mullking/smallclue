@@ -3463,8 +3463,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "    %u/%g uid/gid %U/%G user/group %i inode %h links\n"
              "    %d device %b blocks %B block-size %f raw mode(hex)\n"
              "    %X/%Y/%Z atime/mtime/ctime (epoch seconds), %% literal %"},
-    {"stty", "stty [reset] [sane]\n"
-             "  Report terminal settings; apply reset/sane"},
+    {"stty", "stty [reset] [sane] [ixon|-ixon]\n"
+             "  Report terminal settings; apply reset/sane; toggle flow control"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", "exsh\n"
              "  Launch PSCAL shell front end"},
@@ -19478,12 +19478,43 @@ static int smallclueSttyReport(void) {
     return 0;
 }
 
+// XON/XOFF flow control. Shell startup files reach for this: zprezto's
+// environment module runs `stty -ixon <$TTY >$TTY` so that ^S and ^Q stay
+// available as key bindings instead of freezing the terminal.
+static int smallclueSttySetIxon(bool enable) {
+    if (!pscalRuntimeStdinHasRealTTY()) {
+        // Report it but succeed, exactly as tset's control-char path does. A
+        // nonzero exit here would surface on every login for a terminal we
+        // simply cannot configure, which is the failure this argument exists
+        // to stop.
+        fprintf(stderr, "stty: stdin is not a tty (cannot set flow control)\n");
+        return 0;
+    }
+    struct termios tio;
+    if (smallclueTcgetattr(STDIN_FILENO, &tio) != 0) {
+        perror("stty");
+        return 1;
+    }
+    if (enable) {
+        tio.c_iflag |= IXON;
+    } else {
+        tio.c_iflag &= ~(tcflag_t) IXON;
+    }
+    if (smallclueTcsetattr(STDIN_FILENO, TCSANOW, &tio) != 0) {
+        perror("stty");
+        return 1;
+    }
+    return 0;
+}
+
 static int smallclueSttyCommand(int argc, char **argv) {
     if (argc <= 1) {
         return smallclueSttyReport();
     }
     bool requestReset = false;
     bool requestSane = false;
+    bool requestIxon = false;
+    bool ixonEnable = false;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -19494,6 +19525,12 @@ static int smallclueSttyCommand(int argc, char **argv) {
         }
         if (strcmp(arg, "sane") == 0) {
             requestSane = true;
+            index += 1;
+            continue;
+        }
+        if (strcmp(arg, "ixon") == 0 || strcmp(arg, "-ixon") == 0) {
+            requestIxon = true;
+            ixonEnable = (arg[0] != '-');
             index += 1;
             continue;
         }
@@ -19512,11 +19549,19 @@ static int smallclueSttyCommand(int argc, char **argv) {
     if (requestSane) {
         smallclueEmitTerminalSane();
     }
+    // After sane, which turns flow control back on -- `stty sane -ixon` has to
+    // end with it off.
+    if (requestIxon) {
+        int rc = smallclueSttySetIxon(ixonEnable);
+        if (rc != 0) {
+            return rc;
+        }
+    }
 
-    if (requestReset || requestSane) {
+    if (requestReset || requestSane || requestIxon) {
         return 0;
     }
-    fprintf(stderr, "Usage: stty [reset] [sane]\n");
+    fprintf(stderr, "Usage: stty [reset] [sane] [ixon|-ixon]\n");
     return 1;
 }
 
