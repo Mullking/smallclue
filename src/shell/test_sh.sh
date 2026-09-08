@@ -142,6 +142,33 @@ EOF'
 check "heredoc dash strips tabs" 'cat <<-EOF
 	indented
 EOF'
+check "two heredocs on one line" 'cat <<A; cat <<B
+first
+A
+second
+B'
+check "three heredocs on one line" 'cat <<A; cat <<B; cat <<C
+1
+A
+2
+B
+3
+C'
+check "two heredocs sharing a delimiter" 'cat <<E; cat <<E
+x
+E
+y
+E'
+check "heredocs on one line, mixed forms" 'x=v; cat <<"A"; cat <<-B
+$x
+A
+	$x
+B'
+check "heredoc in a pipeline, then another" 'cat <<A | tr a-z A-Z; cat <<B
+hello
+A
+world
+B'
 
 # ---- pipelines ----
 check "simple pipe" 'echo hello | cat'

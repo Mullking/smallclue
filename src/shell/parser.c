@@ -954,7 +954,22 @@ static ShellCommand *parsePipelineCommand(ShellParser *parser) {
         return NULL;
     }
     ShellCommand *command = parseCommand(parser);
-    if (command && parser->pending_here_docs && parser->pending_here_docs->count > 0) {
+    /* A here-document's body starts on the line *after* the line carrying the
+     * operator, and every here-doc queued on that line is read in order once
+     * the newline is reached -- which is what shellParserAdvance() does. So
+     * draining here, as soon as a command has been parsed, is too early: for
+     *
+     *     cat <<A; cat <<B
+     *
+     * the lexer is still sitting mid-line just past <<A, and A's body would
+     * swallow the rest of the line (" cat <<B") instead of starting on the
+     * next one. The one case the newline drain cannot reach is input that
+     * ends without a trailing newline at all (`cat <<EOF` and nothing else),
+     * where there is no NEWLINE token to trigger it and the unterminated
+     * here-doc still has to be reported -- so fall back to draining here only
+     * at end of input. */
+    if (command && parser->pending_here_docs && parser->pending_here_docs->count > 0 &&
+        parser->current.type == SHELL_TOKEN_EOF) {
         parserConsumePendingHereDocs(parser);
     }
     return command;
