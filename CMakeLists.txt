@@ -521,6 +521,37 @@ set(SOURCES
     ${OPENRSYNC_ROOT}/zcompress.c
 )
 
+# Warning policy for the vendored third-party trees
+#
+# openssh and nextvi are upstream code this project doesn't maintain, and they
+# are noisy under smallclue's flags -- around 350 warnings, none of them
+# actionable here. openssh especially: it builds clean under the flags its own
+# ./configure picks, which include -Wno-pointer-sign, but CMake compiles its
+# sources with smallclue's flags instead, so the same things have to be said
+# here. Scoped to these sources rather than set project-wide, so a real warning
+# in smallclue's own code still stands out instead of being buried.
+include(CheckCCompilerFlag)
+set(_smallclue_thirdparty_w_flags)
+foreach(_smallclue_w
+        -Wno-deprecated-declarations      # openssh: daemon(), OpenSSL 3 API
+        -Wno-pointer-sign                 # openssh: char*/u_char*; upstream disables this too
+        -Wno-include-next-absolute-path   # openssh: openbsd-compat's #include_next shims
+        -Wno-gnu-folding-constant)        # nextvi: constant-sized VLAs
+    # Probe the positive spelling: gcc accepts an unknown -Wno-* silently and
+    # only mentions it later, when some other diagnostic makes it speak up.
+    string(REPLACE "-Wno-" "-W" _smallclue_w_positive "${_smallclue_w}")
+    string(MAKE_C_IDENTIFIER "SMALLCLUE_HAS_${_smallclue_w_positive}" _smallclue_w_var)
+    check_c_compiler_flag("${_smallclue_w_positive}" ${_smallclue_w_var})
+    if(${_smallclue_w_var})
+        list(APPEND _smallclue_thirdparty_w_flags "${_smallclue_w}")
+    endif()
+endforeach()
+if(_smallclue_thirdparty_w_flags)
+    set_source_files_properties(
+        ${OPENSSH_SOURCES} ${NEXTVI_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "${_smallclue_thirdparty_w_flags}")
+endif()
+
 set_source_files_properties(${NEXTVI_SOURCES} PROPERTIES COMPILE_DEFINITIONS "main=nextvi_main_entry")
 # scp.c defines its own cleanup_exit() (closes remin/remout/remin2/remout2
 # fds) distinct from clientloop.c's client-specific one -- rename it so it
@@ -902,7 +933,13 @@ int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
             -DUSE_I18N=OFF
             -DENABLE_WERROR=OFF
         BUILD_BYPRODUCTS ${LIBGIT2_LIBRARY}
-        INSTALL_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target install
+        # No explicit INSTALL_COMMAND: it was spelled out as
+        # `cmake --build <BINARY_DIR> --target install`, which is what
+        # ExternalProject does by default anyway -- except that under a
+        # Makefile generator the default uses $(MAKE), so the sub-make
+        # inherits the jobserver instead of warning "jobserver unavailable:
+        # using -j1". Leaving it unset also keeps Ninja builds correct, where
+        # ExternalProject picks cmake --build on its own.
     )
 
     add_definitions(-DPSCAL_HAS_LIBGIT2)
@@ -1110,11 +1147,17 @@ target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 # won't look back. Re-list ZLIB::ZLIB (and libzstd, if present) after
 # OpenSSL so they're available on this later pass too -- same fix as the
 # libgit2.a re-list of OpenSSL::SSL/Crypto below.
-target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
-if(ZSTD_LIBRARY)
-    target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
-else()
-    message(WARNING "libzstd not found; if this OpenSSL build has zstd BIO support compiled in, the static link will fail with undefined ZSTD_* references. Install libzstd-dev (Debian/Ubuntu) or equivalent.")
+#
+# Only on the platform that needs it: ld64 resolves archives without regard to
+# link order, so on Apple the re-list is pure duplication and the linker says
+# so ("ignoring duplicate libraries").
+if(UNIX AND NOT APPLE)
+    target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
+    if(ZSTD_LIBRARY)
+        target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
+    else()
+        message(WARNING "libzstd not found; if this OpenSSL build has zstd BIO support compiled in, the static link will fail with undefined ZSTD_* references. Install libzstd-dev (Debian/Ubuntu) or equivalent.")
+    endif()
 endif()
 
 if(SMALLCLUE_WITH_LIBGIT2)
@@ -1132,10 +1175,13 @@ if(SMALLCLUE_WITH_LIBGIT2)
     # were already listed earlier (line ~399, before libgit2.a lands in the
     # link line), the linker never looks back at them once it hits libgit2's
     # unresolved references. Re-list them after libgit2.a so they're
-    # available on this later pass too.
-    target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    if(ZSTD_LIBRARY)
-        target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
+    # available on this later pass too. Linux only, for the same reason as the
+    # ZLIB re-list above: on Apple this only produces duplicate-library warnings.
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        if(ZSTD_LIBRARY)
+            target_link_libraries(smallclue PRIVATE ${ZSTD_LIBRARY})
+        endif()
     endif()
 endif()
 

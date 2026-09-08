@@ -27,11 +27,14 @@ typedef struct {
     bool quoted;
 } ShellPendingHereDoc;
 
-typedef struct ShellPendingHereDocArray {
+/* parser.h already declares the ShellPendingHereDocArray typedef; repeating it
+ * here as well is a redefinition that only C11 allows, and this builds as
+ * gnu99. Define the named struct and let the header keep owning the name. */
+struct ShellPendingHereDocArray {
     ShellPendingHereDoc *items;
     size_t count;
     size_t capacity;
-} ShellPendingHereDocArray;
+};
 
 static void pendingHereDocArrayInit(ShellPendingHereDocArray *array);
 static void pendingHereDocArrayFree(ShellPendingHereDocArray *array);
