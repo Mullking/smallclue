@@ -654,6 +654,33 @@ if(SMALLCLUE_WITH_LIBGIT2)
             set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
             set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
         endif()
+        # pkg_check_modules caches its answers as INTERNAL cache entries and
+        # skips the pkg-config call entirely on every later run. Homebrew
+        # installs into version-stamped Cellar paths, so `brew upgrade libssh2`
+        # moves include/ and lib/ out from under a cache that still names the
+        # old version, and re-running cmake in an existing build tree then dies
+        # with: Imported target "PkgConfig::LIBSSH2" includes non-existent path
+        # ".../Cellar/libssh2/<old version>/include". Nothing about that says
+        # "stale cache", and `make clean` does not help since the cache is what
+        # is stale. So drop the cached answer once the path it names has gone
+        # away, and let pkg_check_modules below re-run and pick up the new
+        # prefix. __pkg_config_checked_LIBSSH2 is the sentinel it tests to
+        # decide whether it may skip; the pkgcfg_lib_* entries are the
+        # find_library() results IMPORTED_TARGET builds the target from, and
+        # would otherwise still point into the old prefix.
+        if(LIBSSH2_INCLUDEDIR AND NOT EXISTS "${LIBSSH2_INCLUDEDIR}")
+            message(STATUS
+                "Cached libssh2 prefix ${LIBSSH2_INCLUDEDIR} no longer exists "
+                "(upgraded?) -- re-running pkg-config for libssh2")
+            set(_smallclue_libssh2_prefix_moved TRUE)
+            unset(__pkg_config_checked_LIBSSH2 CACHE)
+            get_cmake_property(_smallclue_cache_vars CACHE_VARIABLES)
+            foreach(_smallclue_cache_var IN LISTS _smallclue_cache_vars)
+                if(_smallclue_cache_var MATCHES "^pkgcfg_lib_LIBSSH2_")
+                    unset(${_smallclue_cache_var} CACHE)
+                endif()
+            endforeach()
+        endif()
         pkg_check_modules(LIBSSH2 QUIET IMPORTED_TARGET libssh2)
         if(UNIX AND NOT APPLE)
             set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
@@ -818,6 +845,29 @@ int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
     set(LIBGIT2_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libgit2-build)
     set(LIBGIT2_INSTALL_DIR ${LIBGIT2_PREFIX}/install)
     set(LIBGIT2_LIBRARY ${LIBGIT2_INSTALL_DIR}/lib/libgit2.a)
+
+    # libgit2 runs its own pkg_check_modules(LIBSSH2 ...) inside this nested
+    # build tree, which has its own cache and its own "already checked"
+    # sentinel -- so healing the outer cache above is not enough on its own.
+    # The nested cache still names the prefix libssh2 just moved off, and the
+    # build fails a long way in with "'libssh2.h' file not found". Drop the
+    # nested cache, and the stamps that would let ExternalProject skip
+    # re-configuring, so libgit2 reconfigures against the new prefix. This only
+    # fires on the run that first notices the move, not on ordinary rebuilds.
+    if(_smallclue_libssh2_prefix_moved)
+        set(_smallclue_libgit2_nested_build ${LIBGIT2_PREFIX}/src/libgit2_external-build)
+        set(_smallclue_libgit2_stamps ${LIBGIT2_PREFIX}/src/libgit2_external-stamp)
+        if(EXISTS ${_smallclue_libgit2_nested_build}/CMakeCache.txt)
+            message(STATUS
+                "libssh2 moved -- dropping libgit2's nested CMake cache so it "
+                "reconfigures against the new prefix")
+            file(REMOVE ${_smallclue_libgit2_nested_build}/CMakeCache.txt)
+            file(REMOVE
+                ${_smallclue_libgit2_stamps}/libgit2_external-configure
+                ${_smallclue_libgit2_stamps}/libgit2_external-build
+                ${_smallclue_libgit2_stamps}/libgit2_external-install)
+        endif()
+    endif()
 
     ExternalProject_Add(libgit2_external
         SOURCE_DIR ${LIBGIT2_SOURCE_DIR}
