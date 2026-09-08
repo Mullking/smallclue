@@ -678,6 +678,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     -I. -Isrc ${EXTRA_C_INCLUDES} ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
     src/core.c \
+    src/spawn.c \
     src/runtime_support.c \
     src/micro_app.c \
     src/micro_main_stub.c \

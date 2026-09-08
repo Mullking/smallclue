@@ -15061,6 +15061,16 @@ static bool smallclueFormatBuildTimestamp(const char *programVersion, char *out,
     return true;
 }
 
+/* iSH-AOK links its own copyBuildVersion(); a standalone smallclue has none.
+ * A bare weak *declaration* leaves an undefined symbol that Mach-O refuses to
+ * link, so carry a weak *definition* instead -- the shape src/integration.c
+ * already uses for the runtime bridge. A strong definition wins at link time,
+ * and weak definitions are never inlined, so the override still takes. */
+__attribute__((weak))
+char *copyBuildVersion(void) {
+    return NULL;
+}
+
 static int smallclueVersionCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -15084,8 +15094,7 @@ static int smallclueVersionCommand(int argc, char **argv) {
     // answer -- the same one /AOK/VERSION and `uname -v` give, so the three
     // agree -- and it is already malloc'd, which is what the free() below
     // wants. Weak, so a standalone smallclue still links without it.
-    extern char *copyBuildVersion(void) __attribute__((weak));
-    if (!version && &copyBuildVersion) {
+    if (!version) {
         version = copyBuildVersion();
     }
     if (!version) {

@@ -450,6 +450,7 @@ list(APPEND OPENSSH_SOURCES
 set(SOURCES
     src/main.c
     src/core.c
+    src/spawn.c
     src/openrsync_app.c
     src/micro_app.c
     src/micro_main_stub.c
