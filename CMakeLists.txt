@@ -426,7 +426,7 @@ list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/getrrsetbyname.*\\.c$")
 # applet table) -- same category as the already-excluded ssh-agent.c/
 # ssh-add.c. Left in, they collide with src/main.c's real main() at link
 # time since only ssh.c/scp.c/sftp.c/ssh-keygen.c get the main->pscal_*
-# rename treatment from fetch_dependencies.sh.
+# rename, which the openssh fork carries as a commit.
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-sk-helper\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-keyscan\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-sk-client\\.c$")
@@ -540,9 +540,9 @@ if(APPLE AND NOT ENABLE_IOS_TARGET)
         PROPERTIES COMPILE_DEFINITIONS "HAVE_SYS_RANDOM_H=1")
 endif()
 # NOTE: ssh/scp/sftp/ssh-keygen's main() -> pscal_openssh_*_main() renames are
-# done by fetch_dependencies.sh via sed directly on third-party/openssh/*.c
-# (matching src/openssh_app.c's extern declarations), not via COMPILE_DEFINITIONS
-# here. The old ssh_main=/scp_main=/etc. defines assumed an ios_system-style
+# commits on the openssh fork (matching src/openssh_app.c's extern
+# declarations) -- fetch_dependencies.sh used to apply them with sed -- not
+# COMPILE_DEFINITIONS here. The old ssh_main=/scp_main=/etc. defines assumed an ios_system-style
 # pre-renamed source tree that this repo no longer vendors; removed as dead.
 # NOTE: main.c is also listed in the shared set_source_files_properties()
 # call below (it needs the same err/warn/exit renames as every other
