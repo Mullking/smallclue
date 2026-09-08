@@ -338,17 +338,10 @@ __attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
 ")
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh AND
-   NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/config.h)
-    message(FATAL_ERROR
-        "third-party/openssh/config.h is missing -- OpenSSH hasn't been "
-        "configured yet. From third-party/openssh, run:\n"
-        "    ./configure --sysconfdir=/etc/ssh\n"
-        "(on macOS, point CPPFLAGS/LDFLAGS/PKG_CONFIG_PATH at your OpenSSL "
-        "install first, e.g. via `brew --prefix openssl@3`). "
-        "See setup_posix_env.sh's OpenSSH configure step for the exact flags "
-        "used on Linux/macOS if `./configure` fails outright.")
-endif()
+# OpenSSH's config.h: Apple builds use the one committed to the fork, and
+# anywhere else we run openssh's ./configure ourselves -- see the "Configure
+# third-party/openssh" block further down, which has to wait for
+# find_package(OpenSSL).
 
 # Source files
 set(NEXTVI_SOURCES third-party/nextvi/vi.c)
@@ -527,6 +520,18 @@ set_source_files_properties(${NEXTVI_SOURCES} PROPERTIES COMPILE_DEFINITIONS "ma
 # doesn't collide, scoped to scp.c only so its own internal call sites (the
 # only callers) pick up the renamed symbol consistently.
 set_source_files_properties(third-party/openssh/scp.c PROPERTIES COMPILE_DEFINITIONS "cleanup_exit=pscal_openssh_scp_cleanup_exit")
+# On a macOS host this build compiles openssh against the fork's committed
+# config.h (see "Configure third-party/openssh" below). That file leaves
+# HAVE_SYS_RANDOM_H undefined because the iOS SDK lacks the header, but on
+# macOS <sys/random.h> is the only header that declares getentropy(), which
+# bsd-getentropy.c calls under HAVE_GETENTROPY. iSH-AOK never notices because it
+# force-includes kernel/native_libc.h, which declares getentropy itself; here
+# the build stops with "call to undeclared function 'getentropy'". The header
+# does exist on macOS, so say so, but only for the one file that asks.
+if(APPLE AND NOT ENABLE_IOS_TARGET)
+    set_source_files_properties(third-party/openssh/openbsd-compat/bsd-getentropy.c
+        PROPERTIES COMPILE_DEFINITIONS "HAVE_SYS_RANDOM_H=1")
+endif()
 # NOTE: ssh/scp/sftp/ssh-keygen's main() -> pscal_openssh_*_main() renames are
 # done by fetch_dependencies.sh via sed directly on third-party/openssh/*.c
 # (matching src/openssh_app.c's extern declarations), not via COMPILE_DEFINITIONS
@@ -946,6 +951,99 @@ find_package(OpenSSL REQUIRED)
 # not be needed there.
 find_library(ZSTD_LIBRARY zstd)
 set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+
+# Configure third-party/openssh -- off Apple only
+#
+# The fork's config.h is a COMMITTED, hand-maintained source file: generated
+# on aarch64-apple-darwin, then edited so that one file serves both the macOS
+# build and the iOS app (the Darwin-only facts guarded, our own readpassphrase,
+# HAVE_DECL_HTOBE32). The openbsd-compat/include shims configure would write
+# for Darwin are committed beside it; include_directories() above names them.
+# So on Apple there is nothing to configure, and running configure there would
+# overwrite that file with this host's guess -- the same clobber
+# build_smallclue.sh guards against by saving and restoring it.
+#
+# Everywhere else it is the wrong file. Its !__linux__ guards cover only the
+# BSD facts that are outright false on glibc; it was still generated on Darwin,
+# --without-openssl, for a build that force-includes iSH-AOK's
+# kernel/native_libc.h to declare what it leaves out. So run configure and let
+# it write one for this host. It also rewrites openbsd-compat/include: shims
+# for headers this host has, like <endian.h> on glibc, are removed and any it
+# lacks are added. Both happen in the submodule's working tree, so it reads as
+# dirty afterwards. That is expected there, and not something to commit.
+#
+# This lives after find_package(OpenSSL) because it reuses what that found:
+# calling find_package earlier would cache a .so on Linux and defeat the
+# .a preference the static build sets up just above.
+#
+# config.status is autoconf's own record that configure has run in this tree,
+# and openssh's .gitignore covers it, so this fires once per fresh checkout
+# rather than on every cmake run -- delete it to force a reconfigure.
+set(_smallclue_openssh_dir ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh)
+if(EXISTS ${_smallclue_openssh_dir}/configure
+   AND NOT APPLE
+   AND NOT ENABLE_IOS_TARGET
+   AND NOT CMAKE_CROSSCOMPILING
+   AND NOT EXISTS ${_smallclue_openssh_dir}/config.status)
+    # configure refuses to run if configure.ac or any m4/*.m4 is newer than it
+    # ("configure.ac newer than configure, run autoreconf"). A release tarball
+    # carries the right timestamps; a git checkout stamps each file with the
+    # moment it was written, and configure.ac and m4/ are written after
+    # configure, so a fresh clone trips the check with nothing actually stale.
+    # When git says all three are exactly as committed, the committed configure
+    # is current by construction, so make its mtime say so. A real local edit
+    # to configure.ac leaves this alone and still gets the error it deserves.
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD -- configure configure.ac m4
+            WORKING_DIRECTORY ${_smallclue_openssh_dir}
+            RESULT_VARIABLE _smallclue_openssh_autoconf_changed
+            OUTPUT_QUIET ERROR_QUIET
+        )
+        if(_smallclue_openssh_autoconf_changed EQUAL 0)
+            execute_process(COMMAND ${CMAKE_COMMAND} -E touch configure
+                            WORKING_DIRECTORY ${_smallclue_openssh_dir})
+        endif()
+    endif()
+
+    get_filename_component(_smallclue_ssl_libdir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
+    # Same policy as the target_link_options(-static) block: this build is
+    # fully static, so configure has to probe with -static too, or it records
+    # libraries the final link cannot actually use.
+    set(_smallclue_openssh_ldflags "-L${_smallclue_ssl_libdir} -static")
+    message(STATUS "Configuring third-party/openssh for this host (once per checkout)")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env
+            "CPPFLAGS=-I${OPENSSL_INCLUDE_DIR}"
+            "LDFLAGS=${_smallclue_openssh_ldflags}"
+            "PKG_CONFIG_PATH=${_smallclue_ssl_libdir}/pkgconfig"
+            ./configure --sysconfdir=/etc/ssh
+        WORKING_DIRECTORY ${_smallclue_openssh_dir}
+        RESULT_VARIABLE _smallclue_openssh_configure_rc
+        OUTPUT_VARIABLE _smallclue_openssh_configure_log
+        ERROR_VARIABLE _smallclue_openssh_configure_log
+    )
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/openssh-configure.log
+         "${_smallclue_openssh_configure_log}")
+    if(NOT _smallclue_openssh_configure_rc EQUAL 0)
+        message(FATAL_ERROR
+            "third-party/openssh: ./configure failed (exit "
+            "${_smallclue_openssh_configure_rc}). Full output:\n"
+            "    ${CMAKE_CURRENT_BINARY_DIR}/openssh-configure.log\n"
+            "To configure it by hand instead, from third-party/openssh run:\n"
+            "    ./configure --sysconfdir=/etc/ssh")
+    endif()
+endif()
+
+if(EXISTS ${_smallclue_openssh_dir} AND NOT EXISTS ${_smallclue_openssh_dir}/config.h)
+    message(FATAL_ERROR
+        "third-party/openssh/config.h is missing. Apple, iOS and cross builds "
+        "use the copy committed to the fork, so restore it with\n"
+        "    git -C third-party/openssh checkout -- config.h\n"
+        "or, on any other host, delete third-party/openssh/config.status and "
+        "re-run cmake so it configures openssh again.")
+endif()
 target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
 target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 # Static linking on Linux is a single left-to-right pass -- ZLIB::ZLIB was

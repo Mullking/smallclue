@@ -33,23 +33,10 @@ jobs:
       - name: Fetch dependencies
         run: ./fetch_dependencies.sh
 
-      - name: Configure OpenSSH (Linux)
-        if: runner.os == 'Linux'
-        working-directory: third-party/openssh
-        run: env LDFLAGS=-static ./configure --sysconfdir=/etc/ssh
-
-      - name: Configure OpenSSH (macOS)
-        if: runner.os == 'macOS'
-        working-directory: third-party/openssh
-        run: |
-          BREW_OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-          env \
-            CPPFLAGS="-I$BREW_OPENSSL_PREFIX/include" \
-            LDFLAGS="-L$BREW_OPENSSL_PREFIX/lib" \
-            PKG_CONFIG_PATH="$BREW_OPENSSL_PREFIX/lib/pkgconfig" \
-            OPENSSL_BIN="$BREW_OPENSSL_PREFIX/bin/openssl" \
-            ./configure --sysconfdir=/etc/ssh
-
+      # No OpenSSH configure step: CMakeLists.txt runs openssh's ./configure
+      # itself on Linux, and on macOS builds against the fork's committed
+      # config.h, which configuring here would overwrite. Either way CI takes
+      # the same path a fresh developer clone does.
       - name: Configure
         run: cmake -S . -B build
 
