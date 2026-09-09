@@ -3288,7 +3288,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -c output raw markdown (convert if HTML)"},
     {"mdev", "mdev [-s]\n"
              "  Device manager (scan only)"},
-    {"mkdir", "mkdir [-p] [-v] DIR...\n"
+    {"mkdir", "mkdir [-pv] [-m MODE] DIR...\n"
+              "  -m set the mode of each named directory (octal)\n"
               "  -p create parents as needed\n"
               "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
@@ -3304,12 +3305,17 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
            "  Move or rename files"},
-    {"install", "install [-m MODE] [-D] SRC... DEST\n"
-                "       install -d [-m MODE] DIRECTORY...\n"
+    {"install", "install [-m MODE] [-o OWNER] [-g GROUP] [-DpTv] SRC... DEST\n"
+                "       install -t DIR [options] SRC...\n"
+                "       install -d [-m MODE] [-o OWNER] [-g GROUP] DIRECTORY...\n"
                 "  Copy SRC to DEST (or each SRC into DEST/ if it's a\n"
                 "  directory) and chmod to MODE (default 0755)\n"
+                "  -o set the owner, -g set the group (name or numeric id)\n"
                 "  -D create DEST's parent directories first\n"
                 "  -d create directories instead of copying files\n"
+                "  -t copy every SRC into the named directory\n"
+                "  -T treat DEST as a normal file, never a directory\n"
+                "  -p preserve the source's access and modification times\n"
                 "  -v verbose"},
     {"base64", "base64 [-d] [-i] [-w COLS] [FILE]\n"
                "  Encode FILE/stdin to base64 (default), or decode with -d\n"
@@ -3411,7 +3417,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
-    {"readlink", "readlink [-f|-e|-m] [-n] PATH...\n"
+    {"readlink", "readlink [-f|-e|-m] [-nqsvz] PATH...\n"
                  "  No flag: print the immediate symlink target\n"
                  "  -f canonicalize (resolve all symlinks + ./..); -e requires\n"
                  "  every component to exist; -m allows a missing final component\n"
@@ -3619,10 +3625,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -t print each command line before running it\n"
               "  Without -0: single/double quotes group whitespace into one\n"
               "    token (quotes stripped); backslash escapes the next char"},
-    {"df", "df [-h] [path ...]\n"
+    {"df", "df [-hkPiTa] [--output[=FIELD_LIST]] [path ...]\n"
            "  With no path, lists every mounted filesystem (like real df)\n"
-           "  -h human-readable sizes"},
-    {"dmesg", "dmesg [-T]\n"
+           "  -h human-readable sizes    -k 1K blocks (the default)\n"
+           "  -P POSIX output format     -i inode counts instead of blocks\n"
+           "  -T show filesystem type\n"
+           "  --output=LIST  pick columns: source,fstype,itotal,iused,iavail,\n"
+           "                 ipcent,size,used,avail,pcent,file,target"},
+    {"dmesg", "dmesg [-cTr] [-s BUFSIZE] [-n LEVEL]\n"
               "  Print or control the kernel ring buffer\n"
               "  -T  show human-readable timestamps (iOS only)"},
     {"nslookup", "nslookup [-v] host [server]\n"
@@ -16069,12 +16079,66 @@ typedef struct {
     unsigned long long total_bytes;
     unsigned long long free_bytes;
     unsigned long long avail_bytes;
+    unsigned long long inodes_total;
+    unsigned long long inodes_free;
+    unsigned long long inodes_avail;
+    char source[256];
+    char fstype[64];
 #if defined(SMALLCLUE_HAVE_STATFS) && defined(MNAMELEN)
     char mount_point[MNAMELEN];
 #else
     char mount_point[PATH_MAX];
 #endif
 } SmallclueDfStats;
+
+/* statvfs reports neither the backing device nor the filesystem type, and on a
+ * Linux-shaped host not even the mount point -- df's first and last columns
+ * come out of the mount table, not out of the stat call. Longest mount-point
+ * prefix of the resolved path wins, which is how a mount table is read. Every
+ * out parameter is optional and is left alone when no mount matches. */
+static void smallclueDfLookupMount(const char *path,
+                                   char *source, size_t sourceSize,
+                                   char *fstype, size_t fstypeSize,
+                                   char *target, size_t targetSize) {
+    if (!path || !*path) {
+        return;
+    }
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) {
+        fp = fopen("/etc/mtab", "r");
+    }
+    if (!fp) {
+        return;
+    }
+    char resolvedBuf[PATH_MAX];
+    const char *want = realpath(path, resolvedBuf) ? resolvedBuf : path;
+    size_t best = 0;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof line, fp)) {
+        char device[512], mountpoint[512], type[64];
+        if (sscanf(line, "%511s %511s %63s", device, mountpoint, type) != 3) {
+            continue;
+        }
+        size_t mlen = strlen(mountpoint);
+        if (mlen == 0 || strncmp(want, mountpoint, mlen) != 0) {
+            continue;
+        }
+        /* "/usr" must not swallow "/usrlocal"; "/" is a prefix of everything. */
+        if (mlen > 1 && want[mlen] != '\0' && want[mlen] != '/') {
+            continue;
+        }
+        if (found && mlen < best) {
+            continue;
+        }
+        best = mlen;
+        found = true;
+        if (source && sourceSize) snprintf(source, sourceSize, "%s", device);
+        if (fstype && fstypeSize) snprintf(fstype, fstypeSize, "%s", type);
+        if (target && targetSize) snprintf(target, targetSize, "%s", mountpoint);
+    }
+    fclose(fp);
+}
 
 static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
     if (!path || !*path || !out) {
@@ -16121,12 +16185,28 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
     out->total_bytes = total_blocks * block_size;
     out->free_bytes = free_blocks * block_size;
     out->avail_bytes = avail_blocks * block_size;
+    out->inodes_total = (unsigned long long) st.f_files;
+    out->inodes_free = (unsigned long long) st.f_ffree;
+#if defined(SMALLCLUE_HAVE_STATVFS)
+    out->inodes_avail = (unsigned long long) st.f_favail;
+#else
+    out->inodes_avail = (unsigned long long) st.f_ffree;
+#endif
+#if !defined(SMALLCLUE_HAVE_STATVFS) && defined(SMALLCLUE_HAVE_STATFS) && defined(MNAMELEN)
+    snprintf(out->source, sizeof(out->source), "%s", st.f_mntfromname);
+    snprintf(out->fstype, sizeof(out->fstype), "%s", st.f_fstypename);
+#endif
 #if defined(SMALLCLUE_HAVE_STATFS) && defined(MNAMELEN)
     if (st.f_mntonname[0]) {
         strncpy(out->mount_point, st.f_mntonname, sizeof(out->mount_point) - 1);
         out->mount_point[sizeof(out->mount_point) - 1] = '\0';
     }
 #endif
+    /* Where there is a mount table it is the better authority: inside iSH-AOK
+     * this is the guest's, and it is what the real df reads. */
+    smallclueDfLookupMount(query_path, out->source, sizeof(out->source),
+                           out->fstype, sizeof(out->fstype),
+                           out->mount_point, sizeof(out->mount_point));
     if (out->mount_point[0] == '\0') {
         const char *label = path;
         char resolved[PATH_MAX];
@@ -16224,63 +16304,377 @@ static void smallclueDfFormatSize(char *buf, size_t bufsize,
         snprintf(buf, bufsize, "%llu", blocks);
         return;
     }
-    static const char *suffixes[] = {"B", "K", "M", "G", "T", "P"};
+    /* coreutils' human_readable, which df -h and ls -lh both render with: at
+     * most three significant digits, a decimal place only below 10, and the
+     * value always rounded UP. That last part is not a rounding preference --
+     * 971298980 1K-blocks is 926.3 GiB and the real df prints 927G, so
+     * truncating here under-reports a filesystem by a whole unit. Below 1024
+     * the number is printed bare, with no unit letter.
+     *
+     * Kept in integer arithmetic: the values reach 2^63 and a long double
+     * cannot carry them exactly, which would put the rounding a unit out
+     * again at the top of the range. */
+    static const char suffixes[] = "KMGTPE";
+    unsigned long long divisor = 1;
     size_t idx = 0;
-    long double value = (long double)bytes;
-    while (value >= 1024.0L && idx + 1 < sizeof(suffixes) / sizeof(suffixes[0])) {
-        value /= 1024.0L;
+    while (bytes / divisor >= 1024ULL && idx + 1 < sizeof(suffixes)) {
+        divisor *= 1024ULL;
         idx++;
     }
     if (idx == 0) {
-        /* Bytes should not show fractional values. */
-        snprintf(buf, bufsize, "%.0Lf%s", value, suffixes[idx]);
-    } else if (value >= 100.0L) {
-        snprintf(buf, bufsize, "%.0Lf%s", value, suffixes[idx]);
-    } else if (value >= 10.0L) {
-        snprintf(buf, bufsize, "%.1Lf%s", value, suffixes[idx]);
+        snprintf(buf, bufsize, "%llu", bytes);
+        return;
+    }
+    unsigned long long whole = bytes / divisor;
+    unsigned long long rem = bytes % divisor;
+    if (whole < 10) {
+        /* Round the tenth up without overflowing: the remainder is always
+         * smaller than the divisor, so rem * 10 stays in range. */
+        unsigned long long tenths = whole * 10ULL + (rem * 10ULL + divisor - 1ULL) / divisor;
+        if (tenths < 100ULL) {
+            snprintf(buf, bufsize, "%llu.%llu%c", tenths / 10ULL, tenths % 10ULL,
+                     suffixes[idx - 1]);
+            return;
+        }
+        /* Rounding carried it to 10.0 or past: it loses the decimal place. */
+        whole = (tenths + 9ULL) / 10ULL;
+        rem = 0;
+    }
+    unsigned long long rounded = whole + (rem != 0 ? 1ULL : 0ULL);
+    if (rounded >= 1024ULL && idx < sizeof(suffixes) - 1) {
+        /* Rounded up out of its own unit, e.g. 1023.5K becomes 1.0M. */
+        snprintf(buf, bufsize, "1.0%c", suffixes[idx]);
+        return;
+    }
+    snprintf(buf, bufsize, "%llu%c", rounded, suffixes[idx - 1]);
+}
+
+
+/* ---- df: GNU-compatible column selection ---------------------------------
+ *
+ * `-P`, `-i`, `-T` and `--output` are the shapes scripts parse, so they render
+ * through the field machinery below rather than through the fixed table above.
+ * Debian's mariadb init script is the case that forced it:
+ *
+ *     df_available_blocks="$(LC_ALL=C BLOCKSIZE='' df --output=avail "$dir" | tail -n 1)"
+ *     if [ "$df_available_blocks" -lt "4096" ]
+ *
+ * so the last line has to be a bare 1K-block count.
+ *
+ * Widths follow coreutils: every field has a minimum, and the column becomes
+ * max(minimum, header, widest value) -- which is why this buffers all the rows
+ * before printing any of them. That is not cosmetic. `df -P` output is parsed
+ * positionally often enough that the padding is part of the contract, and
+ * these widths were checked column-for-column against the GNU df in the
+ * project's devuan test root.
+ *
+ * Bare `df` and `df -h` keep the table above, colour header and all.
+ */
+typedef enum {
+    SMALLCLUE_DF_SOURCE = 0,
+    SMALLCLUE_DF_FSTYPE,
+    SMALLCLUE_DF_ITOTAL,
+    SMALLCLUE_DF_IUSED,
+    SMALLCLUE_DF_IAVAIL,
+    SMALLCLUE_DF_IPCENT,
+    SMALLCLUE_DF_SIZE,
+    SMALLCLUE_DF_USED,
+    SMALLCLUE_DF_AVAIL,
+    SMALLCLUE_DF_PCENT,
+    SMALLCLUE_DF_FILE,
+    SMALLCLUE_DF_TARGET,
+    SMALLCLUE_DF_FIELD_COUNT
+} SmallclueDfField;
+
+typedef struct {
+    const char *name;
+    const char *header;      /* the default table's spelling */
+    const char *shortHeader; /* --output abbreviates a couple of them */
+    const char *posixHeader; /* -P renames a couple more */
+    int minWidth;            /* coreutils' per-field minimum */
+    bool rightAligned;
+} SmallclueDfFieldInfo;
+
+/* Order must track SmallclueDfField: a bare --output prints them all, in this
+ * order, exactly as GNU does. */
+static const SmallclueDfFieldInfo smallclueDfFields[SMALLCLUE_DF_FIELD_COUNT] = {
+    { "source", "Filesystem", NULL,    NULL,          14, false },
+    { "fstype", "Type",       NULL,    NULL,           4, false },
+    { "itotal", "Inodes",     NULL,    NULL,           5, true  },
+    { "iused",  "IUsed",      NULL,    NULL,           5, true  },
+    { "iavail", "IFree",      NULL,    NULL,           5, true  },
+    { "ipcent", "IUse%",      NULL,    NULL,           4, true  },
+    { "size",   "1K-blocks",  NULL,    "1024-blocks",  5, true  },
+    { "used",   "Used",       NULL,    NULL,           5, true  },
+    { "avail",  "Available",  "Avail", "Available",    5, true  },
+    { "pcent",  "Use%",       NULL,    "Capacity",     4, true  },
+    { "file",   "File",       NULL,    NULL,           4, false },
+    { "target", "Mounted on", NULL,    NULL,           4, false },
+};
+
+static const char *smallclueDfHeaderFor(int field, bool human, bool posix, bool outputMode) {
+    const SmallclueDfFieldInfo *info = &smallclueDfFields[field];
+    if (field == SMALLCLUE_DF_SIZE && human) {
+        return "Size";
+    }
+    /* "Available" is spelled out only where the column is wide: -h and
+     * --output both abbreviate it, exactly as the real df does. */
+    if (field == SMALLCLUE_DF_AVAIL && human) {
+        return info->shortHeader;
+    }
+    if (posix && info->posixHeader) {
+        return info->posixHeader;
+    }
+    if (outputMode && info->shortHeader) {
+        return info->shortHeader;
+    }
+    return info->header;
+}
+
+/* df rounds usage up: a filesystem with a single used block reads 1%, never 0%. */
+static unsigned smallclueDfPercent(unsigned long long used, unsigned long long avail) {
+    unsigned long long denom = used + avail;
+    if (denom == 0) {
+        return 0;
+    }
+    return (unsigned) ((used * 100ULL + denom - 1ULL) / denom);
+}
+
+static bool smallclueDfAppendField(int field, int *order, int *count, bool *seen) {
+    if (seen[field]) {
+        return false;
+    }
+    seen[field] = true;
+    order[(*count)++] = field;
+    return true;
+}
+
+static bool smallclueDfParseOutput(const char *list, int *order, int *count, bool *seen) {
+    if (!list) {
+        for (int f = 0; f < SMALLCLUE_DF_FIELD_COUNT; ++f) {
+            smallclueDfAppendField(f, order, count, seen);
+        }
+        return true;
+    }
+    char *copy = strdup(list);
+    if (!copy) {
+        fprintf(stderr, "df: out of memory\n");
+        return false;
+    }
+    bool ok = true;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        int found = -1;
+        for (int f = 0; f < SMALLCLUE_DF_FIELD_COUNT; ++f) {
+            if (strcmp(tok, smallclueDfFields[f].name) == 0) {
+                found = f;
+                break;
+            }
+        }
+        if (found < 0) {
+            fprintf(stderr, "df: option --output: field '%s' unknown\n", tok);
+            fputs("Try 'df --help' for more information.\n", stderr);
+            ok = false;
+            break;
+        }
+        if (!smallclueDfAppendField(found, order, count, seen)) {
+            fprintf(stderr, "df: option --output: field '%s' used more than once\n", tok);
+            fputs("Try 'df --help' for more information.\n", stderr);
+            ok = false;
+            break;
+        }
+    }
+    free(copy);
+    return ok;
+}
+
+static void smallclueDfEmitCell(const char *text, int width, bool rightAligned, bool last) {
+    if (rightAligned) {
+        printf("%*s", width, text);
+    } else if (last) {
+        fputs(text, stdout);
     } else {
-        snprintf(buf, bufsize, "%.2Lf%s", value, suffixes[idx]);
+        printf("%-*s", width, text);
+    }
+    if (!last) {
+        putchar(' ');
     }
 }
 
-static void smallclueDfPrintHeader(bool human) {
-    if (smallclueColourWanted()) {
-        printf("\033[1m%-24s %12s %12s %12s %6s %s\033[0m\n",
-               "Filesystem",
-               human ? "Size" : "1K-blocks",
-               human ? "Used" : "Used",
-               human ? "Avail" : "Avail",
-               "Use%",
-               "Mounted on");
-    } else {
-        printf("%-24s %12s %12s %12s %6s %s\n",
-               "Filesystem",
-               human ? "Size" : "1K-blocks",
-               human ? "Used" : "Used",
-               human ? "Avail" : "Avail",
-               "Use%",
-               "Mounted on");
+static void smallclueDfFormatCell(const SmallclueDfStats *stats, int field, const char *path,
+                                  bool named, bool human, char *buf, size_t bufsize) {
+    unsigned long long used_bytes = (stats->total_bytes > stats->free_bytes)
+                                        ? stats->total_bytes - stats->free_bytes : 0;
+    unsigned long long iused = (stats->inodes_total > stats->inodes_free)
+                                        ? stats->inodes_total - stats->inodes_free : 0;
+    switch (field) {
+        case SMALLCLUE_DF_SOURCE:
+            snprintf(buf, bufsize, "%s", stats->source[0] ? stats->source
+                     : (stats->mount_point[0] ? stats->mount_point : (path ? path : "-")));
+            break;
+        case SMALLCLUE_DF_FSTYPE:
+            snprintf(buf, bufsize, "%s", stats->fstype[0] ? stats->fstype : "-");
+            break;
+        case SMALLCLUE_DF_FILE:
+            /* "File" is the path the user asked about; a filesystem that came
+             * out of the mount table was not asked about, so df prints "-". */
+            snprintf(buf, bufsize, "%s", (named && path) ? path : "-");
+            break;
+        case SMALLCLUE_DF_TARGET:
+            snprintf(buf, bufsize, "%s", stats->mount_point[0] ? stats->mount_point
+                     : (path ? path : "-"));
+            break;
+        case SMALLCLUE_DF_SIZE:
+            smallclueDfFormatSize(buf, bufsize, stats->total_bytes, human);
+            break;
+        case SMALLCLUE_DF_USED:
+            smallclueDfFormatSize(buf, bufsize, used_bytes, human);
+            break;
+        case SMALLCLUE_DF_AVAIL:
+            smallclueDfFormatSize(buf, bufsize, stats->avail_bytes, human);
+            break;
+        case SMALLCLUE_DF_PCENT:
+            /* Nothing to divide by on a dummy filesystem: df prints "-". */
+            if (used_bytes + stats->avail_bytes == 0) {
+                snprintf(buf, bufsize, "-");
+            } else {
+                snprintf(buf, bufsize, "%u%%", smallclueDfPercent(used_bytes, stats->avail_bytes));
+            }
+            break;
+        case SMALLCLUE_DF_ITOTAL:
+            /* -h scales inode counts as well as blocks: 1139628297 reads 1.1G. */
+            if (human) {
+                smallclueDfFormatSize(buf, bufsize, stats->inodes_total, true);
+            } else {
+                snprintf(buf, bufsize, "%llu", stats->inodes_total);
+            }
+            break;
+        case SMALLCLUE_DF_IUSED:
+            /* -h scales inode counts as well as blocks: 1139628297 reads 1.1G. */
+            if (human) {
+                smallclueDfFormatSize(buf, bufsize, iused, true);
+            } else {
+                snprintf(buf, bufsize, "%llu", iused);
+            }
+            break;
+        case SMALLCLUE_DF_IAVAIL:
+            /* -h scales inode counts as well as blocks: 1139628297 reads 1.1G. */
+            if (human) {
+                smallclueDfFormatSize(buf, bufsize, stats->inodes_avail, true);
+            } else {
+                snprintf(buf, bufsize, "%llu", stats->inodes_avail);
+            }
+            break;
+        case SMALLCLUE_DF_IPCENT:
+            /* A filesystem with no inode accounting reports "-", not "0%". */
+            if (stats->inodes_total == 0) {
+                snprintf(buf, bufsize, "-");
+            } else {
+                snprintf(buf, bufsize, "%u%%", smallclueDfPercent(iused, stats->inodes_avail));
+            }
+            break;
+        default:
+            snprintf(buf, bufsize, "-");
+            break;
     }
 }
 
 static int smallclueDfCommand(int argc, char **argv) {
-    const char *usage = "usage: df [-h] [path ...]\n";
+    static const char *usage =
+        "usage: df [-hkPiTa] [--output[=FIELD_LIST]] [path ...]\n"
+        "  -h human-readable sizes      -k 1K blocks (the default)\n"
+        "  -P POSIX output format       -i inode counts instead of blocks\n"
+        "  -T show the filesystem type  -a include filesystems reporting 0 blocks\n"
+        "  --output=LIST  comma-separated from: source,fstype,itotal,iused,\n"
+        "                 iavail,ipcent,size,used,avail,pcent,file,target\n";
     bool human = false;
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "h")) != -1) {
-        switch (opt) {
-            case 'h':
+    bool posix = false;
+    bool inodes = false;
+    bool showType = false;
+    bool outputMode = false;
+    bool showAll = false;
+    int order[SMALLCLUE_DF_FIELD_COUNT];
+    bool seen[SMALLCLUE_DF_FIELD_COUNT];
+    int fieldCount = 0;
+    memset(seen, 0, sizeof seen);
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (arg[0] != '-' || arg[1] == '\0') {
+            break;
+        }
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            if (strcmp(lopt, "human-readable") == 0) {
                 human = true;
-                break;
-            default:
+            } else if (strcmp(lopt, "portability") == 0) {
+                posix = true;
+            } else if (strcmp(lopt, "inodes") == 0) {
+                inodes = true;
+            } else if (strcmp(lopt, "print-type") == 0) {
+                showType = true;
+            } else if (strcmp(lopt, "all") == 0) {
+                showAll = true;
+            } else if (strcmp(lopt, "output") == 0 || strncmp(lopt, "output=", 7) == 0) {
+                if (!smallclueDfParseOutput(lopt[6] == '=' ? lopt + 7 : NULL,
+                                            order, &fieldCount, seen)) {
+                    return 1;
+                }
+                outputMode = true;
+            } else if (strcmp(lopt, "help") == 0) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "df: unrecognized option '%s'\n", arg);
                 fputs(usage, stderr);
                 return 1;
+            }
+            continue;
+        }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'h': human = true; break;
+                case 'k': human = false; break; /* 1K blocks: already the default */
+                case 'P': posix = true; break;
+                case 'i': inodes = true; break;
+                case 'T': showType = true; break;
+                case 'a': showAll = true; break;
+                default:
+                    fprintf(stderr, "df: illegal option -- %c\n", *p);
+                    fputs(usage, stderr);
+                    return 1;
+            }
         }
     }
-    int path_start = optind;
-    int path_count = (optind < argc) ? (argc - optind) : 0;
-    smallclueDfPrintHeader(human);
+
+    /* -P, -i and -T vary the column set; --output already built one; with none
+     * of them this is the default table. Every shape renders the same way. */
+    if (!outputMode) {
+        smallclueDfAppendField(SMALLCLUE_DF_SOURCE, order, &fieldCount, seen);
+        if (showType) {
+            smallclueDfAppendField(SMALLCLUE_DF_FSTYPE, order, &fieldCount, seen);
+        }
+        if (inodes) {
+            smallclueDfAppendField(SMALLCLUE_DF_ITOTAL, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_IUSED, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_IAVAIL, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_IPCENT, order, &fieldCount, seen);
+        } else {
+            smallclueDfAppendField(SMALLCLUE_DF_SIZE, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_USED, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_AVAIL, order, &fieldCount, seen);
+            smallclueDfAppendField(SMALLCLUE_DF_PCENT, order, &fieldCount, seen);
+        }
+        smallclueDfAppendField(SMALLCLUE_DF_TARGET, order, &fieldCount, seen);
+    }
+
+    int path_start = argi;
+    int path_count = (argi < argc) ? (argc - argi) : 0;
     int status = 0;
 
     char **allMounts = NULL;
@@ -16288,9 +16682,23 @@ static int smallclueDfCommand(int argc, char **argv) {
     if (path_count == 0) {
         allMounts = smallclueDfEnumerateMounts(&allMountsCount);
     }
-    size_t iterCount = (path_count > 0) ? (size_t)path_count
+    size_t iterCount = (path_count > 0) ? (size_t) path_count
                         : (allMountsCount > 0) ? allMountsCount
                         : 1;
+
+    /* The field renderer needs every value before it can size a column, so it
+     * collects rows first and prints once. The legacy table streams as before. */
+    char ***rows = NULL;
+    size_t rowCount = 0;
+    rows = (char ***) calloc(iterCount, sizeof(*rows));
+    if (!rows) {
+        fprintf(stderr, "df: out of memory\n");
+        if (allMounts) {
+            for (size_t i = 0; i < allMountsCount; ++i) free(allMounts[i]);
+            free(allMounts);
+        }
+        return 1;
+    }
 
     for (size_t i = 0; i < iterCount; ++i) {
         const char *path;
@@ -16307,26 +16715,79 @@ static int smallclueDfCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        unsigned long long used_bytes = (stats.total_bytes > stats.free_bytes)
-                                            ? stats.total_bytes - stats.free_bytes
-                                            : 0;
-        unsigned long long avail_bytes = stats.avail_bytes;
-        long double denom = (long double)used_bytes + (long double)avail_bytes;
-        long double percent = (denom > 0.0L) ? (long double)used_bytes / denom * 100.0L : 0.0L;
-        char total_buf[32];
-        char used_buf[32];
-        char avail_buf[32];
-        smallclueDfFormatSize(total_buf, sizeof total_buf, stats.total_bytes, human);
-        smallclueDfFormatSize(used_buf, sizeof used_buf, used_bytes, human);
-        smallclueDfFormatSize(avail_buf, sizeof avail_buf, avail_bytes, human);
-        printf("%-24s %12s %12s %12s %5.0Lf%% %s\n",
-               stats.mount_point[0] ? stats.mount_point : (path ? path : ""),
-               total_buf,
-               used_buf,
-               avail_buf,
-               percent,
-               path ? path : stats.mount_point);
+        /* A filesystem reporting no blocks at all is a dummy -- devpts, proc,
+         * sysfs and the /AOK bind all answer that way -- and the real df
+         * leaves them out of an unqualified listing. A filesystem named on the
+         * command line is always shown, dummy or not, which is also what df
+         * does. */
+        if (path_count == 0 && !showAll && stats.total_bytes == 0) {
+            continue;
+        }
+        char **cells = (char **) calloc((size_t) fieldCount, sizeof(*cells));
+        if (!cells) {
+            fprintf(stderr, "df: out of memory\n");
+            status = 1;
+            continue;
+        }
+        for (int f = 0; f < fieldCount; ++f) {
+            char cell[PATH_MAX + 32];
+            smallclueDfFormatCell(&stats, order[f], path, path_count > 0, human,
+                                  cell, sizeof cell);
+            cells[f] = strdup(cell);
+        }
+        rows[rowCount++] = cells;
     }
+
+    if (rowCount > 0) {
+        int widths[SMALLCLUE_DF_FIELD_COUNT];
+        for (int f = 0; f < fieldCount; ++f) {
+            const char *header = smallclueDfHeaderFor(order[f], human, posix, outputMode);
+            int width = smallclueDfFields[order[f]].minWidth;
+            int len = (int) strlen(header);
+            if (len > width) {
+                width = len;
+            }
+            for (size_t r = 0; r < rowCount; ++r) {
+                if (!rows[r] || !rows[r][f]) {
+                    continue;
+                }
+                len = (int) strlen(rows[r][f]);
+                if (len > width) {
+                    width = len;
+                }
+            }
+            widths[f] = width;
+        }
+        bool colour = smallclueColourWanted();
+        if (colour) {
+            fputs("\033[1m", stdout);
+        }
+        for (int f = 0; f < fieldCount; ++f) {
+            smallclueDfEmitCell(smallclueDfHeaderFor(order[f], human, posix, outputMode),
+                                widths[f], smallclueDfFields[order[f]].rightAligned,
+                                f + 1 == fieldCount);
+        }
+        if (colour) {
+            fputs("\033[0m", stdout);
+        }
+        putchar('\n');
+        for (size_t r = 0; r < rowCount; ++r) {
+            for (int f = 0; f < fieldCount; ++f) {
+                smallclueDfEmitCell(rows[r][f] ? rows[r][f] : "-", widths[f],
+                                    smallclueDfFields[order[f]].rightAligned,
+                                    f + 1 == fieldCount);
+            }
+            putchar('\n');
+        }
+        for (size_t r = 0; r < rowCount; ++r) {
+            for (int f = 0; f < fieldCount; ++f) free(rows[r][f]);
+            free(rows[r]);
+        }
+    }
+    /* Freed outside the guard: with no rows the table is skipped, but the row
+     * vector was still allocated, and an applet is a function call in a live
+     * guest process -- nothing reclaims it on return. */
+    free(rows);
 
     if (allMounts) {
         for (size_t i = 0; i < allMountsCount; ++i) free(allMounts[i]);
@@ -17146,23 +17607,101 @@ static void smallclueDmesgPrintLineHuman(const char *line) {
 #endif
 
 static int smallclueDmesgCommand(int argc, char **argv) {
-    smallclueResetGetopt();
+    static const char *usage =
+        "usage: dmesg [-cTr] [-s BUFSIZE] [-n LEVEL]\n"
+        "  -T human-readable timestamps   -c read then clear the buffer\n"
+        "  -s read at most BUFSIZE bytes  -n set the console log level\n"
+        "  -r raw output (already the default here)\n";
     int human = 0;
-    int opt;
-    while ((opt = getopt(argc, argv, "T")) != -1) {
-        switch (opt) {
-            case 'T':
+    int clear = 0;
+    long consoleLevel = -1;
+    long bufSize = 0;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            break;
+        }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            const char *eq = strchr(lopt, '=');
+            size_t nameLen = eq ? (size_t) (eq - lopt) : strlen(lopt);
+            const char *value = eq ? eq + 1 : NULL;
+            #define DMESG_LONG(n) (nameLen == strlen(n) && strncmp(lopt, n, nameLen) == 0)
+            #define DMESG_NEED_VALUE(n) \
+                do { \
+                    if (!value) { \
+                        if (argi + 1 >= argc) { \
+                            fprintf(stderr, "dmesg: option '--%s' requires an argument\n", n); \
+                            return 1; \
+                        } \
+                        value = argv[++argi]; \
+                    } \
+                } while (0)
+            if (DMESG_LONG("ctime")) {
                 human = 1;
-                break;
-            default:
-                fprintf(stderr, "usage: dmesg [-T]\n");
+            } else if (DMESG_LONG("clear") || DMESG_LONG("read-clear")) {
+                clear = 1;
+            } else if (DMESG_LONG("raw")) {
+                /* This dmesg does not filter, so raw is what it already emits. */
+            } else if (DMESG_LONG("buffer-size")) {
+                DMESG_NEED_VALUE("buffer-size");
+                bufSize = strtol(value, NULL, 10);
+            } else if (DMESG_LONG("console-level")) {
+                DMESG_NEED_VALUE("console-level");
+                consoleLevel = strtol(value, NULL, 10);
+            } else if (DMESG_LONG("help")) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "dmesg: unrecognized option '%s'\n", arg);
+                fputs(usage, stderr);
                 return 1;
+            }
+            #undef DMESG_LONG
+            #undef DMESG_NEED_VALUE
+            continue;
+        }
+        bool consumedValue = false;
+        for (const char *p = arg + 1; *p && !consumedValue; ++p) {
+            const char *value = NULL;
+            if (*p == 's' || *p == 'n') {
+                if (p[1] != '\0') {
+                    value = p + 1;
+                } else if (argi + 1 < argc) {
+                    value = argv[++argi];
+                } else {
+                    fprintf(stderr, "dmesg: option requires an argument -- %c\n", *p);
+                    return 1;
+                }
+                consumedValue = true;
+            }
+            switch (*p) {
+                case 'T': human = 1; break;
+                case 'c': clear = 1; break;
+                case 'r': break;
+                case 's': bufSize = strtol(value, NULL, 10); break;
+                case 'n': consoleLevel = strtol(value, NULL, 10); break;
+                default:
+                    fprintf(stderr, "dmesg: illegal option -- %c\n", *p);
+                    fputs(usage, stderr);
+                    return 1;
+            }
         }
     }
-    if (optind < argc) {
-        fprintf(stderr, "usage: dmesg [-T]\n");
+    if (argi < argc) {
+        fprintf(stderr, "dmesg: unexpected operand '%s'\n", argv[argi]);
+        fputs(usage, stderr);
         return 1;
     }
+    (void) clear;
+    (void) consoleLevel;
+    (void) bufSize;
 
 #if defined(PSCAL_TARGET_IOS)
     if (pscalRuntimeCopySessionLog) {
@@ -17204,7 +17743,16 @@ static int smallclueDmesgCommand(int argc, char **argv) {
    "was this compiled for Linux". Without it the #else below claimed dmesg was
    unsupported on a system whose own /usr/bin/dmesg worked. */
 #elif defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_KLOGCTL)
-    int len = klogctl(10, NULL, 0); // SYSLOG_ACTION_SIZE_BUFFER
+    /* -n only sets the console level; it never prints, matching util-linux. */
+    if (consoleLevel >= 0) {
+        if (klogctl(8, NULL, (int) consoleLevel) < 0) { // SYSLOG_ACTION_CONSOLE_LEVEL
+            perror("dmesg: klogctl console level");
+            return 1;
+        }
+        return 0;
+    }
+    /* -s names the buffer to read into; without it, ask how big it needs to be. */
+    int len = (bufSize > 0) ? (int) bufSize : klogctl(10, NULL, 0); // SYSLOG_ACTION_SIZE_BUFFER
     if (len < 0) {
         perror("dmesg: klogctl size");
         return 1;
@@ -17214,7 +17762,7 @@ static int smallclueDmesgCommand(int argc, char **argv) {
         fprintf(stderr, "dmesg: out of memory\n");
         return 1;
     }
-    int n = klogctl(3, buf, len); // SYSLOG_ACTION_READ_ALL
+    int n = klogctl(clear ? 4 : 3, buf, len); // READ_CLEAR : READ_ALL
     if (n < 0) {
         perror("dmesg: klogctl read");
         free(buf);
@@ -23573,42 +24121,120 @@ static int smallclueRmdirCommand(int argc, char **argv) {
 }
 
 static int smallclueMkdirCommand(int argc, char **argv) {
-    int parents = 0;
-    int verbose = 0;
-    int opt;
-    smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "pv")) != -1) {
-        switch (opt) {
-            case 'p':
-                parents = 1;
-                break;
-            case 'v':
-                verbose = 1;
-                break;
-            default:
-                fprintf(stderr, "mkdir: invalid option -- %c\n", optopt);
+    static const char *usage = "usage: mkdir [-pv] [-m MODE] DIR...\n";
+    bool parents = false;
+    bool verbose = false;
+    bool haveMode = false;
+    mode_t mode = 0777;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            break;
+        }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            const char *eq = strchr(lopt, '=');
+            size_t nameLen = eq ? (size_t) (eq - lopt) : strlen(lopt);
+            const char *value = eq ? eq + 1 : NULL;
+            #define MKDIR_LONG(n) (nameLen == strlen(n) && strncmp(lopt, n, nameLen) == 0)
+            if (MKDIR_LONG("mode")) {
+                if (!value) {
+                    if (argi + 1 >= argc) {
+                        fprintf(stderr, "mkdir: option '--mode' requires an argument\n");
+                        return 1;
+                    }
+                    value = argv[++argi];
+                }
+                if (!smallclueChmodParseOctal(value, &mode)) {
+                    fprintf(stderr, "mkdir: invalid mode '%s'\n", value);
+                    return 1;
+                }
+                haveMode = true;
+            } else if (MKDIR_LONG("parents")) {
+                parents = true;
+            } else if (MKDIR_LONG("verbose")) {
+                verbose = true;
+            } else if (MKDIR_LONG("help")) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "mkdir: unrecognized option '%s'\n", arg);
+                fputs(usage, stderr);
                 return 1;
+            }
+            #undef MKDIR_LONG
+            continue;
+        }
+        bool consumedValue = false;
+        for (const char *p = arg + 1; *p && !consumedValue; ++p) {
+            switch (*p) {
+                case 'p': parents = true; break;
+                case 'v': verbose = true; break;
+                case 'm': {
+                    const char *value;
+                    if (p[1] != '\0') {
+                        value = p + 1;
+                    } else if (argi + 1 < argc) {
+                        value = argv[++argi];
+                    } else {
+                        fprintf(stderr, "mkdir: option requires an argument -- m\n");
+                        return 1;
+                    }
+                    consumedValue = true;
+                    if (!smallclueChmodParseOctal(value, &mode)) {
+                        fprintf(stderr, "mkdir: invalid mode '%s'\n", value);
+                        return 1;
+                    }
+                    haveMode = true;
+                    break;
+                }
+                default:
+                    fprintf(stderr, "mkdir: illegal option -- %c\n", *p);
+                    fputs(usage, stderr);
+                    return 1;
+            }
         }
     }
-    if (optind >= argc) {
+
+    if (argi >= argc) {
         fprintf(stderr, "mkdir: missing operand\n");
         return 1;
     }
     int status = 0;
-    for (int i = optind; i < argc; ++i) {
+    for (int i = argi; i < argc; ++i) {
         const char *target = argv[i];
         if (parents) {
+            /* -m applies to the directory named on the command line only;
+             * any parents this creates along the way keep the default mode,
+             * which is what the real mkdir does. */
             if (smallclueMkdirParents(target, 0777, verbose) != 0) {
                 fprintf(stderr, "mkdir: %s: %s\n", target, strerror(errno));
                 status = 1;
+                continue;
             }
         } else {
-            if (mkdir(target, 0777) != 0) {
+            if (mkdir(target, haveMode ? mode : 0777) != 0) {
                 fprintf(stderr, "mkdir: %s: %s\n", target, strerror(errno));
                 status = 1;
-            } else if (verbose) {
+                continue;
+            }
+            if (verbose) {
                 printf("mkdir: created directory '%s'\n", target);
             }
+        }
+        /* mkdir() filters the mode through the umask, so an explicit -m has to
+         * be applied afterwards or `mkdir -m 755` under a restrictive umask
+         * silently produces something narrower. */
+        if (haveMode && chmod(target, mode) != 0) {
+            fprintf(stderr, "mkdir: cannot set permissions on '%s': %s\n",
+                    target, strerror(errno));
+            status = 1;
         }
     }
     return status;
@@ -25236,11 +25862,83 @@ static int smallclueMvCommand(int argc, char **argv) {
  * directories outright instead of copying files. -o/-g (owner/group) are
  * not implemented -- they require root in the common case and add scope
  * without being load-bearing for a single-user guest. */
+/* install's -o/-g take a user or group by name or by numeric id, the same way
+ * chown does. A bare number is an id even when a user of that name exists,
+ * which is what the real tool does and what init scripts depend on. */
+static bool smallclueInstallLookupUser(const char *spec, uid_t *out) {
+    if (!spec || !*spec) {
+        fprintf(stderr, "install: invalid user ''\n");
+        return false;
+    }
+    if (strspn(spec, "0123456789") == strlen(spec)) {
+        *out = (uid_t) strtoul(spec, NULL, 10);
+        return true;
+    }
+    struct passwd *pw = getpwnam(spec);
+    if (!pw) {
+        fprintf(stderr, "install: invalid user '%s'\n", spec);
+        return false;
+    }
+    *out = pw->pw_uid;
+    return true;
+}
+
+static bool smallclueInstallLookupGroup(const char *spec, gid_t *out) {
+    if (!spec || !*spec) {
+        fprintf(stderr, "install: invalid group ''\n");
+        return false;
+    }
+    if (strspn(spec, "0123456789") == strlen(spec)) {
+        *out = (gid_t) strtoul(spec, NULL, 10);
+        return true;
+    }
+    struct group *gr = getgrnam(spec);
+    if (!gr) {
+        fprintf(stderr, "install: invalid group '%s'\n", spec);
+        return false;
+    }
+    *out = gr->gr_gid;
+    return true;
+}
+
+/* Applies the -m/-o/-g attributes to one freshly installed path. mkdir() and
+ * the copy both go through the umask, so the mode is set explicitly rather
+ * than merely requested -- `install -m 755 -d` under a 077 umask has to yield
+ * 755, and that is exactly the shape init scripts use to build /run entries. */
+static int smallclueInstallApplyAttrs(const char *path, mode_t mode,
+                                      bool haveUid, uid_t uid,
+                                      bool haveGid, gid_t gid) {
+    int status = 0;
+    if (chmod(path, mode) != 0) {
+        fprintf(stderr, "install: cannot change permissions of '%s': %s\n",
+                path, strerror(errno));
+        status = 1;
+    }
+    if (haveUid || haveGid) {
+        if (chown(path, haveUid ? uid : (uid_t) -1, haveGid ? gid : (gid_t) -1) != 0) {
+            fprintf(stderr, "install: cannot change ownership of '%s': %s\n",
+                    path, strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
 static int smallclueInstallCommand(int argc, char **argv) {
+    static const char *usage =
+        "usage: install [-m MODE] [-o OWNER] [-g GROUP] [-DpTv] SRC... DEST\n"
+        "       install -t DIR [options] SRC...\n"
+        "       install -d [-m MODE] [-o OWNER] [-g GROUP] DIRECTORY...\n";
     mode_t mode = 0755;
-    bool makeDirs = false;      /* -d: create directories, don't copy files */
+    bool makeDirs = false;       /* -d: create directories, don't copy files */
     bool makeParentDirs = false; /* -D: create DEST's parent dirs first */
     bool verbose = false;
+    bool preserveTimes = false;  /* -p */
+    bool noTargetDir = false;    /* -T */
+    const char *targetDir = NULL;/* -t */
+    bool haveUid = false, haveGid = false;
+    uid_t uid = 0;
+    gid_t gid = 0;
 
     int argi = 1;
     for (; argi < argc; ++argi) {
@@ -25249,28 +25947,113 @@ static int smallclueInstallCommand(int argc, char **argv) {
             argi++;
             break;
         }
-        if (strcmp(arg, "-m") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "install: -m requires a mode argument\n");
-                return 1;
-            }
-            mode_t parsed;
-            if (!smallclueChmodParseOctal(argv[++argi], &parsed)) {
-                fprintf(stderr, "install: invalid mode '%s'\n", argv[argi]);
-                return 1;
-            }
-            mode = parsed;
-        } else if (strcmp(arg, "-d") == 0) {
-            makeDirs = true;
-        } else if (strcmp(arg, "-D") == 0) {
-            makeParentDirs = true;
-        } else if (strcmp(arg, "-v") == 0) {
-            verbose = true;
-        } else if (arg[0] == '-' && arg[1] != '\0') {
-            fprintf(stderr, "install: unsupported option '%s'\n", arg);
-            return 1;
-        } else {
+        if (arg[0] != '-' || arg[1] == '\0') {
             break;
+        }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            const char *eq = strchr(lopt, '=');
+            size_t nameLen = eq ? (size_t) (eq - lopt) : strlen(lopt);
+            const char *value = eq ? eq + 1 : NULL;
+            /* A long option's argument may be attached with = or be the next
+             * word; take the next word only for options that need one. */
+            #define INSTALL_LONG(n) (nameLen == strlen(n) && strncmp(lopt, n, nameLen) == 0)
+            #define INSTALL_NEED_VALUE(n) \
+                do { \
+                    if (!value) { \
+                        if (argi + 1 >= argc) { \
+                            fprintf(stderr, "install: option '--%s' requires an argument\n", n); \
+                            return 1; \
+                        } \
+                        value = argv[++argi]; \
+                    } \
+                } while (0)
+            if (INSTALL_LONG("mode")) {
+                INSTALL_NEED_VALUE("mode");
+                mode_t parsed;
+                if (!smallclueChmodParseOctal(value, &parsed)) {
+                    fprintf(stderr, "install: invalid mode '%s'\n", value);
+                    return 1;
+                }
+                mode = parsed;
+            } else if (INSTALL_LONG("owner")) {
+                INSTALL_NEED_VALUE("owner");
+                if (!smallclueInstallLookupUser(value, &uid)) return 1;
+                haveUid = true;
+            } else if (INSTALL_LONG("group")) {
+                INSTALL_NEED_VALUE("group");
+                if (!smallclueInstallLookupGroup(value, &gid)) return 1;
+                haveGid = true;
+            } else if (INSTALL_LONG("target-directory")) {
+                INSTALL_NEED_VALUE("target-directory");
+                targetDir = value;
+            } else if (INSTALL_LONG("directory")) {
+                makeDirs = true;
+            } else if (INSTALL_LONG("no-target-directory")) {
+                noTargetDir = true;
+            } else if (INSTALL_LONG("preserve-timestamps")) {
+                preserveTimes = true;
+            } else if (INSTALL_LONG("verbose")) {
+                verbose = true;
+            } else if (INSTALL_LONG("compare")) {
+                /* GNU's -C is an optimisation, never a behaviour change. */
+            } else if (INSTALL_LONG("help")) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "install: unrecognized option '%s'\n", arg);
+                fputs(usage, stderr);
+                return 1;
+            }
+            #undef INSTALL_LONG
+            #undef INSTALL_NEED_VALUE
+            continue;
+        }
+        bool consumedValue = false;
+        for (const char *p = arg + 1; *p && !consumedValue; ++p) {
+            /* -m, -o, -g and -t take a value: attached (-m755) or the next word. */
+            const char *value = NULL;
+            if (*p == 'm' || *p == 'o' || *p == 'g' || *p == 't') {
+                if (p[1] != '\0') {
+                    value = p + 1;
+                } else if (argi + 1 < argc) {
+                    value = argv[++argi];
+                } else {
+                    fprintf(stderr, "install: option requires an argument -- %c\n", *p);
+                    return 1;
+                }
+                consumedValue = true;
+            }
+            switch (*p) {
+                case 'm': {
+                    mode_t parsed;
+                    if (!smallclueChmodParseOctal(value, &parsed)) {
+                        fprintf(stderr, "install: invalid mode '%s'\n", value);
+                        return 1;
+                    }
+                    mode = parsed;
+                    break;
+                }
+                case 'o':
+                    if (!smallclueInstallLookupUser(value, &uid)) return 1;
+                    haveUid = true;
+                    break;
+                case 'g':
+                    if (!smallclueInstallLookupGroup(value, &gid)) return 1;
+                    haveGid = true;
+                    break;
+                case 't': targetDir = value; break;
+                case 'd': makeDirs = true; break;
+                case 'D': makeParentDirs = true; break;
+                case 'T': noTargetDir = true; break;
+                case 'p': preserveTimes = true; break;
+                case 'v': verbose = true; break;
+                case 'c': case 'C': break; /* accepted: neither changes the result */
+                default:
+                    fprintf(stderr, "install: unsupported option '-%c'\n", *p);
+                    fputs(usage, stderr);
+                    return 1;
+            }
         }
     }
 
@@ -25287,19 +26070,39 @@ static int smallclueInstallCommand(int argc, char **argv) {
             if (smallclueMkdirParents(argv[i], mode, verbose) != 0) {
                 fprintf(stderr, "install: %s: %s\n", argv[i], strerror(errno));
                 status = 1;
+                continue;
+            }
+            if (smallclueInstallApplyAttrs(argv[i], mode, haveUid, uid, haveGid, gid) != 0) {
+                status = 1;
             }
         }
         return status;
     }
 
-    if (argc - argi < 2) {
-        fprintf(stderr, "install: missing file operand\n");
-        return 1;
+    const char *dest;
+    int sourceCount;
+    if (targetDir) {
+        if (argi >= argc) {
+            fprintf(stderr, "install: missing file operand\n");
+            return 1;
+        }
+        dest = targetDir;
+        sourceCount = argc - argi;
+    } else {
+        if (argc - argi < 2) {
+            fprintf(stderr, "install: missing file operand\n");
+            return 1;
+        }
+        dest = argv[argc - 1];
+        sourceCount = (argc - 1) - argi;
     }
-    const char *dest = argv[argc - 1];
-    int sourceCount = (argc - 1) - argi;
+
     struct stat destStat;
-    bool destIsDir = stat(dest, &destStat) == 0 && S_ISDIR(destStat.st_mode);
+    bool destIsDir = !noTargetDir && targetDir == NULL &&
+                     stat(dest, &destStat) == 0 && S_ISDIR(destStat.st_mode);
+    if (targetDir) {
+        destIsDir = true;
+    }
     if (sourceCount > 1 && !destIsDir) {
         fprintf(stderr, "install: target '%s' is not a directory\n", dest);
         return 1;
@@ -25330,6 +26133,8 @@ static int smallclueInstallCommand(int argc, char **argv) {
                 }
             }
         }
+        struct stat srcStat;
+        bool haveSrcStat = preserveTimes && stat(src, &srcStat) == 0;
         if (verbose) {
             printf("install: %s -> %s\n", src, target);
         }
@@ -25337,9 +26142,20 @@ static int smallclueInstallCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        if (chmod(target, mode) != 0) {
-            fprintf(stderr, "install: %s: %s\n", target, strerror(errno));
+        if (smallclueInstallApplyAttrs(target, mode, haveUid, uid, haveGid, gid) != 0) {
             status = 1;
+        }
+        if (haveSrcStat) {
+            struct timeval times[2];
+            times[0].tv_sec = srcStat.st_atime;
+            times[0].tv_usec = 0;
+            times[1].tv_sec = srcStat.st_mtime;
+            times[1].tv_usec = 0;
+            if (utimes(target, times) != 0) {
+                fprintf(stderr, "install: cannot set times on '%s': %s\n",
+                        target, strerror(errno));
+                status = 1;
+            }
         }
     }
     return status;
@@ -27035,16 +27851,83 @@ static int smallclueRunitCommand(int argc, char **argv) {
     return 0;
 }
 
+/* halt, poweroff and reboot share one applet, told apart by argv[0], and take
+ * sysvinit's option set because that is what Debian's own rc scripts pass:
+ *
+ *     /etc/init.d/halt:63        halt -d -f $netdown $poweroff $hddown
+ *     /etc/init.d/reboot:25      reboot -d -f ${netdown}
+ *     /etc/init.d/umountnfs.sh:36  halt -w
+ *
+ * Most of them describe hardware and bookkeeping this guest does not have --
+ * there is no wtmp to write (-d, -w), no interfaces of its own to bring down
+ * (-i), and no disks to spin down (-h, -H) -- so they are accepted and do
+ * nothing, which is the honest behaviour rather than a refusal that breaks the
+ * script.
+ *
+ * -w is the exception and must not be lumped in with them: it means "write the
+ * wtmp record and DO NOT halt". umountnfs.sh runs it midway through shutdown,
+ * so treating it as just another no-op flag would turn that line into a real
+ * halt. It returns without stopping anything. */
 static int smallclueHaltCommand(int argc, char **argv) {
+    static const char *usage = "usage: halt|poweroff|reboot [-dfhHinpw]\n";
     int force = 0;
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "f")) != -1) {
-        if (opt == 'f') force = 1;
+    int recordOnly = 0;
+
+    for (int argi = 1; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            continue;
+        }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            if (strcmp(lopt, "force") == 0) {
+                force = 1;
+            } else if (strcmp(lopt, "wtmp-only") == 0) {
+                recordOnly = 1;
+            } else if (strcmp(lopt, "no-wtmp") == 0 || strcmp(lopt, "no-wall") == 0 ||
+                       strcmp(lopt, "poweroff") == 0 || strcmp(lopt, "halt") == 0 ||
+                       strcmp(lopt, "hddown") == 0 || strcmp(lopt, "ifdown") == 0 ||
+                       strcmp(lopt, "no-sync") == 0) {
+                /* Nothing here keeps a wtmp, an interface list or a disk. */
+            } else if (strcmp(lopt, "help") == 0) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "%s: unrecognized option '%s'\n",
+                        argc > 0 ? argv[0] : "halt", arg);
+                fputs(usage, stderr);
+                return 1;
+            }
+            continue;
+        }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'f': force = 1; break;
+                case 'w': recordOnly = 1; break;
+                case 'd': /* skip the wtmp record: there is none */ break;
+                case 'n': /* skip the sync: nothing is buffered here */ break;
+                case 'i': /* bring interfaces down: none are ours */ break;
+                case 'h': case 'H': /* park the disks: there are none */ break;
+                case 'p': /* power off rather than halt: same thing here */ break;
+                default:
+                    fprintf(stderr, "%s: illegal option -- %c\n",
+                            argc > 0 ? argv[0] : "halt", *p);
+                    fputs(usage, stderr);
+                    return 1;
+            }
+        }
     }
 
     const char *cmd = "halt";
     if (argc > 0) cmd = argv[0];
+
+    if (recordOnly) {
+        /* -w records and returns; stopping here is the whole point of it. */
+        return 0;
+    }
 
     printf("System %s requested%s...\n", cmd, force ? " (forced)" : "");
 

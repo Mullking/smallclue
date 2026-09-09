@@ -81,10 +81,24 @@ static bool smallclueCanonicalize(const char *path, bool allowMissing, char *out
 }
 
 int smallclueReadlinkCommand(int argc, char **argv) {
+    static const char *usage =
+        "usage: readlink [-f|-e|-m] [-nqsvz] PATH...\n"
+        "  -f canonicalize, all but the last component must exist\n"
+        "  -e canonicalize, every component must exist\n"
+        "  -m canonicalize, no component need exist\n"
+        "  -n omit the trailing newline    -z terminate with NUL instead\n"
+        "  -q, -s suppress error messages (the default)\n"
+        "  -v report error messages\n";
     bool canonicalize = false;
     bool requireExisting = false;
     bool allowMissing = false;
     bool noNewline = false;
+    /* The real readlink is quiet by default -- -s/-q are documented as "on by
+     * default" and -v is what turns diagnostics on. This used to report every
+     * failure, so `readlink --silent /proc/self/fd/0 || true` in Devuan's udev
+     * init script printed an error where the real tool prints nothing. */
+    bool verbose = false;
+    bool nulTerminated = false;
 
     int argi = 1;
     for (; argi < argc; ++argi) {
@@ -96,14 +110,46 @@ int smallclueReadlinkCommand(int argc, char **argv) {
             argi++;
             break;
         }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            if (strcmp(lopt, "canonicalize") == 0) {
+                canonicalize = true;
+            } else if (strcmp(lopt, "canonicalize-existing") == 0) {
+                canonicalize = true;
+                requireExisting = true;
+            } else if (strcmp(lopt, "canonicalize-missing") == 0) {
+                canonicalize = true;
+                allowMissing = true;
+            } else if (strcmp(lopt, "no-newline") == 0) {
+                noNewline = true;
+            } else if (strcmp(lopt, "silent") == 0 || strcmp(lopt, "quiet") == 0) {
+                verbose = false;
+            } else if (strcmp(lopt, "verbose") == 0) {
+                verbose = true;
+            } else if (strcmp(lopt, "zero") == 0) {
+                nulTerminated = true;
+            } else if (strcmp(lopt, "help") == 0) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "readlink: unrecognized option '%s'\n", arg);
+                fputs(usage, stderr);
+                return 1;
+            }
+            continue;
+        }
         for (const char *p = arg + 1; *p; ++p) {
             switch (*p) {
                 case 'f': canonicalize = true; break;
                 case 'e': canonicalize = true; requireExisting = true; break;
                 case 'm': canonicalize = true; allowMissing = true; break;
                 case 'n': noNewline = true; break;
+                case 's': case 'q': verbose = false; break;
+                case 'v': verbose = true; break;
+                case 'z': nulTerminated = true; break;
                 default:
                     fprintf(stderr, "readlink: unsupported option '%c'\n", *p);
+                    fputs(usage, stderr);
                     return 1;
             }
         }
@@ -120,7 +166,9 @@ int smallclueReadlinkCommand(int argc, char **argv) {
         if (canonicalize) {
             bool lenient = allowMissing || !requireExisting;
             if (!smallclueCanonicalize(path, lenient, resolved, sizeof(resolved))) {
-                fprintf(stderr, "readlink: %s: %s\n", path, strerror(errno));
+                if (verbose) {
+                    fprintf(stderr, "readlink: %s: %s\n", path, strerror(errno));
+                }
                 status = 1;
                 continue;
             }
@@ -128,14 +176,18 @@ int smallclueReadlinkCommand(int argc, char **argv) {
         } else {
             ssize_t n = readlink(path, resolved, sizeof(resolved) - 1);
             if (n < 0) {
-                fprintf(stderr, "readlink: %s: %s\n", path, strerror(errno));
+                if (verbose) {
+                    fprintf(stderr, "readlink: %s: %s\n", path, strerror(errno));
+                }
                 status = 1;
                 continue;
             }
             resolved[n] = '\0';
             fputs(resolved, stdout);
         }
-        if (!noNewline) {
+        if (nulTerminated) {
+            putchar('\0');
+        } else if (!noNewline) {
             putchar('\n');
         }
     }
