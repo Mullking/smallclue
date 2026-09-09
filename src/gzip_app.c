@@ -17,7 +17,7 @@
 #define GZIP_SUFFIX ".gz"
 #define GZIP_CHUNK 65536
 
-typedef enum { GZIP_COMPRESS, GZIP_DECOMPRESS } GzipMode;
+typedef enum { GZIP_COMPRESS, GZIP_DECOMPRESS, GZIP_TEST } GzipMode;
 
 static bool gzipHasSuffix(const char *name, const char *suffix) {
     size_t nlen = strlen(name);
@@ -106,6 +106,32 @@ static int gzipProcessOne(const char *path, GzipMode mode, bool toStdout,
         return ok ? 0 : 1;
     }
 
+    /* -t decompresses and throws the result away, purely to find out whether
+     * the stream is intact. Real gzip says nothing on success and reports the
+     * corruption on failure, so this reuses the decompress path with the
+     * output pointed at /dev/null and never touches the input file. */
+    if (mode == GZIP_TEST) {
+        gzFile in = isStdin ? gzdopen(dup(STDIN_FILENO), "rb") : gzopen(path, "rb");
+        if (!in) {
+            fprintf(stderr, "gzip: %s: %s\n", path ? path : "stdin", strerror(errno));
+            return 1;
+        }
+        FILE *sink = fopen("/dev/null", "wb");
+        if (!sink) {
+            gzclose(in);
+            fprintf(stderr, "gzip: /dev/null: %s\n", strerror(errno));
+            return 1;
+        }
+        bool ok = gzipCopyGzToPlain(in, sink);
+        gzclose(in);
+        fclose(sink);
+        if (!ok) {
+            fprintf(stderr, "gzip: %s: invalid compressed data\n", path ? path : "stdin");
+            return 1;
+        }
+        return 0;
+    }
+
     /* GZIP_DECOMPRESS */
     gzFile in = isStdin ? gzdopen(dup(STDIN_FILENO), "rb") : gzopen(path, "rb");
     if (!in) {
@@ -174,6 +200,14 @@ static int gzipRun(int argc, char **argv, GzipMode defaultMode, bool forceStdout
                 case 'k': keepOriginal = true; break;
                 case 'f': force = true; break;
                 case 'd': mode = GZIP_DECOMPRESS; break;
+                case 't': mode = GZIP_TEST; break;
+                case 'n': case 'N': break; /* name/timestamp handling */
+                case 'q': break;           /* quiet: nothing extra is printed */
+                case '1': case '2': case '3': case '4': case '5':
+                case '6': case '7': case '8': case '9':
+                    /* Compression level: zlib's default is used throughout, so
+                     * the level only trades size for time, never correctness. */
+                    break;
                 default:
                     fprintf(stderr, "%s: unsupported option '%c'\n", progName, *p);
                     return 1;

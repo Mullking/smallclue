@@ -763,63 +763,103 @@ int smallclueTarCommand(int argc, char **argv) {
     int firstOperand = -1;
 
     /* Accept both "tar -xzf archive.tar.gz" and the traditional
-     * bundled-without-dash "tar xzf archive.tar.gz" form. */
+     * bundled-without-dash "tar xzf archive.tar.gz" form.
+     *
+     * The dashed form may spread its flags over SEVERAL groups -- mariadb's
+     * backup scripts run `tar -P $tar_options ...`, where the mode letters
+     * arrive in a later word than -P -- so every leading -group is read, not
+     * just the first. Any group containing f or C takes its value from the
+     * next argument, which is what traditional tar does. */
     int argi = 1;
     const char *modeArg = argv[argi];
     bool bundled = (modeArg[0] != '-');
-    const char *flags = bundled ? modeArg : modeArg + 1;
 
-    for (const char *p = flags; *p; ++p) {
-        switch (*p) {
-            case 'c': doCreate = true; break;
-            case 'x': doExtract = true; break;
-            case 't': doList = true; break;
-            case 'v': verbose = true; break;
-            case 'z': gzip = true; break;
-            case 'f':
-                /* 'f' consumes the NEXT argument as the archive path,
-                 * whether bundled or not -- matches traditional tar. */
-                break;
-            default:
-                fprintf(stderr, "tar: unsupported option '%c'\n", *p);
-                tarUsage();
+    if (bundled) {
+        for (const char *p = modeArg; *p; ++p) {
+            switch (*p) {
+                case 'c': doCreate = true; break;
+                case 'x': doExtract = true; break;
+                case 't': doList = true; break;
+                case 'v': verbose = true; break;
+                case 'z': gzip = true; break;
+                case 'P': break;
+                case 'f': break;
+                default:
+                    fprintf(stderr, "tar: unsupported option '%c'\n", *p);
+                    tarUsage();
+                    return 1;
+            }
+        }
+        argi++;
+        if (strchr(modeArg, 'f') != NULL) {
+            if (argi >= argc) {
+                fprintf(stderr, "tar: option 'f' requires an archive path\n");
                 return 1;
+            }
+            archivePath = argv[argi++];
         }
-    }
-    argi++;
-
-    bool wantsFileArg = strchr(flags, 'f') != NULL;
-    if (wantsFileArg) {
-        if (argi >= argc) {
-            fprintf(stderr, "tar: option 'f' requires an archive path\n");
-            return 1;
-        }
-        archivePath = argv[argi++];
-    }
-
-    if (!bundled) {
-        for (; argi < argc; ++argi) {
-            if (strcmp(argv[argi], "-C") == 0) {
-                if (argi + 1 >= argc) {
+    } else {
+        while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+            const char *arg = argv[argi];
+            if (strcmp(arg, "--") == 0) {
+                argi++;
+                break;
+            }
+            if (arg[1] == '-') {
+                if (strcmp(arg, "--verbose") == 0) verbose = true;
+                else if (strcmp(arg, "--gzip") == 0) gzip = true;
+                else if (strcmp(arg, "--create") == 0) doCreate = true;
+                else if (strcmp(arg, "--extract") == 0 || strcmp(arg, "--get") == 0) doExtract = true;
+                else if (strcmp(arg, "--list") == 0) doList = true;
+                else if (strcmp(arg, "--absolute-names") == 0) { /* never stripped here */ }
+                else if (strncmp(arg, "--file=", 7) == 0) archivePath = arg + 7;
+                else if (strncmp(arg, "--directory=", 12) == 0) destDir = arg + 12;
+                else {
+                    fprintf(stderr, "tar: unsupported option '%s'\n", arg);
+                    tarUsage();
+                    return 1;
+                }
+                argi++;
+                continue;
+            }
+            bool needsFile = false, needsDir = false;
+            for (const char *p = arg + 1; *p; ++p) {
+                switch (*p) {
+                    case 'c': doCreate = true; break;
+                    case 'x': doExtract = true; break;
+                    case 't': doList = true; break;
+                    case 'v': verbose = true; break;
+                    case 'z': gzip = true; break;
+                    /* -P means "do not strip a leading /", and this tar never
+                     * strips one, so the flag asks for what it already does. */
+                    case 'P': break;
+                    case 'f': needsFile = true; break;
+                    case 'C': needsDir = true; break;
+                    default:
+                        fprintf(stderr, "tar: unsupported option '%c'\n", *p);
+                        tarUsage();
+                        return 1;
+                }
+            }
+            argi++;
+            if (needsFile) {
+                if (argi >= argc) {
+                    fprintf(stderr, "tar: option 'f' requires an archive path\n");
+                    return 1;
+                }
+                archivePath = argv[argi++];
+            }
+            if (needsDir) {
+                if (argi >= argc) {
                     fprintf(stderr, "tar: -C requires a directory argument\n");
                     return 1;
                 }
-                destDir = argv[++argi];
-            } else if (strcmp(argv[argi], "-f") == 0) {
-                if (argi + 1 >= argc) {
-                    fprintf(stderr, "tar: -f requires an archive path\n");
-                    return 1;
-                }
-                archivePath = argv[++argi];
-            } else if (strcmp(argv[argi], "-v") == 0) {
-                verbose = true;
-            } else if (strcmp(argv[argi], "-z") == 0) {
-                gzip = true;
-            } else {
-                break;
+                destDir = argv[argi++];
             }
         }
-    } else {
+    }
+
+    if (bundled) {
         /* Traditional bundled form also allows a following "-C dir". */
         if (argi < argc && strcmp(argv[argi], "-C") == 0) {
             if (argi + 1 >= argc) {

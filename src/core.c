@@ -5832,12 +5832,12 @@ static int smallclueXargsCommand(int argc, char **argv) {
             break;
         }
     }
-    if (argi >= argc) {
-        fprintf(stderr, "xargs: missing command name\n");
-        return 1;
-    }
-    int baseCount = argc - argi;
-    char **baseArgs = &argv[argi];
+    /* With no command, xargs runs echo. Debian's invoke-rc.d leans on exactly
+     * that -- `ls -d -Q ... | xargs` is how it collapses a listing onto one
+     * line -- and erroring here made that produce nothing at all. */
+    char *defaultCommand[] = { (char *) "echo", NULL };
+    int baseCount = (argi < argc) ? argc - argi : 1;
+    char **baseArgs = (argi < argc) ? &argv[argi] : defaultCommand;
 
     int status = 0;
 
@@ -12881,6 +12881,53 @@ static const char *smallclueLsGetColor(mode_t mode) {
     return NULL;
 }
 
+/* -Q wraps each name in double quotes, C-escaping what would otherwise be
+ * ambiguous. Debian's invoke-rc.d depends on it -- every package's postinst
+ * goes through that script, and it runs
+ *
+ *     SLINK=`ls -d -Q ${RCDPREFIX}${RL}.d/S[0-9][0-9]${INITSCRIPTID} | xargs`
+ *
+ * where the quoting is exactly what keeps a path containing a space as one
+ * word once xargs re-splits it.
+ *
+ * The flag lives in a __thread global rather than being threaded through the
+ * dozen ls printers. That is this file's existing pattern for per-invocation
+ * applet state (see gSmallclueSortOpts): an applet is a function call running
+ * on its own task thread, so a plain global would be shared between two
+ * concurrent `ls` calls in a pipeline and a __thread one is not. */
+static __thread bool gSmallclueLsQuoteNames = false;
+
+static const char *smallclueLsQuote(const char *name, char *buf, size_t bufsize) {
+    if (!gSmallclueLsQuoteNames || !name) {
+        return name;
+    }
+    /* Every byte can escape to at most four characters, plus the two quotes
+     * and the NUL; if that will not fit, the unquoted name is a better answer
+     * than a truncated one. */
+    if (strlen(name) * 4 + 3 > bufsize) {
+        return name;
+    }
+    size_t w = 0;
+    buf[w++] = '"';
+    for (const unsigned char *p = (const unsigned char *) name; *p; ++p) {
+        switch (*p) {
+            case '"':  buf[w++] = '\\'; buf[w++] = '"';  break;
+            case '\\': buf[w++] = '\\'; buf[w++] = '\\'; break;
+            case '\n': buf[w++] = '\\'; buf[w++] = 'n';  break;
+            case '\t': buf[w++] = '\\'; buf[w++] = 't';  break;
+            default:
+                if (*p < 0x20 || *p == 0x7f) {
+                    w += (size_t) snprintf(buf + w, bufsize - w, "\\%03o", *p);
+                } else {
+                    buf[w++] = (char) *p;
+                }
+        }
+    }
+    buf[w++] = '"';
+    buf[w] = '\0';
+    return buf;
+}
+
 static int print_path_entry_with_stat(const char *path,
                                       const char *label,
                                       bool long_format,
@@ -12906,7 +12953,8 @@ static int print_path_entry_with_stat(const char *path,
     }
 
     char decorated[PATH_MAX];
-    const char *display = label ? label : path;
+    char quoted[PATH_MAX];
+    const char *display = smallclueLsQuote(label ? label : path, quoted, sizeof quoted);
     const char *out = display;
     if (classify && st) {
         char suffix = '\0';
@@ -13109,7 +13157,8 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
 
     size_t max_len = 0;
     for (size_t i = 0; i < count; ++i) {
-        size_t len = strlen(entries[i].name);
+        char qbuf[PATH_MAX];
+        size_t len = strlen(smallclueLsQuote(entries[i].name, qbuf, sizeof qbuf));
         if (show_inode) {
             len += inode_width + 1; /* inode digits + one separating space */
         }
@@ -13136,7 +13185,8 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
                 continue;
             }
             const struct stat *st = &entries[idx].stat_buf;
-            const char *name = entries[idx].name;
+            char qbuf[PATH_MAX];
+            const char *name = smallclueLsQuote(entries[idx].name, qbuf, sizeof qbuf);
             char withInode[PATH_MAX];
             const char *base = name;
             if (show_inode) {
@@ -13502,6 +13552,11 @@ static bool smallclueLsValidateShortOptions(const char *arg,
             case 'C':
                 *format = LS_FORMAT_COLUMNS;
                 break;
+            case 'Q':
+                /* Set directly: the flag is per-invocation __thread state, so
+                 * it needs no place in this already-long parameter list. */
+                gSmallclueLsQuoteNames = true;
+                break;
             case 't':
                 *sort_by_time = 1;
                 break;
@@ -13567,6 +13622,10 @@ static bool smallclueLsHandleLongOption(const char *arg) {
         return true;
     }
     if (strcmp(arg, "--group-directories-first") == 0) {
+        return true;
+    }
+    if (strcmp(arg, "--quote-name") == 0) {
+        gSmallclueLsQuoteNames = true;
         return true;
     }
     if (strcmp(arg, "--color") == 0) {

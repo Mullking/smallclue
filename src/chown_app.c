@@ -115,6 +115,9 @@ static int smallclueChownApplyRecursive(const char *progName, const char *path, 
 int smallclueChownCommand(int argc, char **argv) {
     bool recursive = false;
     bool followSymlink = true; /* default: chown() semantics, follow symlinks */
+    /* --reference=FILE takes the owner and group from that file instead of
+     * from a spec operand, so with it there is no OWNER[:GROUP] argument. */
+    const char *referenceFile = NULL;
     int argi = 1;
     for (; argi < argc; ++argi) {
         const char *arg = argv[argi];
@@ -130,6 +133,20 @@ int smallclueChownCommand(int argc, char **argv) {
             followSymlink = false;
             continue;
         }
+        if (strncmp(arg, "--reference=", 12) == 0) {
+            referenceFile = arg + 12;
+            continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 ||
+            strcmp(arg, "-c") == 0 || strcmp(arg, "--changes") == 0 ||
+            strcmp(arg, "-f") == 0 || strcmp(arg, "--silent") == 0 ||
+            strcmp(arg, "--quiet") == 0 || strcmp(arg, "--dereference") == 0) {
+            /* Reporting verbosity only; the ownership change is the same. */
+            if (strcmp(arg, "--dereference") == 0) {
+                followSymlink = true;
+            }
+            continue;
+        }
         if (arg[0] == '-' && arg[1] != '\0') {
             fprintf(stderr, "chown: unsupported option '%s'\n", arg);
             return 1;
@@ -140,19 +157,34 @@ int smallclueChownCommand(int argc, char **argv) {
         fprintf(stderr, "chown: missing operand\n");
         return 1;
     }
-    const char *spec = argv[argi++];
-    if (argi >= argc) {
-        fprintf(stderr, "chown: missing file operand\n");
-        return 1;
-    }
     uid_t uid = 0;
     gid_t gid = 0;
     bool haveUid = false, haveGid = false;
-    if (!smallclueResolveUidGid(spec, &uid, &gid, &haveUid, &haveGid, "chown")) {
-        return 1;
+    if (referenceFile) {
+        struct stat refSt;
+        if (stat(referenceFile, &refSt) != 0) {
+            fprintf(stderr, "chown: %s: %s\n", referenceFile, strerror(errno));
+            return 1;
+        }
+        uid = refSt.st_uid;
+        gid = refSt.st_gid;
+        haveUid = haveGid = true;
+    } else {
+        const char *spec = argv[argi++];
+        if (argi >= argc) {
+            fprintf(stderr, "chown: missing file operand\n");
+            return 1;
+        }
+        if (!smallclueResolveUidGid(spec, &uid, &gid, &haveUid, &haveGid, "chown")) {
+            return 1;
+        }
+        if (!haveUid && !haveGid) {
+            fprintf(stderr, "chown: invalid spec '%s'\n", spec);
+            return 1;
+        }
     }
-    if (!haveUid && !haveGid) {
-        fprintf(stderr, "chown: invalid spec '%s'\n", spec);
+    if (argi >= argc) {
+        fprintf(stderr, "chown: missing file operand\n");
         return 1;
     }
     int status = 0;
