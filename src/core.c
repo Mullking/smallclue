@@ -12667,6 +12667,7 @@ typedef struct {
     bool showEnds;        /* -E: '$' at end of line */
     bool showTabs;        /* -T: tabs as ^I */
     bool squeezeBlank;    /* -s: collapse runs of blank lines to one */
+    bool showNonPrinting; /* -v: control bytes as ^X, high bytes as M-X */
 } SmallclueCatOptions;
 
 /* Line-based formatting path, used only when any of -n/-b/-A/-E/-T/-s is
@@ -12716,10 +12717,31 @@ static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions
                 printf("%6ld\t", ++(*lineNo));
             }
         }
-        if (opts->showTabs) {
+        if (opts->showTabs || opts->showNonPrinting) {
             for (ssize_t i = 0; i < len; ++i) {
-                if (line[i] == '\t') fputs("^I", stdout);
-                else putchar(line[i]);
+                unsigned char c = (unsigned char) line[i];
+                if (c == '\t') {
+                    /* -v leaves tabs alone; only -T rewrites them. */
+                    if (opts->showTabs) fputs("^I", stdout);
+                    else putchar('\t');
+                    continue;
+                }
+                if (!opts->showNonPrinting) {
+                    putchar(c);
+                    continue;
+                }
+                if (c >= 128) {
+                    fputs("M-", stdout);
+                    c = (unsigned char) (c - 128);
+                }
+                if (c == 127) {
+                    fputs("^?", stdout);
+                } else if (c < 32) {
+                    putchar('^');
+                    putchar((int) c + 64);
+                } else {
+                    putchar(c);
+                }
             }
         } else {
             fwrite(line, 1, (size_t)len, stdout);
@@ -17789,6 +17811,22 @@ static int smallclueCatCommand(int argc, char **argv) {
         const char *arg = argv[argi];
         if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) break;
         if (strcmp(arg, "--") == 0) { argi++; break; }
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            if (strcmp(lopt, "number") == 0) opts.numberAll = true;
+            else if (strcmp(lopt, "number-nonblank") == 0) opts.numberNonBlank = true;
+            else if (strcmp(lopt, "show-ends") == 0) opts.showEnds = true;
+            else if (strcmp(lopt, "show-tabs") == 0) opts.showTabs = true;
+            else if (strcmp(lopt, "squeeze-blank") == 0) opts.squeezeBlank = true;
+            else if (strcmp(lopt, "show-nonprinting") == 0) opts.showNonPrinting = true;
+            else if (strcmp(lopt, "show-all") == 0) {
+                opts.showEnds = opts.showTabs = opts.showNonPrinting = true;
+            } else {
+                fprintf(stderr, "cat: unrecognized option '%s'\n", arg);
+                return 1;
+            }
+            continue;
+        }
         for (const char *p = arg + 1; *p; ++p) {
             switch (*p) {
                 case 'n': opts.numberAll = true; break;
@@ -17796,7 +17834,16 @@ static int smallclueCatCommand(int argc, char **argv) {
                 case 'E': opts.showEnds = true; break;
                 case 'T': opts.showTabs = true; break;
                 case 's': opts.squeezeBlank = true; break;
-                case 'A': opts.showEnds = true; opts.showTabs = true; break;
+                case 'v': opts.showNonPrinting = true; break;
+                /* GNU's bundles: -e is -vE, -t is -vT, -A is -vET. */
+                case 'e': opts.showNonPrinting = true; opts.showEnds = true; break;
+                case 't': opts.showNonPrinting = true; opts.showTabs = true; break;
+                case 'A':
+                    opts.showEnds = true;
+                    opts.showTabs = true;
+                    opts.showNonPrinting = true;
+                    break;
+                case 'u': break; /* unbuffered: accepted, as in every cat */
                 default:
                     fprintf(stderr, "cat: unsupported option -%c\n", *p);
                     return 1;
@@ -17805,7 +17852,7 @@ static int smallclueCatCommand(int argc, char **argv) {
     }
 
     bool anyFlag = opts.numberAll || opts.numberNonBlank || opts.showEnds ||
-                  opts.showTabs || opts.squeezeBlank;
+                  opts.showTabs || opts.squeezeBlank || opts.showNonPrinting;
     int status = 0;
     if (!anyFlag) {
         if (argi >= argc) {
@@ -17839,11 +17886,59 @@ static const char *smallcluePagerDisplayName(const char *path) {
     return path;
 }
 
+/* less takes its default options from $LESS, and for this pager that is not a
+ * nicety -- it is the only channel that exists. apt execs a bare pager name
+ * with NO arguments (APT_PAGER, else PAGER, else `pager`), so -R can never
+ * arrive on the command line. Debian sets LESS=-R -M -i, which is exactly why
+ * `apt search` renders colour under the real less; without reading it here,
+ * every SGR sequence came out as a literal ^[[32m.
+ *
+ * Only -r/-R are acted on. The rest of what shows up in $LESS (-M, -i, -F, -S,
+ * -X ...) selects behaviour this pager does not have, and quietly ignoring a
+ * request for a status line beats refusing to page at all. */
+static bool pagerRawFromEnv(void) {
+    const char *less = getenv("LESS");
+    if (!less || !*less) {
+        return false;
+    }
+    const char *p = less;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        size_t len = (size_t) (p - start);
+        if (len < 2 || start[0] != '-') {
+            continue;
+        }
+        if (start[1] == '-') {
+            /* less spells the long forms with the case carrying the meaning. */
+            if ((len == 19 && strncmp(start, "--RAW-CONTROL-CHARS", 19) == 0) ||
+                (len == 19 && strncmp(start, "--raw-control-chars", 19) == 0)) {
+                return true;
+            }
+            continue;
+        }
+        for (size_t i = 1; i < len; ++i) {
+            if (start[i] == 'r' || start[i] == 'R') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int smallcluePagerCommand(int argc, char **argv) {
     const char *cmd_name = pager_command_name(argv && argc > 0 ? argv[0] : NULL);
     smallclueResetGetopt();
     int opt;
-    bool raw_mode = false;
+    bool raw_mode = pagerRawFromEnv();
     while ((opt = getopt(argc, argv, "rR")) != -1) {
         switch (opt) {
             case 'r':
@@ -21434,10 +21529,14 @@ static bool smallclueCutRangesContain(const SmallclueCutRange *ranges, size_t co
 }
 
 static void smallclueCutPrintFields(const char *line, char delim, const SmallclueCutRange *ranges,
-                                    size_t rangeCount, bool suppressNoDelim) {
+                                    size_t rangeCount, bool suppressNoDelim, bool complement,
+                                    const char *outputDelim, char terminator) {
     if (!strchr(line, delim)) {
+        /* A line with no delimiter is one whole field: cut passes it through
+         * untouched unless -s says to drop it. */
         if (!suppressNoDelim) {
-            printf("%s\n", line);
+            fputs(line, stdout);
+            putchar(terminator);
         }
         return;
     }
@@ -21446,8 +21545,11 @@ static void smallclueCutPrintFields(const char *line, char delim, const Smallclu
     bool printedAny = false;
     for (const char *p = line;; ++p) {
         if (*p == delim || *p == '\0') {
-            if (smallclueCutRangesContain(ranges, rangeCount, fieldNo)) {
-                if (printedAny) putchar(delim);
+            if (smallclueCutRangesContain(ranges, rangeCount, fieldNo) != complement) {
+                if (printedAny) {
+                    if (outputDelim) fputs(outputDelim, stdout);
+                    else putchar(delim);
+                }
                 fwrite(start, 1, (size_t)(p - start), stdout);
                 printedAny = true;
             }
@@ -21456,101 +21558,199 @@ static void smallclueCutPrintFields(const char *line, char delim, const Smallclu
             start = p + 1;
         }
     }
-    putchar('\n');
+    putchar(terminator);
 }
 
-static void smallclueCutPrintChars(const char *line, const SmallclueCutRange *ranges, size_t rangeCount) {
+static void smallclueCutPrintChars(const char *line, const SmallclueCutRange *ranges,
+                                   size_t rangeCount, bool complement, char terminator) {
     size_t len = strlen(line);
     for (size_t i = 0; i < len; ++i) {
-        if (smallclueCutRangesContain(ranges, rangeCount, (int)(i + 1))) {
+        if (smallclueCutRangesContain(ranges, rangeCount, (int)(i + 1)) != complement) {
             putchar(line[i]);
         }
     }
-    putchar('\n');
+    putchar(terminator);
 }
 
 static int smallclueCutCommand(int argc, char **argv) {
+    static const char *usage =
+        "usage: cut -b LIST | -c LIST | -f LIST [-d DELIM] [-sn z] [file ...]\n"
+        "  -b/-c LIST  select bytes/characters   -f LIST  select fields\n"
+        "  -d DELIM    field delimiter (default tab)\n"
+        "  -s          skip lines with no delimiter\n"
+        "  --complement           select the fields NOT listed\n"
+        "  --output-delimiter=S   separate output fields with S\n"
+        "  -z, --zero-terminated  lines end with NUL, not newline\n";
     char delimiter = '\t';
-    bool haveFieldList = false, haveCharList = false, suppressNoDelim = false;
+    bool haveFieldList = false, haveCharList = false, haveByteList = false;
+    bool suppressNoDelim = false, complement = false;
+    const char *outputDelim = NULL;
+    char terminator = '\n';
     SmallclueCutRange ranges[SMALLCLUE_CUT_MAX_RANGES];
     size_t rangeCount = 0;
 
-    int index = 1;
-    while (index < argc) {
+    /* Operands and options may interleave -- `cut file -f1` is as valid as
+     * `cut -f1 file`, because GNU permutes. Stopping at the first non-option
+     * left the field list unseen and reported "you must specify a list", which
+     * looks like the script's fault and is not. So options are collected in one
+     * pass and the operands are remembered by index. */
+    int files[256];
+    int fileCount = 0;
+    bool endOfOptions = false;
+
+    for (int index = 1; index < argc; ++index) {
         const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
+        if (!arg) {
+            continue;
+        }
+        if (endOfOptions || arg[0] != '-' || arg[1] == '\0') {
+            if (fileCount < (int) (sizeof(files) / sizeof(files[0]))) {
+                files[fileCount++] = index;
+            }
+            continue;
         }
         if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        if (strcmp(arg, "-s") == 0) {
-            suppressNoDelim = true;
-            index++;
+            endOfOptions = true;
             continue;
         }
-        if (strncmp(arg, "-d", 2) == 0) {
-            if (arg[2] != '\0') {
-                delimiter = arg[2];
-                index++;
-                continue;
-            }
-            if (index + 1 >= argc || !argv[index + 1][0]) {
-                fprintf(stderr, "cut: missing delimiter\n");
-                return 1;
-            }
-            delimiter = argv[index + 1][0];
-            index += 2;
-            continue;
-        }
-        if (strncmp(arg, "-f", 2) == 0 || strncmp(arg, "-c", 2) == 0) {
-            bool isChar = (arg[1] == 'c');
-            const char *listStr = NULL;
-            if (arg[2] != '\0') {
-                listStr = arg + 2;
-                index++;
-            } else {
-                if (index + 1 >= argc) {
-                    fprintf(stderr, "cut: missing %s list\n", isChar ? "-c" : "-f");
+        if (arg[1] == '-') {
+            const char *lopt = arg + 2;
+            const char *eq = strchr(lopt, '=');
+            size_t nameLen = eq ? (size_t) (eq - lopt) : strlen(lopt);
+            const char *value = eq ? eq + 1 : NULL;
+            #define CUT_LONG(n) (nameLen == strlen(n) && strncmp(lopt, n, nameLen) == 0)
+            #define CUT_NEED_VALUE(n) \
+                do { \
+                    if (!value) { \
+                        if (index + 1 >= argc) { \
+                            fprintf(stderr, "cut: option '--%s' requires an argument\n", n); \
+                            return 1; \
+                        } \
+                        value = argv[++index]; \
+                    } \
+                } while (0)
+            int listKind = 0; /* 'b', 'c' or 'f' */
+            if (CUT_LONG("bytes")) { CUT_NEED_VALUE("bytes"); listKind = 'b'; }
+            else if (CUT_LONG("characters")) { CUT_NEED_VALUE("characters"); listKind = 'c'; }
+            else if (CUT_LONG("fields")) { CUT_NEED_VALUE("fields"); listKind = 'f'; }
+            else if (CUT_LONG("delimiter")) {
+                CUT_NEED_VALUE("delimiter");
+                if (!value[0]) {
+                    fprintf(stderr, "cut: missing delimiter\n");
                     return 1;
                 }
-                listStr = argv[index + 1];
-                index += 2;
-            }
-            if (!smallclueCutParseList(listStr, ranges, &rangeCount, SMALLCLUE_CUT_MAX_RANGES)) {
-                fprintf(stderr, "cut: invalid %s list '%s'\n", isChar ? "-c" : "-f", listStr);
+                delimiter = value[0];
+            } else if (CUT_LONG("output-delimiter")) {
+                CUT_NEED_VALUE("output-delimiter");
+                outputDelim = value;
+            } else if (CUT_LONG("only-delimited")) {
+                suppressNoDelim = true;
+            } else if (CUT_LONG("complement")) {
+                complement = true;
+            } else if (CUT_LONG("zero-terminated")) {
+                terminator = '\0';
+            } else if (CUT_LONG("help")) {
+                fputs(usage, stdout);
+                return 0;
+            } else {
+                fprintf(stderr, "cut: unrecognized option '%s'\n", arg);
+                fputs("Try 'cut --help' for more information.\n", stderr);
                 return 1;
             }
-            if (isChar) haveCharList = true; else haveFieldList = true;
+            #undef CUT_LONG
+            #undef CUT_NEED_VALUE
+            if (listKind) {
+                if (!smallclueCutParseList(value, ranges, &rangeCount, SMALLCLUE_CUT_MAX_RANGES)) {
+                    fprintf(stderr, "cut: invalid list '%s'\n", value);
+                    return 1;
+                }
+                if (listKind == 'f') haveFieldList = true;
+                else if (listKind == 'c') haveCharList = true;
+                else haveByteList = true;
+            }
             continue;
         }
-        fprintf(stderr, "cut: unsupported option '%s'\n", arg);
+        /* Short options bundle, and the ones taking a value may carry it
+         * attached (-f1, -d:) or as the next word (-f 1, -d :). */
+        bool consumedValue = false;
+        for (const char *p = arg + 1; *p && !consumedValue; ++p) {
+            if (*p == 'd' || *p == 'f' || *p == 'c' || *p == 'b') {
+                const char *value;
+                if (p[1] != '\0') {
+                    value = p + 1;
+                } else if (index + 1 < argc) {
+                    value = argv[++index];
+                } else {
+                    fprintf(stderr, "cut: option requires an argument -- %c\n", *p);
+                    return 1;
+                }
+                consumedValue = true;
+                if (*p == 'd') {
+                    if (!value[0]) {
+                        fprintf(stderr, "cut: missing delimiter\n");
+                        return 1;
+                    }
+                    delimiter = value[0];
+                    continue;
+                }
+                if (!smallclueCutParseList(value, ranges, &rangeCount, SMALLCLUE_CUT_MAX_RANGES)) {
+                    fprintf(stderr, "cut: invalid list '%s'\n", value);
+                    return 1;
+                }
+                if (*p == 'f') haveFieldList = true;
+                else if (*p == 'c') haveCharList = true;
+                else haveByteList = true;
+                continue;
+            }
+            switch (*p) {
+                case 's': suppressNoDelim = true; break;
+                case 'z': terminator = '\0'; break;
+                case 'n': break; /* only meaningful with -b in a multibyte locale */
+                default:
+                    fprintf(stderr, "cut: unsupported option '-%c'\n", *p);
+                    fputs("Try 'cut --help' for more information.\n", stderr);
+                    return 1;
+            }
+        }
+    }
+
+    if (!haveFieldList && !haveCharList && !haveByteList) {
+        fprintf(stderr, "cut: you must specify a list of bytes, characters, or fields\n");
+        fputs("Try 'cut --help' for more information.\n", stderr);
         return 1;
     }
-    if (!haveFieldList && !haveCharList) {
-        fprintf(stderr, "cut: you must specify a list of -f fields or -c characters\n");
+    if ((haveFieldList ? 1 : 0) + (haveCharList ? 1 : 0) + (haveByteList ? 1 : 0) > 1) {
+        fprintf(stderr, "cut: only one list may be specified\n");
+        fputs("Try 'cut --help' for more information.\n", stderr);
         return 1;
     }
-    if (haveFieldList && haveCharList) {
-        fprintf(stderr, "cut: only one of -f or -c may be given\n");
+    if (!haveFieldList && suppressNoDelim) {
+        fprintf(stderr, "cut: suppressing non-delimited lines makes sense\n"
+                        "\tonly when operating on fields\n");
+        fputs("Try 'cut --help' for more information.\n", stderr);
         return 1;
     }
+    /* This cut is byte-oriented, so -b and -c select the same units. That is
+     * exact for single-byte data -- which is what shell pipelines carry -- and
+     * the same approximation busybox makes; it is recorded here rather than
+     * claimed as full multibyte support. */
+    bool selectPositions = haveCharList || haveByteList;
 
     char *line = NULL;
     size_t cap = 0;
     int status = 0;
-    int fileCount = argc - index;
     for (int fi = 0; fi < (fileCount > 0 ? fileCount : 1); ++fi) {
         FILE *fp = stdin;
         const char *label = "-";
         if (fileCount > 0) {
-            label = argv[index + fi];
-            fp = fopen(label, "r");
-            if (!fp) {
-                fprintf(stderr, "cut: %s: %s\n", label, strerror(errno));
-                status = 1;
-                continue;
+            label = argv[files[fi]];
+            if (strcmp(label, "-") != 0) {
+                fp = fopen(label, "r");
+                if (!fp) {
+                    fprintf(stderr, "cut: %s: %s\n", label, strerror(errno));
+                    status = 1;
+                    continue;
+                }
             }
         }
         while (true) {
@@ -21566,10 +21766,11 @@ static int smallclueCutCommand(int argc, char **argv) {
             if (len > 0 && line[len - 1] == '\n') {
                 line[len - 1] = '\0';
             }
-            if (haveCharList) {
-                smallclueCutPrintChars(line, ranges, rangeCount);
+            if (selectPositions) {
+                smallclueCutPrintChars(line, ranges, rangeCount, complement, terminator);
             } else {
-                smallclueCutPrintFields(line, delimiter, ranges, rangeCount, suppressNoDelim);
+                smallclueCutPrintFields(line, delimiter, ranges, rangeCount,
+                                        suppressNoDelim, complement, outputDelim, terminator);
             }
         }
         if (fp != stdin) fclose(fp);
