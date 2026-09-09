@@ -5628,6 +5628,10 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
                 return 125;
             }
             argi++;
+        } else if (strcmp(arg, "--help") == 0) {
+            fputs("usage: timeout [-k DURATION] [-s SIGNAL] [--preserve-status] "
+                  "DURATION COMMAND [ARG...]\n", stdout);
+            return 0;
         } else if (strncmp(arg, "--kill-after=", 13) == 0) {
             if (!smallclueTimeoutParseDuration(arg + 13, &killAfter)) {
                 fprintf(stderr, "timeout: invalid duration '%s'\n", arg + 13);
@@ -5799,12 +5803,28 @@ static int smallclueXargsCommand(int argc, char **argv) {
                 return 1;
             }
             replaceStr = argv[++argi];
-        } else if (strcmp(arg, "-n") == 0) {
+        } else if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+            /* `xargs -n1` is one token, and far more common in scripts than
+             * the spaced form that was the only one accepted. */
+            maxArgsPerInvocation = atoi(arg + 2);
+        } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--max-args") == 0) {
             if (argi + 1 >= argc) {
                 fprintf(stderr, "xargs: -n requires a count\n");
                 return 1;
             }
             maxArgsPerInvocation = atoi(argv[++argi]);
+        } else if (strncmp(arg, "--max-args=", 11) == 0) {
+            maxArgsPerInvocation = atoi(arg + 11);
+        } else if (strcmp(arg, "--null") == 0) {
+            nulDelimited = true;
+        } else if (strcmp(arg, "--verbose") == 0) {
+            verbose = true;
+        } else if (strncmp(arg, "--replace=", 10) == 0) {
+            replaceStr = arg + 10;
+        } else if (strcmp(arg, "--replace") == 0) {
+            replaceStr = "{}";
+        } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--no-run-if-empty") == 0) {
+            /* This xargs already skips empty input rather than running once. */
         } else if (arg[0] == '-' && arg[1] != '\0') {
             fprintf(stderr, "xargs: unsupported option '%s'\n", arg);
             return 1;
@@ -5945,6 +5965,8 @@ static int smallclueStringCompare(const void *a, const void *b) {
  * struct, set immediately before the one qsort() call that uses it. */
 typedef struct {
     bool numeric;
+    bool stable;    /* -s: keep equal-key lines in input order, no last resort */
+    bool foldCase;  /* -f: compare as though every letter were upper case */
     bool haveKey;
     int keyField; /* 1-based; the key runs from here to end-of-line, matching
                     * GNU sort's own semantics for a bare "-k N" (no ",M" end
@@ -5978,7 +6000,10 @@ static const char *smallclueSortKeyOf(const char *line) {
     return p;
 }
 
-static int smallclueSortCompare(const void *a, const void *b) {
+/* Key-only comparison. -u groups by this and nothing else: `sort -nu` over
+ * lines whose numeric keys all compare equal emits ONE line, even though the
+ * lines differ. */
+static int smallclueSortCompareKeys(const void *a, const void *b) {
     const char *lhs = *(const char *const *)a;
     const char *rhs = *(const char *const *)b;
     const char *lkey = smallclueSortKeyOf(lhs);
@@ -5990,7 +6015,33 @@ static int smallclueSortCompare(const void *a, const void *b) {
         if (lv > rv) return 1;
         return 0;
     }
+    if (gSmallclueSortOpts.foldCase) {
+        /* GNU sort's -f folds UP, so the ordering matches the C locale's
+         * upper-case run rather than strcasecmp's locale-dependent one. */
+        const unsigned char *l = (const unsigned char *) lkey;
+        const unsigned char *r = (const unsigned char *) rkey;
+        for (; *l && *r; ++l, ++r) {
+            int lc = toupper(*l), rc = toupper(*r);
+            if (lc != rc) return lc < rc ? -1 : 1;
+        }
+        if (*l) return 1;
+        if (*r) return -1;
+        return 0;
+    }
     return strcmp(lkey, rkey);
+}
+
+/* Ordering comparison. When the keys tie, sort compares the ENTIRE lines as a
+ * last resort -- which is why `sort -n` over non-numeric input still comes out
+ * alphabetical rather than in input order. -s turns that off and makes the
+ * sort stable instead; both were previously missing, so every tie fell back to
+ * input order, i.e. -s behaviour whether or not it was asked for. */
+static int smallclueSortCompare(const void *a, const void *b) {
+    int rc = smallclueSortCompareKeys(a, b);
+    if (rc != 0 || gSmallclueSortOpts.stable) {
+        return rc;
+    }
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
 /* qsort() isn't guaranteed stable, but GNU sort documents itself as
@@ -20240,17 +20291,46 @@ static int smallclueSortCommand(int argc, char **argv) {
             index++;
             break;
         }
-        if (strcmp(arg, "-r") == 0) {
+        /* These were exact-match only, so a bundle like `sort -rn` -- which
+         * is how people actually write it -- was rejected as an unknown
+         * option. Each valueless short flag is now read out of a bundle. */
+        if (arg[0] == '-' && arg[1] != '-' && arg[1] != '\0' &&
+            strspn(arg + 1, "rnufbs") == strlen(arg + 1)) {
+            for (const char *p = arg + 1; *p; ++p) {
+                switch (*p) {
+                    case 'r': reverse = 1; break;
+                    case 'n': gSmallclueSortOpts.numeric = true; break;
+                    case 'u': uniqueOnly = true; break;
+                    case 'f': gSmallclueSortOpts.foldCase = true; break;
+                    case 's': gSmallclueSortOpts.stable = true; break;
+                    case 'b': break; /* leading blanks: the key scan skips them */
+                    default: break;
+                }
+            }
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "--ignore-case") == 0) {
+            gSmallclueSortOpts.foldCase = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "--stable") == 0) {
+            gSmallclueSortOpts.stable = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "--reverse") == 0) {
             reverse = 1;
             index++;
             continue;
         }
-        if (strcmp(arg, "-n") == 0) {
+        if (strcmp(arg, "--numeric-sort") == 0) {
             gSmallclueSortOpts.numeric = true;
             index++;
             continue;
         }
-        if (strcmp(arg, "-u") == 0) {
+        if (strcmp(arg, "--unique") == 0) {
             uniqueOnly = true;
             index++;
             continue;
@@ -20351,7 +20431,8 @@ static int smallclueSortCommand(int argc, char **argv) {
         char *lastPrinted = NULL;
         for (size_t k = 0; k < vec.count; ++k) {
             size_t i = reverse ? (vec.count - 1 - k) : k;
-            if (uniqueOnly && lastPrinted && smallclueSortCompare(&lastPrinted, &vec.items[i]) == 0) {
+            if (uniqueOnly && lastPrinted &&
+                smallclueSortCompareKeys(&lastPrinted, &vec.items[i]) == 0) {
                 continue;
             }
             fputs(vec.items[i], stdout);
@@ -22221,6 +22302,157 @@ static int smallclueEnvCommand(int argc, char **argv) {
  * the already-compiled pattern. `len` is the byte length actually being
  * searched (the caller has already excluded any trailing '\n' so `$`/`.`
  * behave as end-of-line, not end-of-buffer -- see smallclueGrepMatches). */
+/* Darwin's BRE has none of GNU's extensions, and the gap is silent rather than
+ * loud: `grep 'alpha\|beta'` matches BOTH lines under GNU grep and NOTHING
+ * here, with a clean exit 1 that reads like an honest no-match. Carrying two
+ * regex engines to fix that would be absurd, so a BRE pattern is rewritten into
+ * the equivalent ERE and everything compiles as ERE.
+ *
+ * The mapping is the standard one: the escaping of the group, brace,
+ * alternation and repetition operators is exactly INVERTED between the two
+ * dialects, so `\(` becomes `(` and a bare `(` -- a literal in BRE -- becomes
+ * `\(`. Bracket expressions pass through untouched, because inside [...] a
+ * backslash is an ordinary character and none of those operators apply.
+ *
+ * Two BRE corners are not reproduced: a leading `*` and a `^`/`$` in the middle
+ * of a pattern are literals in BRE and operators in ERE. POSIX leaves both
+ * undefined and GNU grep documents them as unspecified, so a pattern relying on
+ * either is already not portable -- whereas `\|` is idiomatic and common. */
+static char *smallclueBreToEre(const char *bre) {
+    size_t n = strlen(bre);
+    char *out = (char *) malloc(n * 2 + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *w = out;
+    const char *p = bre;
+    bool inBracket = false;
+    while (*p) {
+        if (inBracket) {
+            if (*p == '[' && (p[1] == ':' || p[1] == '.' || p[1] == '=')) {
+                char kind = p[1];
+                *w++ = *p++;
+                *w++ = *p++;
+                while (*p && !(*p == kind && p[1] == ']')) {
+                    *w++ = *p++;
+                }
+                if (*p) { *w++ = *p++; }
+                if (*p) { *w++ = *p++; }
+                continue;
+            }
+            if (*p == ']') {
+                inBracket = false;
+            }
+            *w++ = *p++;
+            continue;
+        }
+        if (*p == '[') {
+            inBracket = true;
+            *w++ = *p++;
+            if (*p == '^') { *w++ = *p++; }
+            if (*p == ']') { *w++ = *p++; }  /* a ']' first in the set is literal */
+            continue;
+        }
+        if (*p == '\\' && p[1]) {
+            char c = p[1];
+            if (c == '(' || c == ')' || c == '{' || c == '}' ||
+                c == '|' || c == '+' || c == '?') {
+                *w++ = c;           /* an operator in BRE only when escaped */
+                p += 2;
+                continue;
+            }
+            *w++ = *p++;            /* \. \* \\ \1 ... keep the backslash */
+            *w++ = *p++;
+            continue;
+        }
+        if (*p == '(' || *p == ')' || *p == '{' || *p == '}' ||
+            *p == '|' || *p == '+' || *p == '?') {
+            *w++ = '\\';            /* literal in BRE, so escape it for ERE */
+            *w++ = *p++;
+            continue;
+        }
+        *w++ = *p++;
+    }
+    *w = '\0';
+    return out;
+}
+
+static void smallclueGrepFreePatterns(char **patterns, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        free(patterns[i]);
+    }
+    free(patterns);
+}
+
+/* -f FILE: one pattern per line, and an empty file means "match nothing",
+ * which is why a zero-pattern result is still a success here. */
+static bool smallclueGrepLoadPatternFile(const char *path, char ***patterns,
+                                         size_t *count, size_t *cap) {
+    FILE *fp = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    char *line = NULL;
+    size_t lcap = 0;
+    bool ok = true;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &lcap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "grep: %s: %s\n", path, strerror(read_err));
+                ok = false;
+            }
+            break;
+        }
+        if (len > 0 && line[len - 1] == '\n') {
+            line[len - 1] = '\0';
+        }
+        if (*count == *cap) {
+            size_t want = *cap ? *cap * 2 : 8;
+            char **grown = (char **) realloc(*patterns, want * sizeof(**patterns));
+            if (!grown) {
+                fprintf(stderr, "grep: out of memory\n");
+                ok = false;
+                break;
+            }
+            *patterns = grown;
+            *cap = want;
+        }
+        (*patterns)[*count] = strdup(line);
+        if (!(*patterns)[*count]) {
+            fprintf(stderr, "grep: out of memory\n");
+            ok = false;
+            break;
+        }
+        (*count)++;
+    }
+    free(line);
+    if (fp != stdin) {
+        fclose(fp);
+    }
+    return ok;
+}
+
+/* -F: quote every ERE metacharacter so the pattern matches as literal text. */
+static char *smallclueGrepQuoteLiteral(const char *text) {
+    size_t n = strlen(text);
+    char *out = (char *) malloc(n * 2 + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *w = out;
+    for (const char *r = text; *r; ++r) {
+        if (strchr(".[]{}()*+?^$|\\", *r)) {
+            *w++ = '\\';
+        }
+        *w++ = *r;
+    }
+    *w = '\0';
+    return out;
+}
+
 static void smallclueGrepHighlightMatches(const char *line, size_t len, const regex_t *re) {
     const char *cursor = line;
     const char *end = line + len;
@@ -22383,6 +22615,7 @@ typedef struct SmallclueGrepOptions {
     bool noFilename;     /* -h: never prefix with the file name */
     bool withFilename;   /* -H: always prefix, even for one file */
     bool fixedStrings;   /* -F: the pattern is literal text, not a regex */
+    long maxCount;       /* -m: stop after this many matching lines (0 = all) */
 } SmallclueGrepOptions;
 
 static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
@@ -22421,6 +22654,9 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
                 break;
             if (opts->countOnly) {
                 matchCount++;
+                if (opts->maxCount > 0 && matchCount >= opts->maxCount) {
+                    break;
+                }
             } else if (opts->matchOnly && !opts->invertMatch) {
                 smallclueGrepPrintAllMatches(line, matchLen, re, opts->wordMatch, opts->lineMatch,
                                              opts->multiplePaths ? label : NULL,
@@ -22435,6 +22671,12 @@ static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *r
                                         opts->numberLines ? lineNo : 0);
                 if (matchLen < (size_t)len) {
                     fputc('\n', stdout);
+                }
+            }
+            /* -m counts matching lines and stops the file there. */
+            if (opts->maxCount > 0 && !opts->countOnly) {
+                if (++matchCount >= opts->maxCount) {
+                    break;
                 }
             }
         }
@@ -22513,6 +22755,31 @@ static int smallclueGrepCommand(int argc, char **argv) {
     bool extendedRegex = false;
     bool ignoreCase = false;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
+    /* -e may repeat and -f contributes one per line, so patterns accumulate
+     * rather than living in a single variable. */
+    char **patterns = NULL;
+    size_t patternCount = 0, patternCap = 0;
+    #define GREP_ADD_PATTERN(str) \
+        do { \
+            if (patternCount == patternCap) { \
+                size_t want = patternCap ? patternCap * 2 : 8; \
+                char **grown = (char **) realloc(patterns, want * sizeof(*patterns)); \
+                if (!grown) { \
+                    fprintf(stderr, "grep: out of memory\n"); \
+                    smallclueGrepFreePatterns(patterns, patternCount); \
+                    return 2; \
+                } \
+                patterns = grown; \
+                patternCap = want; \
+            } \
+            patterns[patternCount] = strdup(str); \
+            if (!patterns[patternCount]) { \
+                fprintf(stderr, "grep: out of memory\n"); \
+                smallclueGrepFreePatterns(patterns, patternCount); \
+                return 2; \
+            } \
+            patternCount++; \
+        } while (0)
 
     while (index < argc) {
         const char *arg = argv[index];
@@ -22572,6 +22839,46 @@ static int smallclueGrepCommand(int argc, char **argv) {
             }
             if (strcmp(arg, "--no-messages") == 0) {
                 opts.noMessages = true;
+                index++;
+                continue;
+            }
+            if (strncmp(arg, "--regexp=", 9) == 0) {
+                GREP_ADD_PATTERN(arg + 9);
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--regexp") == 0) {
+                if (index + 1 >= argc) {
+                    fprintf(stderr, "grep: option '--regexp' requires an argument\n");
+                    smallclueGrepFreePatterns(patterns, patternCount);
+                    return 2;
+                }
+                GREP_ADD_PATTERN(argv[++index]);
+                index++;
+                continue;
+            }
+            if (strncmp(arg, "--file=", 7) == 0 || strcmp(arg, "--file") == 0) {
+                const char *path = (arg[6] == '=') ? arg + 7
+                                 : (index + 1 < argc ? argv[++index] : NULL);
+                if (!path) {
+                    fprintf(stderr, "grep: option '--file' requires an argument\n");
+                    smallclueGrepFreePatterns(patterns, patternCount);
+                    return 2;
+                }
+                if (!smallclueGrepLoadPatternFile(path, &patterns, &patternCount, &patternCap)) {
+                    smallclueGrepFreePatterns(patterns, patternCount);
+                    return 2;
+                }
+                index++;
+                continue;
+            }
+            if (strncmp(arg, "--max-count=", 12) == 0) {
+                opts.maxCount = strtol(arg + 12, NULL, 10);
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--text") == 0 || strcmp(arg, "--binary-files=text") == 0) {
+                /* Every line is already read as text here. */
                 index++;
                 continue;
             }
@@ -22655,49 +22962,94 @@ static int smallclueGrepCommand(int argc, char **argv) {
             } else if (*opt == 'F') {
                 /* Fixed strings. Handled where the regex is compiled. */
                 opts.fixedStrings = true;
+            } else if (*opt == 'a') {
+                /* --text: lines are already read as text here. */
+            } else if (*opt == 'e' || *opt == 'f' || *opt == 'm') {
+                /* These take a value, attached (-m1, -ePAT) or as the next
+                 * word (-m 1, -e PAT). -e in particular is how a script passes
+                 * a pattern that begins with a dash. */
+                const char *value;
+                if (opt[1] != '\0') {
+                    value = opt + 1;
+                } else if (index + 1 < argc) {
+                    value = argv[++index];
+                } else {
+                    fprintf(stderr, "grep: option requires an argument -- %c\n", *opt);
+                    smallclueGrepFreePatterns(patterns, patternCount);
+                    return 2;
+                }
+                if (*opt == 'e') {
+                    GREP_ADD_PATTERN(value);
+                } else if (*opt == 'm') {
+                    opts.maxCount = strtol(value, NULL, 10);
+                } else {
+                    if (!smallclueGrepLoadPatternFile(value, &patterns, &patternCount,
+                                                      &patternCap)) {
+                        smallclueGrepFreePatterns(patterns, patternCount);
+                        return 2;
+                    }
+                }
+                break; /* the rest of this token was the value */
             } else {
                 fprintf(stderr, "grep: unsupported option -%c\n", *opt);
+                smallclueGrepFreePatterns(patterns, patternCount);
                 return 1;
             }
         }
         index++;
     }
-    if (index >= argc) {
-        fprintf(stderr, "grep: missing pattern\n");
-        return 1;
+    /* A positional pattern is only expected when no -e/-f supplied one. */
+    if (patternCount == 0) {
+        if (index >= argc) {
+            fprintf(stderr, "grep: missing pattern\n");
+            return 1;
+        }
+        GREP_ADD_PATTERN(argv[index++]);
     }
-    const char *pattern = argv[index++];
+    #undef GREP_ADD_PATTERN
 
-    /* -F means the pattern is literal. Rather than carry a second matcher
-       through every path above, quote the metacharacters and let the existing
-       regex engine do it: same result, and -w/-x/-o keep working unchanged. */
-    char *literal = NULL;
-    if (opts.fixedStrings) {
-        size_t n = strlen(pattern);
-        literal = (char *)malloc(n * 2 + 1);
-        if (!literal) {
+    /* Every pattern is normalised to ERE -- literal-quoted for -F, translated
+     * from BRE otherwise -- so several of them can simply be joined with '|'
+     * and compiled once, leaving the single-regex matcher below untouched. */
+    char *combined = NULL;
+    size_t combinedLen = 0;
+    for (size_t i = 0; i < patternCount; ++i) {
+        char *converted = opts.fixedStrings ? smallclueGrepQuoteLiteral(patterns[i])
+                        : (extendedRegex ? strdup(patterns[i])
+                                         : smallclueBreToEre(patterns[i]));
+        if (!converted) {
             fprintf(stderr, "grep: out of memory\n");
+            free(combined);
+            smallclueGrepFreePatterns(patterns, patternCount);
             return 2;
         }
-        char *w = literal;
-        for (const char *r = pattern; *r; ++r) {
-            if (strchr(".[]{}()*+?^$|\\", *r))
-                *w++ = '\\';
-            *w++ = *r;
+        size_t add = strlen(converted) + 4; /* "(" ")" "|" and the NUL */
+        char *grown = (char *) realloc(combined, combinedLen + add);
+        if (!grown) {
+            fprintf(stderr, "grep: out of memory\n");
+            free(converted);
+            free(combined);
+            smallclueGrepFreePatterns(patterns, patternCount);
+            return 2;
         }
-        *w = '\0';
-        pattern = literal;
+        combined = grown;
+        combinedLen += (size_t) snprintf(combined + combinedLen, add, "%s(%s)",
+                                         i ? "|" : "", converted);
+        free(converted);
     }
+    smallclueGrepFreePatterns(patterns, patternCount);
 
     regex_t re;
-    int reFlags = (extendedRegex ? REG_EXTENDED : 0) | (ignoreCase ? REG_ICASE : 0);
-    int rc = regcomp(&re, pattern, reFlags);
+    int reFlags = REG_EXTENDED | (ignoreCase ? REG_ICASE : 0);
+    int rc = regcomp(&re, combined, reFlags);
     if (rc != 0) {
         char errbuf[256];
         regerror(rc, &re, errbuf, sizeof(errbuf));
-        fprintf(stderr, "grep: invalid pattern '%s': %s\n", pattern, errbuf);
+        fprintf(stderr, "grep: invalid pattern '%s': %s\n", combined, errbuf);
+        free(combined);
         return 2;
     }
+    char *literal = combined; /* freed with the same name the old code used */
 
     /* Same precedence as smallclueLsCommand, and here it matches GNU grep
      * exactly (measured on 3.11): --color=auto goes quiet under NO_COLOR=1 and
@@ -23022,6 +23374,8 @@ typedef struct {
     int summarize_only;
     int use_kilobytes;
     int human_readable;
+    int apparent_size;  /* --apparent-size: st_size, not allocated blocks */
+    int raw_bytes;      /* --bytes/-b: report bytes, unrounded */
     int max_depth;      /* -1 = unlimited */
     int grand_total;    /* -c */
     int one_filesystem; /* -x */
@@ -23048,6 +23402,10 @@ static void smallclueDuPrintSize(long long bytes,
     }
 
     long long value = bytes;
+    if (opts && opts->raw_bytes) {
+        printf("%lld\t%s\n", value, path);
+        return;
+    }
     if (opts && opts->use_kilobytes) {
         if (value >= 0) {
             value = (value + 1023) / 1024;
@@ -23055,12 +23413,15 @@ static void smallclueDuPrintSize(long long bytes,
             value = -(((-value) + 1023) / 1024);
         }
     } else {
-        /* POSIX/real du's actual default unit is 512-byte blocks, not
-         * raw bytes (matches `ls -s`'s own block-count column). */
+        /* GNU du reports 1K blocks by default -- `du -s` and `du -sk` give the
+         * same number, and only --block-size=512 gives the POSIX unit. This
+         * used to emit 512-byte blocks, so every size was exactly twice what
+         * the real du reports, which any script doing arithmetic on du output
+         * would have got wrong. */
         if (value >= 0) {
-            value = (value + 511) / 512;
+            value = (value + 1023) / 1024;
         } else {
-            value = -(((-value) + 511) / 512);
+            value = -(((-value) + 1023) / 1024);
         }
     }
     printf("%lld\t%s\n", value, path);
@@ -23079,7 +23440,11 @@ static long long smallclueDuVisit(const char *path,
     /* Real du measures actual disk usage (allocated 512-byte blocks),
      * not apparent file size -- st_size would badly undercount small
      * files on filesystems with block sizes larger than the file. */
-    long long total = (long long)st.st_blocks * 512;
+    /* --apparent-size (and so -b) asks for the file's own length instead of
+     * what it costs on disk; every other mode wants allocated blocks. */
+    long long total = (opts && opts->apparent_size)
+                          ? (long long) st.st_size
+                          : (long long) st.st_blocks * 512;
     if (S_ISDIR(st.st_mode)) {
         DIR *dir = opendir(path);
         if (!dir) {
@@ -23146,15 +23511,45 @@ static int smallclueDuCommand(int argc, char **argv) {
             opts.max_depth = atoi(argv[i] + 12);
             continue;
         }
+        if (strcmp(argv[i], "--bytes") == 0) {
+            opts.apparent_size = 1;
+            opts.raw_bytes = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--apparent-size") == 0) {
+            opts.apparent_size = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--summarize") == 0) {
+            opts.summarize_only = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--human-readable") == 0) {
+            opts.human_readable = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--total") == 0) {
+            opts.grand_total = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--one-file-system") == 0) {
+            opts.one_filesystem = 1;
+            continue;
+        }
         args[nargs++] = argv[i];
     }
 
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(nargs, args, "skhcxd:")) != -1) {
+    while ((opt = getopt(nargs, args, "skhcxbd:")) != -1) {
         switch (opt) {
             case 's':
                 opts.summarize_only = 1;
+                break;
+            case 'b':
+                /* GNU's -b is exactly --apparent-size --block-size=1. */
+                opts.apparent_size = 1;
+                opts.raw_bytes = 1;
                 break;
             case 'k':
                 opts.use_kilobytes = 1;
@@ -24361,6 +24756,8 @@ static int smallclueMkdirCommand(int argc, char **argv) {
                 parents = true;
             } else if (MKDIR_LONG("verbose")) {
                 verbose = true;
+            } else if (MKDIR_LONG("context") || MKDIR_LONG("Z")) {
+                /* No SELinux here; see -Z above. */
             } else if (MKDIR_LONG("help")) {
                 fputs(usage, stdout);
                 return 0;
@@ -24377,6 +24774,9 @@ static int smallclueMkdirCommand(int argc, char **argv) {
             switch (*p) {
                 case 'p': parents = true; break;
                 case 'v': verbose = true; break;
+                /* -Z asks for an SELinux context. This guest has no SELinux,
+                 * so there is nothing to label and nothing to fail at. */
+                case 'Z': break;
                 case 'm': {
                     const char *value;
                     if (p[1] != '\0') {
