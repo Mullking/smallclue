@@ -4163,10 +4163,128 @@ static int smallclueXargsRunOne(char **cmdArgv, int cmdArgc, bool verbose) {
 typedef struct {
     int pid;
     int ppid;
+    int pgid;
+    int sid;
+    long nice;
     uid_t uid;
     char state;
-    char *command;
+    char *comm;      /* the executable name alone, as -o comm wants */
+    char *command;   /* the full command line */
 } SmallcluePsEntry;
+
+/* -o names a column set. mariadbd-safe and the wsrep scripts both use it --
+ * `ps -o nice -p $$` and `ps -o 'pgid=' $$` -- and a trailing '=' replaces the
+ * header, with an empty one meaning "no header line at all", which is how the
+ * second of those gets a bare number to feed to grep. */
+typedef enum {
+    PS_COL_PID, PS_COL_PPID, PS_COL_PGID, PS_COL_SID, PS_COL_USER,
+    PS_COL_UID, PS_COL_COMM, PS_COL_ARGS, PS_COL_STATE, PS_COL_NICE
+} SmallcluePsColumnKind;
+
+typedef struct {
+    SmallcluePsColumnKind kind;
+    char header[32];
+    int minWidth;       /* ps pads to a per-field minimum, header or not */
+    bool headerGiven;   /* an explicit name=... was supplied */
+} SmallcluePsColumn;
+
+static void smallcluePsFormatCell(const SmallcluePsEntry *e, SmallcluePsColumnKind kind,
+                                  char *buf, size_t bufsize) {
+    switch (kind) {
+        case PS_COL_PID:   snprintf(buf, bufsize, "%d", e->pid); break;
+        case PS_COL_PPID:  snprintf(buf, bufsize, "%d", e->ppid); break;
+        case PS_COL_PGID:  snprintf(buf, bufsize, "%d", e->pgid); break;
+        case PS_COL_SID:   snprintf(buf, bufsize, "%d", e->sid); break;
+        case PS_COL_UID:   snprintf(buf, bufsize, "%d", (int) e->uid); break;
+        case PS_COL_NICE:  snprintf(buf, bufsize, "%ld", e->nice); break;
+        case PS_COL_STATE: snprintf(buf, bufsize, "%c", e->state); break;
+        case PS_COL_COMM:  snprintf(buf, bufsize, "%s", e->comm ? e->comm : "?"); break;
+        case PS_COL_ARGS:  snprintf(buf, bufsize, "%s", e->command ? e->command : "?"); break;
+        case PS_COL_USER: {
+            struct passwd *pw = getpwuid(e->uid);
+            if (pw) snprintf(buf, bufsize, "%s", pw->pw_name);
+            else snprintf(buf, bufsize, "%d", (int) e->uid);
+            break;
+        }
+    }
+}
+
+static bool smallcluePsParseColumn(const char *spec, SmallcluePsColumn *out);
+
+/* Splits a -o list on commas and appends each column, naming the first one it
+ * does not know exactly as ps does. */
+static bool smallcluePsAddColumns(const char *list, SmallcluePsColumn *columns,
+                                  size_t *count, size_t capacity) {
+    char *copy = strdup(list);
+    if (!copy) {
+        return false;
+    }
+    bool ok = true;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (*count >= capacity) {
+            break;
+        }
+        if (!smallcluePsParseColumn(tok, &columns[*count])) {
+            fprintf(stderr, "ps: unknown user-defined format specifier \"%s\"\n", tok);
+            ok = false;
+            break;
+        }
+        (*count)++;
+    }
+    free(copy);
+    return ok;
+}
+
+static bool smallcluePsParseColumn(const char *spec, SmallcluePsColumn *out) {
+    char name[64];
+    const char *eq = strchr(spec, '=');
+    size_t nameLen = eq ? (size_t) (eq - spec) : strlen(spec);
+    if (nameLen >= sizeof(name)) {
+        return false;
+    }
+    memcpy(name, spec, nameLen);
+    name[nameLen] = '\0';
+
+    /* The minimum widths are ps's own, measured against procps rather than
+     * guessed: `ps -o pgid= -p 1` pads to five even with the header blanked,
+     * which is the shape wsrep_sst_common uses. */
+    static const struct {
+        const char *name; SmallcluePsColumnKind kind; const char *header; int width;
+    } kKnown[] = {
+        { "pid",     PS_COL_PID,   "PID",     5 },
+        { "ppid",    PS_COL_PPID,  "PPID",    5 },
+        { "pgid",    PS_COL_PGID,  "PGID",    5 },
+        { "pgrp",    PS_COL_PGID,  "PGRP",    5 },
+        { "sid",     PS_COL_SID,   "SID",     5 },
+        { "sess",    PS_COL_SID,   "SESS",    5 },
+        { "session", PS_COL_SID,   "SESS",    5 },
+        { "user",    PS_COL_USER,  "USER",    4 },
+        { "ruser",   PS_COL_USER,  "RUSER",   5 },
+        { "uid",     PS_COL_UID,   "UID",     5 },
+        { "comm",    PS_COL_COMM,  "COMMAND", 7 },
+        { "ucomm",   PS_COL_COMM,  "COMMAND", 7 },
+        { "cmd",     PS_COL_ARGS,  "CMD",     3 },
+        { "args",    PS_COL_ARGS,  "COMMAND", 7 },
+        { "command", PS_COL_ARGS,  "COMMAND", 7 },
+        { "stat",    PS_COL_STATE, "STAT",    4 },
+        { "state",   PS_COL_STATE, "S",       1 },
+        { "s",       PS_COL_STATE, "S",       1 },
+        { "nice",    PS_COL_NICE,  "NI",      3 },
+        { "ni",      PS_COL_NICE,  "NI",      3 },
+    };
+    for (size_t i = 0; i < sizeof(kKnown) / sizeof(kKnown[0]); ++i) {
+        if (strcmp(name, kKnown[i].name) == 0) {
+            out->kind = kKnown[i].kind;
+            out->minWidth = kKnown[i].width;
+            out->headerGiven = (eq != NULL);
+            snprintf(out->header, sizeof(out->header), "%s",
+                     eq ? eq + 1 : kKnown[i].header);
+            return true;
+        }
+    }
+    return false;
+}
 
 #if !defined(PSCAL_TARGET_IOS)
 static int smallcluePsCompare(const void *a, const void *b) {
@@ -4331,10 +4449,29 @@ static int smallcluePsCommand(int argc, char **argv) {
     size_t filterPidCount = 0;
     uid_t *filterUids = NULL;
     size_t filterUidCount = 0;
+    SmallcluePsColumn columns[16];
+    size_t columnCount = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg || !*arg) continue;
+        if (strcmp(arg, "-o") == 0 || strcmp(arg, "--format") == 0 ||
+            (strncmp(arg, "-o", 2) == 0 && arg[2] != '\0')) {
+            const char *list = (arg[2] != '\0' && arg[1] == 'o') ? arg + 2
+                             : (i + 1 < argc ? argv[++i] : NULL);
+            if (!list) {
+                fprintf(stderr, "ps: -o requires a format list\n");
+                free(filterPids); free(filterUids);
+                return 1;
+            }
+            if (!smallcluePsAddColumns(list, columns, &columnCount,
+                                       sizeof(columns) / sizeof(columns[0]))) {
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(arg, "-p") == 0 || strcmp(arg, "--pid") == 0) {
             if (i + 1 >= argc || !smallcluePsParsePidList(argv[i + 1], &filterPids, &filterPidCount)) {
                 fprintf(stderr, "ps: invalid or missing argument to -p\n");
@@ -4377,6 +4514,19 @@ static int smallcluePsCommand(int argc, char **argv) {
          * ps accepts both `ps -ef` and the BSD-legacy `ps aux` spelling,
          * and the latter is arguably the single most common invocation
          * in the wild. */
+        // A bare number is a PID, not a flag bundle. `ps -o 'pgid=' $$` is
+        // how wsrep_sst_common asks for its own process group, and parsing the
+        // pid as options rejected it with "unsupported option '1'". Digits and
+        // commas only, so `ps aux` is untouched.
+        if (arg[0] != '-' && strspn(arg, "0123456789,") == strlen(arg)) {
+            if (!smallcluePsParsePidList(arg, &filterPids, &filterPidCount)) {
+                fprintf(stderr, "ps: invalid process id '%s'\n", arg);
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
         const char *flags = (arg[0] == '-') ? arg + 1 : arg;
         bool recognized = (*flags != '\0');
         for (const char *fc = flags; recognized && *fc; ++fc) {
@@ -4390,6 +4540,26 @@ static int smallcluePsCommand(int argc, char **argv) {
                     break;
                 case 'u': case 'U':
                     break; /* user-oriented format -- USER column is always shown */
+                case 'o': {
+                    /* `ps -eo pid,comm` bundles the format flag with the
+                     * selection ones, so the list is whatever follows 'o' in
+                     * this token, or the next argument when nothing does. */
+                    const char *list = (fc[1] != '\0') ? fc + 1
+                                     : (i + 1 < argc ? argv[++i] : NULL);
+                    if (!list || !smallcluePsAddColumns(list, columns, &columnCount,
+                                                        sizeof(columns) / sizeof(columns[0]))) {
+                        if (list) {
+                            /* smallcluePsAddColumns already named the bad one. */
+                        } else {
+                            fprintf(stderr, "ps: -o requires a format list\n");
+                        }
+                        free(filterPids);
+                        free(filterUids);
+                        return 1;
+                    }
+                    fc = flags + strlen(flags) - 1; /* the rest was the list */
+                    break;
+                }
                 default:
                     recognized = false;
                     break;
@@ -4442,8 +4612,27 @@ static int smallcluePsCommand(int argc, char **argv) {
 
             int ppid = 0;
             char state_char = '?';
-            if (sscanf(rest, " %c %d", &state_char, &ppid) != 2) {
+            int pgid = 0, sid = 0;
+            long nice_value = 0;
+            /* The fields after the ")" are, in order: state, ppid, pgrp,
+             * session, tty_nr, tpgid, flags, then the fault and time counters,
+             * with priority at 16 and nice at 17 counting from state as 1. */
+            if (sscanf(rest, " %c %d %d %d", &state_char, &ppid, &pgid, &sid) != 4) {
                 ppid = 0;
+            }
+            {
+                const char *scan = rest;
+                int field = 0;
+                while (*scan && field < 17) {
+                    while (*scan == ' ') scan++;
+                    if (!*scan) break;
+                    field++;
+                    if (field == 17) {
+                        nice_value = strtol(scan, NULL, 10);
+                        break;
+                    }
+                    while (*scan && *scan != ' ') scan++;
+                }
             }
 
             struct stat st;
@@ -4495,8 +4684,12 @@ static int smallcluePsCommand(int argc, char **argv) {
                 }
                 entries[count].pid = pid;
                 entries[count].ppid = ppid;
+                entries[count].pgid = pgid;
+                entries[count].sid = sid;
+                entries[count].nice = nice_value;
                 entries[count].uid = uid;
                 entries[count].state = state_char;
+                entries[count].comm = strdup(comm_short ? comm_short : "?");
                 entries[count].command = command;
                 count++;
             }
@@ -4507,6 +4700,73 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
+        if (columnCount > 0) {
+            /* Columns are sized to their contents, and the header line is
+             * skipped entirely when every header was blanked with a bare '=',
+             * which is what `ps -o 'pgid=' $$` asks for.
+             *
+             * Cells are formatted on demand rather than cached: buffering them
+             * would need a fixed row bound, and a bound here would silently
+             * drop processes off the end of the listing. */
+            int widths[16];
+            bool anyHeader = false;
+            for (size_t c = 0; c < columnCount; ++c) {
+                if (columns[c].header[0] != '\0') anyHeader = true;
+                widths[c] = (int) strlen(columns[c].header);
+                if (columns[c].minWidth > widths[c])
+                    widths[c] = columns[c].minWidth;
+            }
+            char cell[PATH_MAX];
+            for (size_t i = 0; i < count; ++i) {
+                for (size_t c = 0; c < columnCount; ++c) {
+                    smallcluePsFormatCell(&entries[i], columns[c].kind, cell, sizeof cell);
+                    int len = (int) strlen(cell);
+                    if (len > widths[c]) widths[c] = len;
+                }
+            }
+            if (anyHeader) {
+                for (size_t c = 0; c < columnCount; ++c) {
+                    bool last = (c + 1 == columnCount);
+                    bool textCol = (columns[c].kind == PS_COL_COMM ||
+                                    columns[c].kind == PS_COL_ARGS ||
+                                    columns[c].kind == PS_COL_USER);
+                    /* Not a ternary format string: "%s" takes ONE argument
+                     * and the width would be eaten as the pointer, printing
+                     * "(null)" for every text header. */
+                    if (textCol) {
+                        if (last) fputs(columns[c].header, stdout);
+                        else printf("%-*s ", widths[c], columns[c].header);
+                    } else {
+                        printf("%*s%s", widths[c], columns[c].header, last ? "" : " ");
+                    }
+                }
+                putchar('\n');
+            }
+            for (size_t i = 0; i < count; ++i) {
+                for (size_t c = 0; c < columnCount; ++c) {
+                    bool last = (c + 1 == columnCount);
+                    bool textCol = (columns[c].kind == PS_COL_COMM ||
+                                    columns[c].kind == PS_COL_ARGS ||
+                                    columns[c].kind == PS_COL_USER);
+                    smallcluePsFormatCell(&entries[i], columns[c].kind, cell, sizeof cell);
+                    if (textCol) {
+                        if (last) fputs(cell, stdout);
+                        else printf("%-*s ", widths[c], cell);
+                    } else {
+                        printf("%*s%s", widths[c], cell, last ? "" : " ");
+                    }
+                }
+                putchar('\n');
+            }
+            for (size_t i = 0; i < count; ++i) {
+                free(entries[i].command);
+                free(entries[i].comm);
+            }
+            free(entries);
+            free(filterPids);
+            free(filterUids);
+            return 0;
+        }
         const char *header = fullFormat ? "  PID   PPID USER     S COMMAND" : "  PID   PPID USER     COMMAND";
         if (smallclueColourWanted()) {
             printf("\033[1m%s\033[0m\n", header);
@@ -4528,6 +4788,7 @@ static int smallcluePsCommand(int argc, char **argv) {
                 printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
             }
             free(entries[i].command);
+            free(entries[i].comm);
         }
         free(entries);
     } else {
