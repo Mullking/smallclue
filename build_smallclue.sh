@@ -154,18 +154,18 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
 
 /* exsh stubs removed: standalone builds use smallclue's built-in sh */
 
-/* core.c's applet table references these unconditionally (git/rsync entries
- * aren't ifdef-guarded), but their real implementations (src/git_app.c,
- * src/openrsync_app.c) need libgit2/the vendored openrsync tree, which this
- * script only builds when SMALLCLUE_WITH_LIBGIT2=1 / openrsync is fetched.
- * Weak so the real, strong definition (when those sources are compiled in
- * below) silently wins the link over this fallback. */
-__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    fprintf(stderr, "git: not built in this configuration (libgit2 unavailable)\n");
-    return 127;
-}
+/* core.c's applet table references smallclueRunRsync unconditionally (the
+ * rsync entry is not ifdef-guarded), but its real implementation
+ * (src/openrsync_app.c) needs the vendored openrsync tree, which this script
+ * does not build. Weak so a real, strong definition silently wins the link
+ * over this fallback.
+ *
+ * smallclueGitCommand used to be here too, and that was the bug: src/git_app.c
+ * was never in the source list below, so the weak stub was the ONLY definition
+ * and `git` said "libgit2 unavailable" in a build that had just spent minutes
+ * compiling libgit2 and linked it in. git_app.c carries its own fallback for
+ * the no-libgit2 case, so it is simply compiled unconditionally now and there
+ * is nothing here to be silently preferred over. */
 
 __attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
     (void)argc;
@@ -629,6 +629,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/expr_app.c \
     src/fmt_app.c \
     src/fold_app.c \
+    src/git_app.c \
     src/gzip_app.c \
     src/nl_app.c \
     src/nohup_app.c \
