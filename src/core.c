@@ -78,6 +78,13 @@
 #include <sys/klog.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#elif defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+// A native build wants the shadow lookups out of this group and nothing else:
+// klog and netlink are Linux kernel interfaces with no stand-in, while
+// <shadow.h> comes from deps/smallclue-shim and crypt() is already routed at
+// the shim's own implementation by kernel/native_libc.h -- so there is no
+// <crypt.h> to find and none needed.
+#include <shadow.h>
 #endif
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -2406,6 +2413,11 @@ typedef struct SmallclueAppletHelp {
     const char *usage;
 } SmallclueAppletHelp;
 
+// Defined below, next to sudo which was the only caller until su grew an
+// authentication path of its own.
+static void smallclueSecureMemzero(void *ptr, size_t len);
+static char *smallclueGetPass(const char *prompt);
+
 static int smallclueSuCommand(int argc, char **argv) {
     const char *usage = "usage: su [-] [username] [-c command]\n";
     const char *user = "root";
@@ -2451,10 +2463,46 @@ static int smallclueSuCommand(int argc, char **argv) {
         return 1;
     }
 
+    // Inherited from the caller and about to be handed to a shell running as
+    // somebody else, which is the oldest setuid hazard there is. sudo below
+    // does the same two lines for the same reason.
+    unsetenv("IFS");
+    setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
+
     uid_t current_uid = getuid();
     if (current_uid != 0 && current_uid != pw->pw_uid) {
-        fprintf(stderr, "su: permission denied (must be root)\n");
+        // Real root needs no password. Anyone else must prove they know the
+        // TARGET account's -- which is what su has always asked for, and what
+        // this could not do while it only tested getuid(): under a setuid-root
+        // install the real uid stays the caller's by design, so that test
+        // refused every unprivileged caller no matter what they knew.
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+        if (geteuid() != 0) {
+            fprintf(stderr, "su: permission denied (must be setuid root)\n");
+            return 1;
+        }
+        struct spwd *sp = getspnam(user);
+        // "*" and "!..." are not hashes and no password produces them, so a
+        // locked account is refused here rather than left to a comparison
+        // that would never match anyway -- the message is the difference.
+        if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '*' || sp->sp_pwdp[0] == '!') {
+            fprintf(stderr, "su: account %s is locked or has no password\n", user);
+            return 1;
+        }
+        char *pass = smallclueGetPass("Password: ");
+        if (!pass)
+            return 1;
+        char *encrypted = crypt(pass, sp->sp_pwdp);
+        smallclueSecureMemzero(pass, strlen(pass));
+        free(pass);
+        if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+            fprintf(stderr, "su: authentication failure\n");
+            return 1;
+        }
+#else
+        fprintf(stderr, "su: authentication not supported on this platform\n");
         return 1;
+#endif
     }
 
     if (initgroups(user, pw->pw_gid) != 0) {
@@ -2538,7 +2586,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
 
     if (getuid() != 0) {
         if (geteuid() == 0) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
             struct spwd *sp = getspnam("root");
             if (!sp || !sp->sp_pwdp || strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
                 fprintf(stderr, "sudo: root account locked or cannot read shadow\n");
@@ -2576,7 +2624,10 @@ static int smallclueSudoCommand(int argc, char **argv) {
     return (errno == ENOENT) ? 127 : 126;
 }
 
-#if defined(__linux__) || defined(linux) || defined(__linux)
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+// Plain POSIX termios -- tcgetattr, ~ECHO, tcsetattr -- which Darwin has
+// and the shim routes at the guest's terminal. It was gated on the OS
+// rather than on anything it actually uses.
 static char *smallclueGetPass(const char *prompt) {
     static char buf[128];
     struct termios old, new;
@@ -2880,7 +2931,7 @@ static bool smallclueScriptAvailable(void) {
 // needs lckpwdf/ulckpwdf and a crypt(3) that speaks $6$, none of which Darwin
 // has; until one of those is supplied it can only decline.
 static bool smallcluePasswdAvailable(void) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
     return true;
 #else
     return false;
