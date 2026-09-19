@@ -2938,7 +2938,10 @@ static int smallclueSudoCommand(int argc, char **argv) {
              * reason to let anybody through. Say which file is missing, since
              * the whole fix is one line in it. */
             fprintf(stderr, "sudo: no %s on this system, so nobody is authorised.\n", SUDOERS_PATH);
-            fprintf(stderr, "sudo: as root, create it with a line like:  %s ALL=(ALL:ALL) ALL\n", invoker);
+            fprintf(stderr, "sudo: as root, create it with one of:\n");
+            fprintf(stderr, "sudo:     %s ALL=(ALL:ALL) ALL             (asks for %s's own password)\n",
+                    invoker, invoker);
+            fprintf(stderr, "sudo:     %s ALL=(ALL:ALL) NOPASSWD: ALL   (never asks)\n", invoker);
             return 1;
         }
         if (list_only) {
