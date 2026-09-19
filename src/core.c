@@ -2571,11 +2571,274 @@ static void smallclueSecureMemzero(void *ptr, size_t len) {
 static char *smallclueGetPass(const char *prompt);
 #endif
 
-static int smallclueSudoCommand(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: sudo command [args...]\n");
-        return 1;
+/* --- /etc/sudoers -------------------------------------------------------
+ *
+ * A deliberate subset, restrictive wherever it does not understand something:
+ * a line using syntax not implemented here is SKIPPED, never taken as a match.
+ * Guessing at an unfamiliar rule in this particular file is how people end up
+ * with more access than the rule was written to give.
+ *
+ * Supported, which is the shape almost everyone actually writes:
+ *
+ *     root    ALL=(ALL:ALL) ALL
+ *     %wheel  ALL=(ALL:ALL) ALL
+ *     mke     ALL=(ALL) NOPASSWD: ALL
+ *     deploy  ALL=(root) /usr/bin/systemctl, /usr/bin/journalctl
+ *     #includedir /etc/sudoers.d
+ *
+ * Not supported and skipped: aliases (User_Alias and friends), negation (!),
+ * globs in command paths, and commands written with arguments. `Defaults` is
+ * ignored -- none of what it sets is implemented here, and honouring the name
+ * while ignoring the effect would be worse than not reading it at all.
+ *
+ * Last match wins, as real sudo does.
+ */
+#define SUDOERS_PATH "/etc/sudoers"
+#define SUDOERS_MAX_DEPTH 8
+
+static char *sudoersTrim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\n' || s[n - 1] == '\r'))
+        s[--n] = '\0';
+    return s;
+}
+
+static bool sudoersUserInGroup(const struct passwd *pw, const char *group) {
+    struct group *gr = getgrnam(group);
+    if (!gr)
+        return false;
+    if (gr->gr_gid == pw->pw_gid)
+        return true;
+    for (char **m = gr->gr_mem; m && *m; m++)
+        if (strcmp(*m, pw->pw_name) == 0)
+            return true;
+    return false;
+}
+
+/* The left-hand "who" field: a login name, or %group, or a comma list of them. */
+static bool sudoersWhoMatches(const char *field, const struct passwd *pw) {
+    char buf[512];
+    if (strlen(field) >= sizeof(buf))
+        return false;
+    snprintf(buf, sizeof(buf), "%s", field);
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *t = sudoersTrim(tok);
+        if (*t == '\0')
+            continue;
+        if (*t == '%') {
+            if (sudoersUserInGroup(pw, t + 1))
+                return true;
+        } else if (strcmp(t, "ALL") == 0 || strcmp(t, pw->pw_name) == 0) {
+            return true;
+        }
     }
+    return false;
+}
+
+static bool sudoersHostMatches(const char *field) {
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0)
+        host[0] = '\0';
+    host[sizeof(host) - 1] = '\0';
+    char buf[512];
+    if (strlen(field) >= sizeof(buf))
+        return false;
+    snprintf(buf, sizeof(buf), "%s", field);
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *t = sudoersTrim(tok);
+        if (strcmp(t, "ALL") == 0 || (host[0] != '\0' && strcmp(t, host) == 0))
+            return true;
+    }
+    return false;
+}
+
+/* "(ALL)", "(ALL:ALL)", "(root)", "(root:wheel)" -- only the user half decides
+ * who may be become; the group half is accepted and not otherwise used. */
+static bool sudoersRunasAllows(const char *spec, const char *target_user) {
+    char buf[512];
+    if (strlen(spec) >= sizeof(buf))
+        return false;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char *colon = strchr(buf, ':');
+    if (colon)
+        *colon = '\0';
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *t = sudoersTrim(tok);
+        if (strcmp(t, "ALL") == 0 || strcmp(t, target_user) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* "ALL", or a comma list of absolute paths. An entry carrying arguments is not
+ * understood here, so it matches nothing rather than matching the program. */
+static bool sudoersCmndAllows(const char *spec, const char *cmd_path) {
+    char buf[2048];
+    if (strlen(spec) >= sizeof(buf))
+        return false;
+    /* Compared canonically, because /bin is a symlink to /usr/bin on a merged
+     * -usr system: `/bin/cat` in sudoers and the `/usr/bin/cat` that PATH
+     * resolves to are one file, and a literal compare says they are not. */
+    char cmd_real[PATH_MAX];
+    const char *cmd_cmp = cmd_path;
+    if (cmd_path && realpath(cmd_path, cmd_real) != NULL)
+        cmd_cmp = cmd_real;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *t = sudoersTrim(tok);
+        if (strcmp(t, "ALL") == 0)
+            return true;
+        if (*t != '/' || strpbrk(t, " \t*?[") != NULL)
+            continue;
+        if (!cmd_path)
+            continue;
+        if (strcmp(t, cmd_path) == 0)
+            return true;
+        char entry_real[PATH_MAX];
+        if (cmd_cmp && realpath(t, entry_real) != NULL && strcmp(entry_real, cmd_cmp) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool sudoersScan(const char *path, const struct passwd *pw, const char *target,
+                        const char *cmd_path, bool *allowed, bool *nopasswd, int depth);
+
+static void sudoersScanDir(const char *dir, const struct passwd *pw, const char *target,
+                           const char *cmd_path, bool *allowed, bool *nopasswd, int depth) {
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    /* Sorted, because "last match wins" is only meaningful in a fixed order and
+     * readdir's is not one. */
+    char names[64][256];
+    size_t count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && count < 64) {
+        const char *n = de->d_name;
+        if (n[0] == '.' || strchr(n, '~') != NULL || strchr(n, '.') != NULL)
+            continue;  /* real sudo skips these too */
+        snprintf(names[count], sizeof(names[0]), "%s", n);
+        count++;
+    }
+    closedir(d);
+    for (size_t i = 0; i + 1 < count; i++)
+        for (size_t j = i + 1; j < count; j++)
+            if (strcmp(names[j], names[i]) < 0) {
+                char tmp[256];
+                memcpy(tmp, names[i], sizeof(tmp));
+                memcpy(names[i], names[j], sizeof(tmp));
+                memcpy(names[j], tmp, sizeof(tmp));
+            }
+    for (size_t i = 0; i < count; i++) {
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s/%s", dir, names[i]) >= (int) sizeof(full))
+            continue;
+        sudoersScan(full, pw, target, cmd_path, allowed, nopasswd, depth + 1);
+    }
+}
+
+/* Returns false when the file could not be read at all, which the caller turns
+ * into "there is no policy here" rather than "you are not allowed". */
+static bool sudoersScan(const char *path, const struct passwd *pw, const char *target,
+                        const char *cmd_path, bool *allowed, bool *nopasswd, int depth) {
+    if (depth > SUDOERS_MAX_DEPTH)
+        return false;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    char line[4096];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = sudoersTrim(line);
+        if (strncmp(p, "#includedir", 11) == 0) {
+            char *dir = sudoersTrim(p + 11);
+            if (*dir != '\0')
+                sudoersScanDir(dir, pw, target, cmd_path, allowed, nopasswd, depth);
+            continue;
+        }
+        if (strncmp(p, "#include", 8) == 0) {
+            char *inc = sudoersTrim(p + 8);
+            if (*inc != '\0')
+                sudoersScan(inc, pw, target, cmd_path, allowed, nopasswd, depth + 1);
+            continue;
+        }
+        if (*p == '#' || *p == '\0')
+            continue;
+        if (strncmp(p, "Defaults", 8) == 0)
+            continue;
+        if (strstr(p, "_Alias") != NULL)
+            continue;             /* aliases are not implemented; do not guess */
+        if (strchr(p, '!') != NULL)
+            continue;             /* negation is not implemented; do not guess */
+
+        /* who <host>=[(runas)] [TAGS:] cmnds */
+        char *sp = p;
+        while (*sp && *sp != ' ' && *sp != '\t') sp++;
+        if (*sp == '\0')
+            continue;
+        *sp = '\0';
+        char *who = p;
+        char *rest = sudoersTrim(sp + 1);
+        char *eq = strchr(rest, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *host = sudoersTrim(rest);
+        char *after = sudoersTrim(eq + 1);
+
+        const char *runas = "root";
+        char runas_buf[512];
+        if (*after == '(') {
+            char *close = strchr(after, ')');
+            if (!close)
+                continue;
+            *close = '\0';
+            snprintf(runas_buf, sizeof(runas_buf), "%s", after + 1);
+            runas = runas_buf;
+            after = sudoersTrim(close + 1);
+        }
+
+        bool entry_nopasswd = false;
+        while (true) {
+            if (strncasecmp(after, "NOPASSWD:", 9) == 0) {
+                entry_nopasswd = true;
+                after = sudoersTrim(after + 9);
+            } else if (strncasecmp(after, "PASSWD:", 7) == 0) {
+                entry_nopasswd = false;
+                after = sudoersTrim(after + 7);
+            } else if (strncasecmp(after, "SETENV:", 7) == 0) {
+                after = sudoersTrim(after + 7);
+            } else if (strncasecmp(after, "NOSETENV:", 9) == 0) {
+                after = sudoersTrim(after + 9);
+            } else if (strncasecmp(after, "NOEXEC:", 7) == 0 ||
+                       strncasecmp(after, "EXEC:", 5) == 0) {
+                after = sudoersTrim(after + (after[0] == 'N' || after[0] == 'n' ? 7 : 5));
+            } else {
+                break;
+            }
+        }
+
+        if (!sudoersWhoMatches(who, pw) || !sudoersHostMatches(host))
+            continue;
+        if (!sudoersRunasAllows(runas, target))
+            continue;
+        if (!sudoersCmndAllows(after, cmd_path))
+            continue;
+
+        *allowed = true;          /* last match wins, so keep going */
+        *nopasswd = entry_nopasswd;
+    }
+    fclose(f);
+    return true;
+}
+
+static int smallclueSudoCommand(int argc, char **argv) {
+    const char *usage = "usage: sudo [-u user] [-n] [--] command [args...]\n"
+                        "       sudo -l\n";
+    const char *target = "root";
+    bool non_interactive = false;
+    bool list_only = false;
 
     /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
     unsetenv("LD_PRELOAD");
@@ -2584,16 +2847,115 @@ static int smallclueSudoCommand(int argc, char **argv) {
     unsetenv("IFS");
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
 
-    if (getuid() != 0) {
-        if (geteuid() == 0) {
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--") == 0) { i++; break; }
+        if (a[0] != '-' || a[1] == '\0') break;
+        if (strcmp(a, "-u") == 0) {
+            if (i + 1 >= argc) { fputs(usage, stderr); return 1; }
+            target = argv[++i];
+        } else if (strncmp(a, "-u", 2) == 0) {
+            target = a + 2;
+        } else if (strcmp(a, "-n") == 0) {
+            non_interactive = true;
+        } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
+            list_only = true;
+        } else if (strcmp(a, "-k") == 0 || strcmp(a, "-K") == 0 ||
+                   strcmp(a, "-H") == 0 || strcmp(a, "-E") == 0 || strcmp(a, "-S") == 0) {
+            /* Accepted and without effect: there is no credential cache to
+             * clear, and the environment is handled the same way regardless.
+             * Taking them silently beats failing a command line that works
+             * everywhere else. */
+        } else {
+            fprintf(stderr, "sudo: unsupported option %s\n", a);
+            fputs(usage, stderr);
+            return 1;
+        }
+    }
+    if (!list_only && i >= argc) {
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    char resolved_exec[PATH_MAX];
+    const char *exec_path = list_only ? NULL : argv[i];
+    if (!list_only && smallclueResolveCommandPathForExec(argv[i], resolved_exec, sizeof(resolved_exec)))
+        exec_path = resolved_exec;
+
+    struct passwd *tpw = getpwnam(target);
+    if (!tpw) {
+        fprintf(stderr, "sudo: unknown user: %s\n", target);
+        return 1;
+    }
+
+    uid_t ruid = getuid();
+    gid_t rgid = getgid();
+    struct passwd *ipw = getpwuid(ruid);
+    const char *invoker = ipw ? ipw->pw_name : "";
+
+    /* Real root is not subject to the policy: there is nothing left to
+     * authorise, and a root that cannot sudo cannot fix a broken sudoers. */
+    if (ruid != 0) {
+        if (!ipw) {
+            fprintf(stderr, "sudo: uid %u has no passwd entry\n", (unsigned) ruid);
+            return 1;
+        }
+        if (geteuid() != 0) {
+            fprintf(stderr, "sudo: permission denied (must be setuid root)\n");
+            return 1;
+        }
+
+        bool allowed = false;
+        bool nopasswd = false;
+        bool have_policy = sudoersScan(SUDOERS_PATH, ipw, target,
+                                       exec_path, &allowed, &nopasswd, 0);
+        if (!have_policy) {
+            /* No policy is not the same as an empty one, and neither is a
+             * reason to let anybody through. Say which file is missing, since
+             * the whole fix is one line in it. */
+            fprintf(stderr, "sudo: no %s on this system, so nobody is authorised.\n", SUDOERS_PATH);
+            fprintf(stderr, "sudo: as root, create it with a line like:  %s ALL=(ALL:ALL) ALL\n", invoker);
+            return 1;
+        }
+        if (list_only) {
+            if (allowed)
+                printf("User %s may run commands as %s on this host%s.\n",
+                       invoker, target, nopasswd ? " without a password" : "");
+            else
+                printf("User %s is not allowed to run commands as %s on this host.\n",
+                       invoker, target);
+            return allowed ? 0 : 1;
+        }
+        if (!allowed) {
+            fprintf(stderr, "sudo: %s is not allowed to run '%s' as %s on this host.\n",
+                    invoker, argv[i], target);
+            fprintf(stderr, "sudo: this incident is between you and %s.\n", SUDOERS_PATH);
+            return 1;
+        }
+
+        if (!nopasswd) {
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
-            struct spwd *sp = getspnam("root");
-            if (!sp || !sp->sp_pwdp || strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
-                fprintf(stderr, "sudo: root account locked or cannot read shadow\n");
+            if (non_interactive) {
+                fprintf(stderr, "sudo: a password is required\n");
                 return 1;
             }
-            char *pass = smallclueGetPass("[sudo] password for root: ");
-            if (!pass) return 1;
+            /* THE invoking user's password, not the target's. sudo asks you to
+             * prove you are you; su asks you to prove you are them. This asked
+             * for root's, which is su's question wearing sudo's name -- and it
+             * meant anyone who knew the root password was effectively in the
+             * sudoers file whether or not they were in it. */
+            struct spwd *sp = getspnam(invoker);
+            if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '\0' ||
+                strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
+                fprintf(stderr, "sudo: account %s has no password set, so it cannot authenticate\n", invoker);
+                return 1;
+            }
+            char prompt[160];
+            snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", invoker);
+            char *pass = smallclueGetPass(prompt);
+            if (!pass)
+                return 1;
             char *encrypted = crypt(pass, sp->sp_pwdp);
             smallclueSecureMemzero(pass, strlen(pass));
             free(pass);
@@ -2606,21 +2968,37 @@ static int smallclueSudoCommand(int argc, char **argv) {
             return 1;
 #endif
         }
-
-        if (setuid(0) != 0 || setgid(0) != 0) {
-             fprintf(stderr, "sudo: permission denied (must be setuid root)\n");
-             return 1;
-        }
+    } else if (list_only) {
+        printf("User root may run commands as %s on this host.\n", target);
+        return 0;
     }
 
-    char resolved_exec[PATH_MAX];
-    const char *exec_path = argv[1];
-    if (smallclueResolveCommandPathForExec(argv[1], resolved_exec, sizeof(resolved_exec))) {
-        exec_path = resolved_exec;
+    /* Group first, then supplementary groups, then uid -- once setuid() has
+     * dropped the euid there is no privilege left to set the others with. */
+    if (setgid(tpw->pw_gid) != 0) {
+        fprintf(stderr, "sudo: setgid: %s\n", strerror(errno));
+        return 1;
     }
-    execv(exec_path, &argv[1]);
-    execvp(argv[1], &argv[1]);
-    fprintf(stderr, "sudo: %s: %s\n", argv[1], strerror(errno));
+#if !defined(__APPLE__) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+    (void) initgroups(tpw->pw_name, tpw->pw_gid);
+#endif
+    if (setuid(tpw->pw_uid) != 0) {
+        fprintf(stderr, "sudo: setuid: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (ipw) {
+        char num[32];
+        setenv("SUDO_USER", ipw->pw_name, 1);
+        snprintf(num, sizeof(num), "%u", (unsigned) ruid);
+        setenv("SUDO_UID", num, 1);
+        snprintf(num, sizeof(num), "%u", (unsigned) rgid);
+        setenv("SUDO_GID", num, 1);
+    }
+
+    execv(exec_path, &argv[i]);
+    execvp(argv[i], &argv[i]);
+    fprintf(stderr, "sudo: %s: %s\n", argv[i], strerror(errno));
     return (errno == ENOENT) ? 127 : 126;
 }
 
