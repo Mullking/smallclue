@@ -13130,6 +13130,26 @@ int smallclueGitCommand(int argc, char **argv) {
         return smallclueGitPrintUsage();
     }
 
+    /* Answered before anything else, and in particular before the repository
+     * lookup: it is the one question git has an answer to from outside a
+     * repository, and it used to fall through to "not a git repository: could
+     * not find repository at '/'" -- which reads like the applet is broken.
+     * `git version` is the same question spelled as a subcommand, which real
+     * git accepts too.
+     *
+     * The number is LIBGIT2's, not an upstream git release. This is a subset
+     * of git built on libgit2, so quoting an upstream version would be a claim
+     * about features that are not here; and anything parsing field 3 to decide
+     * what it may use gets a number low enough to stay conservative, which is
+     * the right direction for that guess to be wrong in. */
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0 ||
+        strcmp(argv[1], "version") == 0) {
+        int major = 0, minor = 0, rev = 0;
+        git_libgit2_version(&major, &minor, &rev);
+        printf("git version %d.%d.%d (smallclue, libgit2)\n", major, minor, rev);
+        return 0;
+    }
+
     SmallclueGitGlobalOptions opts;
     int subcmd_index = 1;
     if (smallclueGitParseGlobalOptions(argc, argv, &opts, &subcmd_index) != 0) {
