@@ -2883,21 +2883,44 @@ static int smallclueSudoCommand(int argc, char **argv) {
     if (!list_only && smallclueResolveCommandPathForExec(argv[i], resolved_exec, sizeof(resolved_exec)))
         exec_path = resolved_exec;
 
-    struct passwd *tpw = getpwnam(target);
-    if (!tpw) {
+    /* COPIED OUT, every one of them. getpwnam and getpwuid share one static
+     * struct -- POSIX says the result is valid only until the next call, and
+     * SmallCLUE's own nlibc keeps a single thread-local entry, so the second
+     * lookup rewrites the first one's answer THROUGH THE POINTER THE CALLER IS
+     * STILL HOLDING. Left as pointers, `sudo su -` looked up root, then looked
+     * up the invoker, and then "became root" using the invoker's own uid: a
+     * silent no-op, after which su asked for root's password because it was
+     * still running as the caller. */
+    struct passwd *lookup = getpwnam(target);
+    if (!lookup) {
         fprintf(stderr, "sudo: unknown user: %s\n", target);
         return 1;
     }
+    uid_t target_uid = lookup->pw_uid;
+    gid_t target_gid = lookup->pw_gid;
+    char target_name[256];
+    snprintf(target_name, sizeof(target_name), "%s", lookup->pw_name);
 
     uid_t ruid = getuid();
     gid_t rgid = getgid();
-    struct passwd *ipw = getpwuid(ruid);
-    const char *invoker = ipw ? ipw->pw_name : "";
+    lookup = getpwuid(ruid);
+    struct passwd invoker_pw;
+    char invoker_name[256];
+    bool have_invoker = false;
+    if (lookup != NULL) {
+        invoker_pw = *lookup;
+        snprintf(invoker_name, sizeof(invoker_name), "%s", lookup->pw_name);
+        invoker_pw.pw_name = invoker_name;
+        have_invoker = true;
+    } else {
+        invoker_name[0] = '\0';
+    }
+    const char *invoker = invoker_name;
 
     /* Real root is not subject to the policy: there is nothing left to
      * authorise, and a root that cannot sudo cannot fix a broken sudoers. */
     if (ruid != 0) {
-        if (!ipw) {
+        if (!have_invoker) {
             fprintf(stderr, "sudo: uid %u has no passwd entry\n", (unsigned) ruid);
             return 1;
         }
@@ -2908,7 +2931,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
 
         bool allowed = false;
         bool nopasswd = false;
-        bool have_policy = sudoersScan(SUDOERS_PATH, ipw, target,
+        bool have_policy = sudoersScan(SUDOERS_PATH, &invoker_pw, target_name,
                                        exec_path, &allowed, &nopasswd, 0);
         if (!have_policy) {
             /* No policy is not the same as an empty one, and neither is a
@@ -2975,21 +2998,21 @@ static int smallclueSudoCommand(int argc, char **argv) {
 
     /* Group first, then supplementary groups, then uid -- once setuid() has
      * dropped the euid there is no privilege left to set the others with. */
-    if (setgid(tpw->pw_gid) != 0) {
+    if (setgid(target_gid) != 0) {
         fprintf(stderr, "sudo: setgid: %s\n", strerror(errno));
         return 1;
     }
 #if !defined(__APPLE__) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
-    (void) initgroups(tpw->pw_name, tpw->pw_gid);
+    (void) initgroups(target_name, target_gid);
 #endif
-    if (setuid(tpw->pw_uid) != 0) {
+    if (setuid(target_uid) != 0) {
         fprintf(stderr, "sudo: setuid: %s\n", strerror(errno));
         return 1;
     }
 
-    if (ipw) {
+    if (have_invoker) {
         char num[32];
-        setenv("SUDO_USER", ipw->pw_name, 1);
+        setenv("SUDO_USER", invoker_name, 1);
         snprintf(num, sizeof(num), "%u", (unsigned) ruid);
         setenv("SUDO_UID", num, 1);
         snprintf(num, sizeof(num), "%u", (unsigned) rgid);
