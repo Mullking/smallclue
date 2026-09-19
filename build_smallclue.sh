@@ -173,6 +173,10 @@ __attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
     fprintf(stderr, "rsync: real-protocol client not built in this configuration (openrsync unavailable)\n");
     return 127;
 }
+/* Still weak, and still needed: SMALLCLUE_WITH_OPENRSYNC=0 leaves
+ * src/openrsync_app.c out of the link, and core.c's applet table references
+ * this unconditionally. With openrsync built, openrsync_app.c's strong
+ * definition wins. */
 EOF
 
 # 3. Compile smallclue
@@ -219,7 +223,11 @@ if [ "$(uname -s)" = "Linux" ]; then
     # back ("undefined reference to SSL_connect" etc). Re-listing both here,
     # after LIBGIT2_LIBS, resolves it the same way CMakeLists.txt's own
     # libgit2 target_link_libraries ordering already does.
-    EXTRA_TAIL_LIBS="-lm -lcrypt -lssl -lcrypto"
+    #
+    # -lz for openrsync's zcompress.c (deflate/inflate); libgit2 is built with
+    # USE_COMPRESSION=builtin so it does not bring one, and the same
+    # left-to-right rule applies -- it has to sit after the openrsync objects.
+    EXTRA_TAIL_LIBS="-lm -lcrypt -lssl -lcrypto -lz"
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
@@ -527,6 +535,57 @@ EOF
     DVTM_EXTRA_DEFS="-DSMALLCLUE_WITH_DVTM"
 fi
 
+# openrsync: the real rsync protocol, compiled straight into smallclue rather
+# than shelled out to. CMakeLists.txt has built it for a while; this script
+# never did, so `rsync` was the weak stub -- the same shape as git, and unlike
+# git this one was telling the truth.
+#
+# Compiled as objects with their own flags, the way dvtm and OpenSSH are,
+# because the renames below are per-file and the final link is one gcc call.
+# The rename set is copied from CMakeLists.txt and has to stay in step with
+# it: openrsync is a BSD program, so err/warn/exit/getprogname are the libc
+# ones it expects and src/openrsync_app.c supplies replacements that report
+# through smallclue and longjmp instead of exiting the whole process.
+SMALLCLUE_WITH_OPENRSYNC="${SMALLCLUE_WITH_OPENRSYNC:-1}"
+OPENRSYNC_OBJS=""
+OPENRSYNC_SRC=""
+if [ "$SMALLCLUE_WITH_OPENRSYNC" = "1" ]; then
+    OPENRSYNC_DIR="third-party/openrsync"
+    OPENRSYNC_BUILD_DIR="${OPENRSYNC_DIR}/.pscal-build"
+    if [ ! -d "$OPENRSYNC_DIR" ] || [ ! -f "$OPENRSYNC_DIR/config_pscal.h" ] || [ ! -f "$OPENRSYNC_DIR/main.c" ]; then
+        echo "Error: openrsync source tree is missing required files."
+        echo "Run ./fetch_dependencies.sh and retry."
+        exit 1
+    fi
+    echo "Building openrsync applet support..."
+    mkdir -p "$OPENRSYNC_BUILD_DIR/generated"
+    # config_pscal.h IS the config.h openrsync includes -- copied rather than
+    # generated, exactly as CMake's configure_file(COPYONLY) does.
+    cp "$OPENRSYNC_DIR/config_pscal.h" "$OPENRSYNC_BUILD_DIR/generated/config.h"
+
+    OPENRSYNC_RENAMES="-Derr=pscal_openrsync_err -Derrc=pscal_openrsync_errc \
+        -Derrx=pscal_openrsync_errx -Dwarn=pscal_openrsync_warn \
+        -Dwarnc=pscal_openrsync_warnc -Dwarnx=pscal_openrsync_warnx \
+        -Dexit=pscal_openrsync_request_exit \
+        -Dgetprogname=pscal_openrsync_getprogname \
+        -Dmain=pscal_openrsync_main -Dfreeargs=pscal_openrsync_freeargs \
+        -Dscan_scaled=pscal_openrsync_scan_scaled \
+        -Daddargs=pscal_openrsync_addargs \
+        -Dfmt_scaled=pscal_openrsync_fmt_scaled"
+
+    for rsync_src in blocks client compats copy downloader fargs flist hash \
+                     ids io log main md4 misc mkpath mktemp receiver rmatch \
+                     rules sender server session socket symlinks uploader \
+                     zcompress; do
+        gcc -std=c99 ${PORTABILITY_DEFS} ${EXTRA_C_DEFS} ${OPENRSYNC_RENAMES} \
+            -I"$OPENRSYNC_BUILD_DIR/generated" -I"$OPENRSYNC_DIR" -Icompat -Isrc \
+            -c "$OPENRSYNC_DIR/$rsync_src.c" -o "$OPENRSYNC_BUILD_DIR/$rsync_src.o" \
+            || { echo "Error: failed to compile openrsync/$rsync_src.c"; exit 1; }
+        OPENRSYNC_OBJS="$OPENRSYNC_OBJS $OPENRSYNC_BUILD_DIR/$rsync_src.o"
+    done
+    OPENRSYNC_SRC="src/openrsync_app.c"
+fi
+
 if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
     LIBGIT2_DIR="third-party/libgit2"
     LIBGIT2_BUILD_DIR="${LIBGIT2_DIR}/.pscal-build"
@@ -630,6 +689,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/fmt_app.c \
     src/fold_app.c \
     src/git_app.c \
+    ${OPENRSYNC_SRC} \
     src/gzip_app.c \
     src/nl_app.c \
     src/nohup_app.c \
@@ -643,6 +703,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/split_app.c \
     src/tac_app.c \
     src/tar_app.c \
+    ${OPENRSYNC_OBJS} \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
     ${LIBGIT2_LIBS} \
