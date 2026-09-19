@@ -772,6 +772,18 @@ ShellToken shellNextToken(ShellLexer *lexer) {
             ShellToken tok = makeSimpleToken(lexer, SHELL_TOKEN_NEWLINE, "\n", 1);
             return tok;
         }
+        /* A line continuation BETWEEN tokens is not a token: splice the lines
+         * and carry on.  Leaving it to scanWord instead started a word on the
+         * backslash, consumed the newline and then stopped on the next line's
+         * indent -- producing an EMPTY word.  Harmless nearly everywhere, but
+         * a case pattern list took that empty word for a pattern and then
+         * reported "Expected ')' after case pattern" on the real one, which is
+         * what /AOK/tools/native-links.sh hit. */
+        if (c == '\\' && lexer->pos + 1 < lexer->length && lexer->src[lexer->pos + 1] == '\n') {
+            advanceChar(lexer);
+            advanceChar(lexer);
+            continue;
+        }
         if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') {
             advanceChar(lexer);
             continue;
