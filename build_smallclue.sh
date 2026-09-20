@@ -259,6 +259,25 @@ if [ -d "$OPENSSH_DIR" ]; then
     fi
 
     echo "Configuring OpenSSH..."
+    # config.h in this OpenSSH tree is a COMMITTED, hand-maintained source file,
+    # not a configure artefact: one file serves the macOS build and the iOS app,
+    # and it carries decisions configure cannot make here (the Darwin-guarded
+    # block, our own readpassphrase, HAVE_DECL_HTOBE32). Everything below treats
+    # it as generated -- `make distclean` deletes it, the purge path rm -f's it
+    # by name, and ./configure overwrites it -- so each of those silently threw
+    # the AOK edits away and the next build compiled against whatever configure
+    # happened to detect. Keep a copy and put it back afterwards.
+    #
+    # Gated on the file being tracked, so a plain upstream checkout (where
+    # config.h really is generated) is left exactly as it was.
+    OPENSSH_CONFIG_H_KEEP=""
+    if [ -f "$OPENSSH_DIR/config.h" ] && \
+       git -C "$OPENSSH_DIR" ls-files --error-unmatch config.h >/dev/null 2>&1; then
+        OPENSSH_CONFIG_H_KEEP="$(mktemp -t openssh-config-h)"
+        cp "$OPENSSH_DIR/config.h" "$OPENSSH_CONFIG_H_KEEP"
+        echo "Preserving the committed OpenSSH config.h across configure"
+    fi
+
     if [ -f "$OPENSSH_DIR/Makefile" ]; then
         NEED_RECONF=0
         if [ "$(uname -s)" = "Linux" ] && ! grep -q "\-static" "$OPENSSH_DIR/Makefile"; then
@@ -377,6 +396,18 @@ if [ -d "$OPENSSH_DIR" ]; then
             echo "Try re-running: ./fetch_dependencies.sh"
             exit 1
         fi
+    fi
+
+    # Put the committed config.h back. configure has written its own by now (and
+    # distclean may have deleted ours first); the Makefile it generated is what
+    # we wanted from it, not its idea of this platform's config.
+    if [ -n "${OPENSSH_CONFIG_H_KEEP:-}" ] && [ -f "$OPENSSH_CONFIG_H_KEEP" ]; then
+        if ! cmp -s "$OPENSSH_CONFIG_H_KEEP" "$OPENSSH_DIR/config.h"; then
+            cp "$OPENSSH_CONFIG_H_KEEP" "$OPENSSH_DIR/config.h"
+            echo "Restored the committed OpenSSH config.h over configure's"
+        fi
+        rm -f "$OPENSSH_CONFIG_H_KEEP"
+        OPENSSH_CONFIG_H_KEEP=""
     fi
 
     echo "Patching OpenSSH..."

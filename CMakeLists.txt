@@ -174,6 +174,11 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/nextvi
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/openbsd-compat
+    # OpenSSH 10.5 includes <sys/tree.h> and <endian.h> directly, which Darwin
+    # does not have. Upstream's configure generates forwarding/empty shims into
+    # this directory and puts it on CPPFLAGS; the AOK tree commits them instead,
+    # because it is built from a hand-maintained config.h rather than configured.
+    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/openbsd-compat/include
 )
 
 # openrsync lives in PSCAL's third-party tree when smallclue is the
