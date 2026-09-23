@@ -379,10 +379,12 @@ struct sshkey {
 EOF
 
 # 2. Create extra stubs
+# Thread-local to match the openssh fork's `extern __thread` declarations; see
+# the matching generator in CMakeLists.txt for why the two have to agree.
 cat > src/openssh_globals.c <<EOF
 #include <signal.h>
-volatile sig_atomic_t pscal_openssh_interrupted = 0;
-int pscal_openssh_showprogress = 1;
+__thread volatile sig_atomic_t pscal_openssh_interrupted = 0;
+__thread int pscal_openssh_showprogress = 1;
 EOF
 
 cat > src/runtime_stubs_extra.c <<EOF
@@ -547,6 +549,14 @@ if [ -d "$OPENSSH_DIR" ]; then
     if [ ! -f "$OPENSSH_DIR/configure" ]; then
         echo "Generating configure..."
         (cd "$OPENSSH_DIR" && autoreconf -i)
+    fi
+
+    # A git checkout writes configure.ac and m4/*.m4 just after configure, and
+    # configure refuses to run when either is newer than it ("configure.ac
+    # newer than configure, run autoreconf"). When git says all three are as
+    # committed, configure is current, so say so, as CMakeLists.txt does.
+    if git -C "$OPENSSH_DIR" diff --quiet HEAD -- configure configure.ac m4 2>/dev/null; then
+        touch "$OPENSSH_DIR/configure"
     fi
 
     echo "Running configure for OpenSSH..."
