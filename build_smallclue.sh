@@ -271,9 +271,12 @@ if [ -d "$OPENSSH_DIR" ]; then
     # happened to detect. Keep a copy and put it back afterwards.
     #
     # Gated on the file being tracked, so a plain upstream checkout (where
-    # config.h really is generated) is left exactly as it was.
+    # config.h really is generated) is left exactly as it was. And on Darwin,
+    # because that is the platform the committed file describes: anywhere else
+    # configure's own config.h is the one to build against, as in
+    # CMakeLists.txt's "Configure third-party/openssh" block.
     OPENSSH_CONFIG_H_KEEP=""
-    if [ -f "$OPENSSH_DIR/config.h" ] && \
+    if [ "$(uname -s)" = "Darwin" ] && [ -f "$OPENSSH_DIR/config.h" ] && \
        git -C "$OPENSSH_DIR" ls-files --error-unmatch config.h >/dev/null 2>&1; then
         OPENSSH_CONFIG_H_KEEP="$(mktemp -t openssh-config-h)"
         cp "$OPENSSH_DIR/config.h" "$OPENSSH_CONFIG_H_KEEP"
@@ -329,6 +332,17 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ -f "$OPENSSH_DIR/configure" ]; then
+            # configure refuses to run when configure.ac or m4/*.m4 is newer
+            # than it, and a git checkout writes those just after configure,
+            # so a fresh clone trips the check with nothing stale. (Linux's
+            # dash compares nanoseconds; macOS's /bin/sh only whole seconds,
+            # so it rarely shows there.) When git says all three are as
+            # committed, configure is current, so say so -- as CMakeLists.txt
+            # does before running configure.
+            if git -C "$OPENSSH_DIR" diff --quiet HEAD -- configure configure.ac m4 2>/dev/null; then
+                touch "$OPENSSH_DIR/configure"
+            fi
+
             OPENSSH_CONFIG_ENV=()
             OPENSSH_CONFIG_ARGS=(--sysconfdir=/etc/ssh)
 
@@ -474,6 +488,17 @@ if [ -d "$OPENSSH_DIR" ]; then
 
     # Force rebuild of patched files
     rm -f "$OPENSSH_DIR/scp.o" "$OPENSSH_DIR/sftp.o" "$OPENSSH_DIR/sftp-client.o"
+
+    # The committed config.h leaves HAVE_SYS_RANDOM_H undefined for the iOS
+    # SDK's sake, but on macOS <sys/random.h> is the only header that declares
+    # getentropy(), so bsd-getentropy.c stops with "call to undeclared function
+    # 'getentropy'". CMakeLists.txt defines it for that one file; do the same
+    # with a target-specific variable, building the object ahead of the make
+    # below, which then finds it up to date.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        printf 'bsd-getentropy.o: CPPFLAGS += -DHAVE_SYS_RANDOM_H=1\n' | \
+            (cd "$OPENSSH_DIR/openbsd-compat" && make -f Makefile -f - bsd-getentropy.o)
+    fi
 
     echo "Building OpenSSH objects..."
     (cd "$OPENSSH_DIR" && make -j4 libssh.a openbsd-compat/libopenbsd-compat.a \
