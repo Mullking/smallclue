@@ -1,0 +1,41 @@
+name: sync devel
+
+# devel is where the Jules bots cut their branches, so it has to be main.
+# When it fell 92 commits behind, every bot PR was written against code main
+# had already replaced -- and one of them would have undone newer work.
+#
+# Fast-forward only. Bot PRs land on main (committed there with "Closes #N"),
+# never by merging into devel, so devel should never have anything of its own.
+# If it ever does, this fails instead of throwing those commits away: look at
+# what is on devel, land it on main, then re-run this.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-devel
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward devel to main
+        run: |
+          if git rev-parse -q --verify origin/devel >/dev/null &&
+             ! git merge-base --is-ancestor origin/devel HEAD; then
+            echo "::error::devel has commits main does not:"
+            git log --oneline HEAD..origin/devel
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/devel
