@@ -415,18 +415,17 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     return false; /* Did not modify */
 }
 
-/* core.c's applet table references these unconditionally (git/rsync entries
- * aren't ifdef-guarded), but their real implementations (src/git_app.c,
- * src/openrsync_app.c) need libgit2/the vendored openrsync tree, neither of
- * which this script builds. Weak so a real, strong definition would win the
- * link over this fallback if one were ever compiled in. */
-__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    fprintf(stderr, "git: not built in this configuration (libgit2 unavailable)\n");
-    return 127;
-}
-
+/* core.c's applet table references smallclueRunRsync unconditionally (the
+ * rsync entry is not ifdef-guarded), but its real implementation
+ * (src/openrsync_app.c) needs the vendored openrsync tree, which this script
+ * does not build. Weak so a real, strong definition would win the link over
+ * this fallback if one were ever compiled in.
+ *
+ * smallclueGitCommand used to be stubbed here too, and as in
+ * build_smallclue.sh that was the bug: src/git_app.c was not in the source
+ * list below, so `git` said "libgit2 unavailable" in a build that had just
+ * compiled libgit2 and linked it in. git_app.c carries its own fallback for
+ * SMALLCLUE_WITH_LIBGIT2=0, so it is compiled unconditionally now. */
 __attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -623,13 +622,13 @@ if [ -d "$OPENSSH_DIR" ]; then
         ssh.o readconf.o clientloop.o sshtty.o sshconnect.o sshconnect2.o mux.o ssh-sk-client.o \
         scp.o progressmeter.o sftp-common.o sftp-client.o sftp-glob.o \
         sftp.o sftp-usergroup.o \
-        ssh-keygen.o sshsig.o)
+        ssh-keygen.o sshsig.o ssh-pkcs11.o)
 
     OPENSSH_OBJS="$OPENSSH_DIR/ssh.o $OPENSSH_DIR/readconf.o $OPENSSH_DIR/clientloop.o $OPENSSH_DIR/sshtty.o \
 $OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \
 $OPENSSH_DIR/scp.o $OPENSSH_DIR/progressmeter.o $OPENSSH_DIR/sftp-common.o $OPENSSH_DIR/sftp-client.o $OPENSSH_DIR/sftp-glob.o \
 $OPENSSH_DIR/sftp.o $OPENSSH_DIR/sftp-usergroup.o \
-$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
+$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
 
     OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz -ldl"
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
@@ -793,7 +792,11 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
 
     LIBGIT2_DEFS="-DPSCAL_HAS_LIBGIT2"
     LIBGIT2_INCLUDES="-I$LIBGIT2_DIR/include"
-    LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
+    # USE_HTTPS=ON builds libgit2's OpenSSL stream, so libgit2.a needs SSL_*
+    # symbols. The static link is one left-to-right pass and OPENSSH_LIBS'
+    # -lcrypto comes before libgit2.a, so name both libraries after it, as
+    # build_smallclue.sh does.
+    LIBGIT2_LIBS="$LIBGIT2_ARCHIVE -lssl -lcrypto"
 fi
 
 # 4. Compile smallclue
@@ -809,7 +812,10 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     -I. -Isrc ${OPENSSH_LDFLAGS} -lpthread \
     src/main.c \
     src/core.c \
+    src/spawn.c \
     src/runtime_support.c \
+    src/micro_app.c \
+    src/micro_main_stub.c \
     src/dvtm_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
@@ -848,6 +854,7 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     src/expr_app.c \
     src/fmt_app.c \
     src/fold_app.c \
+    src/git_app.c \
     src/gzip_app.c \
     src/nl_app.c \
     src/nohup_app.c \
