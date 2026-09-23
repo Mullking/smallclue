@@ -382,6 +382,13 @@ list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/cleanup\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-pkcs11\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sftp-server\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sftp-server-main\\.c$")
+# OpenSSH 10.5 added ssherr-nolibcrypto.c: a one-line ssherr_libcrypto() that
+# returns NULL, for the programs upstream links WITHOUT libssh.a (sftp-server,
+# ssh-sk-helper, and the sftp client objects on their own). ssherr-libcrypto.c
+# defines the same function unconditionally -- the real one under WITH_OPENSSL,
+# a NULL stub otherwise -- and this binary is the libssh.a side, so with both
+# in the glob the link fails on a duplicate _ssherr_libcrypto.
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssherr-nolibcrypto\\.c$")
 # sftp-realpath.c provides a local-filesystem-path sftp_realpath(path,
 # resolved) (its own comment: "XXX rewrite sftp-server to use POSIX
 # realpath") used only by the just-excluded sftp-server.c. It collides with
