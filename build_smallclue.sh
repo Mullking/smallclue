@@ -89,11 +89,13 @@ struct sshkey {
 EOF
 
 # 2. Create extra stubs
+# Thread-local to match the openssh fork's `extern __thread` declarations; see
+# the matching generator in CMakeLists.txt for why the two have to agree.
 cat > src/openssh_globals.c <<EOF
 #include <signal.h>
 #include <stdint.h>
-volatile sig_atomic_t pscal_openssh_interrupted = 0;
-int pscal_openssh_showprogress = 1;
+__thread volatile sig_atomic_t pscal_openssh_interrupted = 0;
+__thread int pscal_openssh_showprogress = 1;
 
 /*
  * Some OpenSSH object files (e.g. ML-KEM code paths) may reference htole64/le64toh

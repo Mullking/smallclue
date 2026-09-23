@@ -248,12 +248,21 @@ struct sshkey {
 ")
 endif()
 
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/openssh_globals.c)
-    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/openssh_globals.c
+# src/openssh_globals.c is generated rather than committed. The openssh fork
+# declares these two `extern __thread` in scp.c, sftp.c and sftp-client.c: each
+# ssh/scp/sftp invocation gets its own, so a ^C'd transfer cannot leave a stale
+# flag for the next one in the same session (iSH-AOK defines them the same way,
+# in kernel/openssh_glue.c). The definition has to agree. ELF refuses the link
+# otherwise ("TLS reference ... mismatches non-TLS definition"), and Mach-O
+# quietly links a plain global that the TLS accessors then misread, so
+# `smallclue scp` died with SIGBUS on macOS. Written through configure_file()
+# so a copy generated before this changed is replaced, and an up-to-date one
+# is left alone rather than rebuilt on every cmake run.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/openssh_globals.c
 "#include <signal.h>
 #include <stdint.h>
-volatile sig_atomic_t pscal_openssh_interrupted = 0;
-int pscal_openssh_showprogress = 1;
+__thread volatile sig_atomic_t pscal_openssh_interrupted = 0;
+__thread int pscal_openssh_showprogress = 1;
 
 /*
  * Some OpenSSH object files (e.g. ML-KEM code paths) may reference htole64/le64toh
@@ -283,7 +292,8 @@ __attribute__((weak)) uint64_t le64toh(uint64_t v) {
 }
 #endif
 ")
-endif()
+configure_file(${CMAKE_CURRENT_BINARY_DIR}/generated/openssh_globals.c
+               ${CMAKE_CURRENT_SOURCE_DIR}/src/openssh_globals.c COPYONLY)
 
 if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_stubs_extra.c)
     file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_stubs_extra.c
