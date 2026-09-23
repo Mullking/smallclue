@@ -250,6 +250,9 @@ buildVendoredOpenSshDeps() {
 
     OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I$(dirname "$zlib_header") -I$(dirname "$(dirname "$openssl_header")")"
     OPENSSH_LDFLAGS="$OPENSSH_LDFLAGS -L$(dirname "$zlib_lib") -L$(dirname "$openssl_lib")"
+    # For the libgit2 step, whose cmake looks for OpenSSL on its own.
+    VENDORED_OPENSSL_INCLUDE_DIR="$(dirname "$(dirname "$openssl_header")")"
+    VENDORED_OPENSSL_LIB_DIR="$(dirname "$openssl_lib")"
 }
 
 selectI686Toolchain() {
@@ -448,6 +451,8 @@ if [ "${CC_CMD[0]}" = "i686-linux-gnu-gcc" ]; then
 fi
 OPENSSH_CPPFLAGS=""
 OPENSSH_LDFLAGS=""
+VENDORED_OPENSSL_INCLUDE_DIR=""
+VENDORED_OPENSSL_LIB_DIR=""
 if [ "$TARGET_IS_CROSS" -eq 1 ]; then
     if [ -d /usr/include/i386-linux-gnu ]; then
         OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I/usr/include/i386-linux-gnu"
@@ -754,11 +759,39 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
         CMAKE_GENERATOR_ARGS=(-G Ninja)
     fi
 
+    # If OpenSSH needed the vendored OpenSSL, FindOpenSSL's search path holds
+    # no i686 OpenSSL (the host's own, at most), so hand libgit2 the headers
+    # and archives the final link uses. By name rather than OPENSSL_ROOT_DIR:
+    # FindOpenSSL caches what it finds and never looks again, so a root hint
+    # would not displace an OpenSSL an earlier configure of this build dir
+    # settled on.
+    LIBGIT2_OPENSSL_ARGS=()
+    if [ -n "$VENDORED_OPENSSL_INCLUDE_DIR" ]; then
+        LIBGIT2_OPENSSL_ARGS=(
+            -DOPENSSL_INCLUDE_DIR="$VENDORED_OPENSSL_INCLUDE_DIR"
+            -DOPENSSL_SSL_LIBRARY="$VENDORED_OPENSSL_LIB_DIR/libssl.a"
+            -DOPENSSL_CRYPTO_LIBRARY="$VENDORED_OPENSSL_LIB_DIR/libcrypto.a"
+        )
+    fi
+
+    # USE_SHA1/USE_SHA256=OpenSSL, as build_smallclue.sh and CMakeLists.txt
+    # have them: USE_HTTPS=ON builds the OpenSSL stream, whose <openssl/sha.h>
+    # declares SHA1() ... SHA512() as functions, and the builtin SHA256's
+    # rfc6234 sha.h declares the same names as an enum. libgit2.c includes
+    # both and stops on "'SHA1' redeclared as different kind of symbol".
+    #
+    # -D_FILE_OFFSET_BITS=64: libgit2's cmake stopped setting it for the
+    # library in 2021 (only its tests and benchmarks still do), leaving it a
+    # 32-bit off_t, ino_t and struct dirent on i686. readdir() then fails with
+    # EOVERFLOW once entries carry 64-bit inode numbers or offsets (`git
+    # status`: "could not read directory ... Value too large for defined data
+    # type"), and files past 2 GiB, packfiles included, cannot be opened. Its
+    # public API passes no off_t or struct stat, so git_app.c need not match.
     echo "Building libgit2 applet support for i686..."
     cmake -S "$LIBGIT2_DIR" -B "$LIBGIT2_BUILD_DIR" "${CMAKE_GENERATOR_ARGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER="${CC_CMD[0]}" \
-        -DCMAKE_C_FLAGS="${TARGET_CFLAGS_JOINED}" \
+        -DCMAKE_C_FLAGS="${TARGET_CFLAGS_JOINED} -D_FILE_OFFSET_BITS=64" \
         -DCMAKE_EXE_LINKER_FLAGS="${TARGET_LDFLAGS_JOINED}" \
         -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTS=OFF \
@@ -769,8 +802,9 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
         -DUSE_THREADS=ON \
         -DUSE_SSH=OFF \
         -DUSE_HTTPS=ON \
-        -DUSE_SHA1=builtin \
-        -DUSE_SHA256=builtin \
+        -DUSE_SHA1=OpenSSL \
+        -DUSE_SHA256=OpenSSL \
+        "${LIBGIT2_OPENSSL_ARGS[@]}" \
         -DUSE_HTTP_PARSER=builtin \
         -DUSE_AUTH_NTLM=OFF \
         -DUSE_AUTH_NEGOTIATE=OFF \
