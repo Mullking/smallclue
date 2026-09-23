@@ -507,8 +507,11 @@ if [ -d "$OPENSSH_DIR" ]; then
         sftp.o sftp-usergroup.o \
         ssh-keygen.o sshsig.o ssh-pkcs11.o)
 
+    # Since 10.0 sshd is only the listener: it execs sshd-session for each
+    # connection, which execs sshd-auth for the pre-auth phase, so the three
+    # are one server and setup_posix_env.sh installs them together.
     echo "Building OpenSSH sshd..."
-    (cd "$OPENSSH_DIR" && make -j4 sshd)
+    (cd "$OPENSSH_DIR" && make -j4 sshd sshd-session sshd-auth)
 
     OPENSSH_OBJS="$OPENSSH_DIR/ssh.o $OPENSSH_DIR/readconf.o $OPENSSH_DIR/clientloop.o $OPENSSH_DIR/sshtty.o \
 $OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \

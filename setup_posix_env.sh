@@ -104,7 +104,11 @@ if [ -x "third-party/micro-bin/micro" ]; then
 fi
 if [ -f "third-party/openssh/sshd" ]; then
     echo "Installing sshd..."
-    cp "third-party/openssh/sshd" "$ROOTFS/bin/sshd"
+    # sshd-session and sshd-auth too: sshd execs them per connection, from
+    # the SshdSessionPath/SshdAuthPath the sshd_config below points here.
+    for sshd_prog in sshd sshd-session sshd-auth; do
+        cp "third-party/openssh/$sshd_prog" "$ROOTFS/bin/$sshd_prog"
+    done
 fi
 if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
@@ -345,6 +349,8 @@ HostKey /etc/ssh/ssh_host_ecdsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
 AuthorizedKeysFile .ssh/authorized_keys
 Subsystem sftp internal-sftp
+SshdSessionPath /bin/sshd-session
+SshdAuthPath /bin/sshd-auth
 EOF
 
 echo "Creating /etc/rc..."
