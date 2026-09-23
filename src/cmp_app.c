@@ -8,13 +8,37 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+
+/* GNU sizes -l's offset column to the largest offset it could print: the
+ * smaller of the two regular files, or the largest off_t when neither is
+ * regular and the size is unknown. */
+static int smallclueCmpOffsetWidth(FILE *f1, FILE *f2) {
+    int64_t limit = INT64_MAX;
+    FILE *files[2] = { f1, f2 };
+    for (int f = 0; f < 2; ++f) {
+        struct stat st;
+        if (fstat(fileno(files[f]), &st) == 0 && S_ISREG(st.st_mode) &&
+            (int64_t)st.st_size < limit) {
+            limit = (int64_t)st.st_size;
+        }
+    }
+    int width = 1;
+    while ((limit /= 10) != 0) {
+        width++;
+    }
+    return width;
+}
 
 static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char *name2,
                                 bool silent, bool listAll) {
+    int offsetWidth = listAll ? smallclueCmpOffsetWidth(f1, f2) : 0;
     long byteNum = 0;
     long lineNum = 1;
+    bool lastWasNewline = false;
     bool anyDiff = false;
     unsigned char buf1[16384];
     unsigned char buf2[16384];
@@ -35,8 +59,22 @@ static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char
             if (eof1 && eof2) {
                 return anyDiff ? 1 : 0;
             }
+            /* GNU's three shapes: an empty file says so; -l gives only the
+             * byte; otherwise the line, which is "line N" when the short file
+             * ended on a newline and "in line N" when it ended mid-line. */
             if (!silent) {
-                fprintf(stderr, "cmp: EOF on %s\n", eof1 ? name1 : name2);
+                const char *shorter = eof1 ? name1 : name2;
+                if (byteNum == 0) {
+                    fprintf(stderr, "cmp: EOF on %s which is empty\n", shorter);
+                } else if (listAll) {
+                    fprintf(stderr, "cmp: EOF on %s after byte %ld\n", shorter, byteNum);
+                } else if (lastWasNewline) {
+                    fprintf(stderr, "cmp: EOF on %s after byte %ld, line %ld\n",
+                            shorter, byteNum, lineNum - 1);
+                } else {
+                    fprintf(stderr, "cmp: EOF on %s after byte %ld, in line %ld\n",
+                            shorter, byteNum, lineNum);
+                }
             }
             return 1;
         }
@@ -53,7 +91,7 @@ static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char
                 anyDiff = true;
                 if (listAll) {
                     if (!silent) {
-                        printf("%6ld %3o %3o\n", byteNum, c1, c2);
+                        printf("%*ld %3o %3o\n", offsetWidth, byteNum, c1, c2);
                     }
                 } else {
                     if (!silent) {
@@ -62,7 +100,8 @@ static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char
                     return 1;
                 }
             }
-            if (c1 == '\n') {
+            lastWasNewline = (c1 == '\n');
+            if (lastWasNewline) {
                 lineNum++;
             }
         }
@@ -94,6 +133,11 @@ int smallclueCmpCommand(int argc, char **argv) {
         break;
     }
 
+    if (silent && listAll) {
+        fprintf(stderr, "cmp: options -l and -s are incompatible\n");
+        return 2;
+    }
+
     if (argc - argi != 2) {
         fprintf(stderr, "usage: cmp [-s] [-l] file1 file2\n");
         return 2;
@@ -104,11 +148,9 @@ int smallclueCmpCommand(int argc, char **argv) {
     bool stdin1 = strcmp(name1, "-") == 0;
     bool stdin2 = strcmp(name2, "-") == 0;
     if (stdin1 && stdin2) {
-        fprintf(stderr, "cmp: only one file may be '-' (stdin)\n");
-        return 2;
+        /* One stream compared with itself: GNU answers "same" unread. */
+        return 0;
     }
-    if (stdin1) name1 = "stdin";
-    if (stdin2) name2 = "stdin";
 
     FILE *f1 = stdin1 ? stdin : fopen(name1, "rb");
     if (!f1) {
