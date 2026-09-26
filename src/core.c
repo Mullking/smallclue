@@ -2586,7 +2586,7 @@ static char *smallclueGetPass(const char *prompt);
  *     %wheel  ALL=(ALL:ALL) ALL
  *     mke     ALL=(ALL) NOPASSWD: ALL
  *     deploy  ALL=(root) /usr/bin/systemctl, /usr/bin/journalctl
- *     #includedir /etc/sudoers.d
+ *     #includedir /etc/sudoers.d    (or @includedir; #include / @include too)
  *
  * Not supported and skipped: aliases (User_Alias and friends), negation (!),
  * globs in command paths, and commands written with arguments. `Defaults` is
@@ -2753,13 +2753,18 @@ static bool sudoersScan(const char *path, const struct passwd *pw, const char *t
     char line[4096];
     while (fgets(line, sizeof(line), f) != NULL) {
         char *p = sudoersTrim(line);
-        if (strncmp(p, "#includedir", 11) == 0) {
+        /* Both spellings of each: '#' is the old one, '@' the one sudo 1.9.1
+         * added, which current distributions ship -- Alpine 3.23's stock
+         * sudoers ends in "@includedir /etc/sudoers.d". Reading only the '#'
+         * form skipped sudoers.d there entirely, so a user in wheel was
+         * refused by a rule this never read. */
+        if ((p[0] == '#' || p[0] == '@') && strncmp(p + 1, "includedir", 10) == 0) {
             char *dir = sudoersTrim(p + 11);
             if (*dir != '\0')
                 sudoersScanDir(dir, pw, target, cmd_path, allowed, nopasswd, depth);
             continue;
         }
-        if (strncmp(p, "#include", 8) == 0) {
+        if ((p[0] == '#' || p[0] == '@') && strncmp(p + 1, "include", 7) == 0) {
             char *inc = sudoersTrim(p + 8);
             if (*inc != '\0')
                 sudoersScan(inc, pw, target, cmd_path, allowed, nopasswd, depth + 1);
