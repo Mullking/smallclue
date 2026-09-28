@@ -15410,10 +15410,12 @@ static int smallclueUnameCommand(int argc, char **argv) {
     bool show_version = false;
     bool show_machine = false;
     bool show_processor = false;
+    bool show_platform = false;
+    bool show_os = false;
     bool show_all = false;
     smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "asnrvmp")) != -1) {
+    while ((opt = getopt(argc, argv, "asnrvmpio")) != -1) {
         switch (opt) {
             case 'a':
                 show_all = true;
@@ -15436,14 +15438,21 @@ static int smallclueUnameCommand(int argc, char **argv) {
             case 'p':
                 show_processor = true;
                 break;
+            case 'i':
+                show_platform = true;
+                break;
+            case 'o':
+                show_os = true;
+                break;
             default:
-                fputs("usage: uname [-asnrvmp]\n", stderr);
+                fputs("usage: uname [-asnrvmpio]\n", stderr);
                 return 1;
         }
     }
 
     if (!show_sysname && !show_nodename && !show_release &&
-        !show_version && !show_machine && !show_processor) {
+        !show_version && !show_machine && !show_processor &&
+        !show_platform && !show_os) {
         show_sysname = true;
     }
     if (show_all) {
@@ -15466,6 +15475,16 @@ static int smallclueUnameCommand(int argc, char **argv) {
     const char *version = info.version;
     const char *machine = info.machine;
     const char *processor = info.machine;
+    const char *platform = "unknown";
+#if defined(SMALLCLUE_UNAME_FROM_KERNEL)
+    /* Hosted in a system whose uname() already describes it (iSH-AOK: the
+     * guest kernel, through the native-program shim). Report that, as
+     * coreutils does on Linux -- -m is the guest's architecture, which is
+     * what a script asks it for, never the host device's model (#622). */
+    processor = "unknown";
+    if (show_all)
+        show_os = true;
+#else
 #if defined(__APPLE__)
     char machine_buf[64];
     if (smallclueUnameMachine(machine_buf, sizeof(machine_buf))) {
@@ -15486,6 +15505,22 @@ static int smallclueUnameCommand(int argc, char **argv) {
         release = product_version;
     }
 #endif
+#endif
+#endif /* SMALLCLUE_UNAME_FROM_KERNEL */
+    const char *os = (sysname && !strcmp(sysname, "Linux")) ? "GNU/Linux" : sysname;
+#if defined(SMALLCLUE_UNAME_FROM_KERNEL)
+    /* A musl system (Alpine) is "Linux", as its own uname -o says; "GNU/Linux"
+     * is glibc's. Its dynamic loader is the tell. */
+    static const char *const musl_loaders[] = {
+        "/lib/ld-musl-aarch64.so.1", "/lib/ld-musl-x86_64.so.1", "/lib/ld-musl-i386.so.1",
+        "/lib/ld-musl-riscv64.so.1", "/lib/ld-musl-armhf.so.1",
+    };
+    for (size_t i = 0; i < sizeof(musl_loaders) / sizeof(musl_loaders[0]); i++) {
+        if (access(musl_loaders[i], F_OK) == 0) {
+            os = "Linux";
+            break;
+        }
+    }
 #endif
 
     bool first = true;
@@ -15521,11 +15556,26 @@ static int smallclueUnameCommand(int argc, char **argv) {
         fputs(machine && *machine ? machine : "unknown", stdout);
         first = false;
     }
-    if (show_processor) {
+    /* -a leaves out what is unknown, as coreutils does. */
+    if (show_processor && !(show_all && processor && !strcmp(processor, "unknown"))) {
         if (!first) {
             putchar(' ');
         }
         fputs(processor && *processor ? processor : "unknown", stdout);
+        first = false;
+    }
+    if (show_platform && !show_all) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(platform, stdout);
+        first = false;
+    }
+    if (show_os) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(os && *os ? os : "unknown", stdout);
     }
     putchar('\n');
     return 0;
