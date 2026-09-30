@@ -25855,7 +25855,23 @@ static int smallclueRmCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        if (strpbrk(expanded, "*?[")) {
+        /* A name that exists is removed as itself. The caller's shell has
+         * already expanded any pattern it meant, so a `*`, `?` or `[` still
+         * in an argument is part of a file's name: globbing it again removed
+         * the wrong files -- `rm -f 'a*'` took every name starting with a --
+         * or none at all, since `[` alone is a malformed pattern that
+         * matches nothing, so `rm -f '['` removed nothing and succeeded.
+         * Hosted where a POSIX shell always does the expansion
+         * (SMALLCLUE_ARGS_EXPANDED, iSH-AOK), rm never globs. */
+        struct stat literal_st;
+        bool literal_exists = lstat(expanded, &literal_st) == 0;
+#if defined(SMALLCLUE_ARGS_EXPANDED)
+        bool glob_it = false;
+        (void) literal_exists;
+#else
+        bool glob_it = !literal_exists && strpbrk(expanded, "*?[") != NULL;
+#endif
+        if (glob_it) {
             glob_t matches;
             memset(&matches, 0, sizeof(matches));
             int gret = glob(expanded, GLOB_NOCHECK, NULL, &matches);
